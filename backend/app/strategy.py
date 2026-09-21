@@ -3,6 +3,7 @@
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from itertools import pairwise
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +27,9 @@ class Config(BaseModel):
     wait_seconds: int = Field(default=300, ge=10, le=3600)
     exit_seconds: int = Field(default=15, ge=5, le=300)
     exit_level: int = Field(default=6, ge=1, le=100)
+    max_hold_seconds: int = Field(default=1800, ge=60, le=86400)
+    target_points: Decimal = Field(default=D("32768"), gt=0)
+    points_per_u: Decimal = Field(default=D("4"), gt=0)
 
 
 def align(value, step, up=False):
@@ -93,6 +97,7 @@ def estimate(m: Snapshot, c: Config):
 
 class Order(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
+    id: str = Field(default_factory=lambda: str(uuid4()))
     side: Literal["buy", "sell"]
     price: Decimal = Field(gt=0)
     quantity: Decimal = Field(gt=0)
@@ -112,6 +117,10 @@ class State(BaseModel):
     session_loss: Decimal = Field(default=D(0), ge=0)
     exiting: bool = False
     budget_stopped: bool = False
+    buy_total: Decimal = Field(default=D(0), ge=0)
+    first_buy_at: int | None = None
+    target_reached: bool = False
+    completed: bool = False
     order: Order | None = None
     event_ids: list[str] = Field(default_factory=list, max_length=2000)
     message: str = "空仓，尚未创建模拟订单。"
@@ -173,6 +182,9 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
             raise ValueError("模拟成交价格违反限价约束。")
         order.filled += event.quantity
         if order.side == "buy":
+            if s.first_buy_at is None:
+                s.first_buy_at = s.clock
+            s.buy_total += event.quantity * event.price
             s.cost += event.quantity * event.price * (1 + fee)
             s.inventory += event.quantity
         else:
@@ -188,13 +200,28 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
             raise ValueError("没有待确认的模拟撤单。")
         s.order = None
         s.message = "已确认模拟撤单，按最终成交量处理剩余持仓。"
+    s.target_reached = (
+        s.target_reached or s.buy_total * c.points_per_u >= c.target_points
+    )
+    if s.inventory and (
+        s.target_reached
+        or (
+            s.first_buy_at is not None
+            and s.clock - s.first_buy_at >= c.max_hold_seconds
+        )
+    ):
+        s.exiting = True
     # Settle fully exited rounds; gains do not replenish the loss budget (conservative trial rule).
     if s.cost and s.inventory == 0 and s.order is None:
         s.session_loss += max(D(0), s.cost - s.proceeds)
         s.cost = s.proceeds = D(0)
         s.exiting = False
+        s.first_buy_at = None
         s.message = "本轮结束；再次推进时才评估下一轮。"
         s.budget_stopped = s.budget_stopped or s.session_loss >= c.budget
+        s.completed = s.target_reached or s.budget_stopped
+        if s.completed:
+            s.message = "任务已清仓结束；不再创建新买单。"
         return s
     risk = exposure(s, m, c)
     # Mark-to-exit losses are checked only on a crossed natural-minute boundary.
@@ -219,7 +246,7 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
         if (
             s.clock - s.order.placed_at >= timeout
             or (s.exiting and not state.exiting)
-            or (s.budget_stopped and s.order.side == "buy")
+            or ((s.budget_stopped or s.target_reached) and s.order.side == "buy")
         ):
             s.order.cancel_requested = True
             s.message = "请求模拟撤单；请先记录撤单期间成交，再确认撤单。"
@@ -241,17 +268,34 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
         s.order = Order(side="sell", price=price, quantity=quantity, placed_at=s.clock)
         s.message = "模拟卖单：" + reason
     else:
+        if s.completed or s.target_reached:
+            s.completed = True
+            s.message = "任务已清仓结束；不再创建新买单。"
+            return s
         reserve = max(c.reserve, c.amount * (c.stop_pct / 100 + 2 * fee))
         if s.budget_stopped or s.session_loss + reserve >= c.budget:
             s.budget_stopped = True
+            s.completed = True
             s.message = "停止新买入：损耗预算或退出预留不足。"
             return s
         e = estimate(m, c)
         if not e["buy_allowed"]:
-            s.message = "盘口交叉/锁定或历史买价已触及卖一，暂停新买单；等待新行情或调整参数。"
+            s.message = (
+                "盘口交叉/锁定或历史买价已触及卖一，暂停新买单；等待新行情或调整参数。"
+            )
             return s
+        remaining = c.target_points / c.points_per_u - s.buy_total
+        # Smallest valid final order, still capped by the per-round budget.
+        quantity = min(
+            e["quantity"],
+            max(
+                align(remaining / e["buy"], m.step, True),
+                align(m.min_qty, m.step, True),
+                align(m.min_notional / e["buy"], m.step, True),
+            ),
+        )
         s.order = Order(
-            side="buy", price=e["buy"], quantity=e["quantity"], placed_at=s.clock
+            side="buy", price=e["buy"], quantity=quantity, placed_at=s.clock
         )
         s.message = "已创建模拟买单；不根据 K 线触价自动判定成交。"
     return s

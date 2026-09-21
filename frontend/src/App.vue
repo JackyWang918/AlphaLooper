@@ -73,7 +73,7 @@ onMounted(() => execute('status'))
       <input id="trade-url" v-model="tradeUrl" type="url" placeholder="粘贴你的币安 Alpha 网页交易链接" :disabled="pending" />
       <button :disabled="pending || !browser.connected || !tradeUrl.trim()" @click="execute('open')">打开页面</button>
     </section>
-    <ResearchPanel :url="tradeUrl" />
+    <ResearchPanel v-model:url="tradeUrl" />
     <section>
       <h2>03 / 仅填表</h2>
       <p class="muted">填写前核对链、合约地址、币种和计价币。此操作只填写，不点击下单按钮。弹窗或验证请在 Chrome 中手动处理。</p>

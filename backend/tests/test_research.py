@@ -6,53 +6,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.market import Candle, MarketError, Snapshot, resolve_pair, validate_snapshot
-from app.strategy import Config, Event, Order, State, advance, estimate, exposure
+from app.market import Candle, MarketError, resolve_pair, validate_snapshot
+from app.strategy import Event, Order, State, advance, estimate, exposure
 
 URL = (
     "https://www.binance.com/zh-CN/alpha/bsc/0x10d4183389e99233db3cc981c43443ebd28ebd5e"
 )
 
-
-@pytest.fixture
-def market():
-    now = (int(time.time() * 1000) // 60000) * 60000 + 1000
-    rows = [
-        Candle(
-            time=now - 1000 - i * 60000,
-            close_time=now - 1001 - (i - 1) * 60000,
-            open="10",
-            high="10.2",
-            low="9.8",
-            close=str(D(10) + (i - 2) * D("0.1")),
-            volume="10",
-            quote_volume="100",
-        )
-        for i in (3, 2, 1)
-    ]
-    return Snapshot(
-        symbol="ALPHA_TESTUSDT",
-        token="TEST",
-        chain="bsc",
-        address="0x1",
-        quote="USDT",
-        fetched_at=now,
-        book_time=now,
-        latency_ms=5,
-        tick="0.01",
-        step="0.01",
-        min_qty="0.01",
-        min_notional="0.1",
-        candles=rows,
-        bids=[(str(D(10) - D("0.01") * i), "100") for i in range(6)],
-        asks=[("10.1", "100")],
-        ticker={},
-    )
-
-
-@pytest.fixture
-def config():
-    return Config(window=3, fee_bps="10")
 
 
 def event(kind="tick", advance_seconds=0, **kwargs):
