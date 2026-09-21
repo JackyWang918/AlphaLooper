@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import ResearchPanel from './components/ResearchPanel.vue'
+import AccountRecords from './components/AccountRecords.vue'
 
 type Filled = { side: string; symbol: string; quote: string; price: string; quantity: string; submitted: boolean }
 type BrowserState = { connected: boolean; url: string; title: string; fill_supported: boolean; symbol?: string; quote?: string; reason?: string; price_step?: string; quantity_step?: string }
@@ -74,6 +75,7 @@ onMounted(() => execute('status'))
       <button :disabled="pending || !browser.connected || !tradeUrl.trim()" @click="execute('open')">打开页面</button>
     </section>
     <ResearchPanel v-model:url="tradeUrl" />
+    <AccountRecords :url="tradeUrl" :connected="browser.connected" :browser-busy="pending" />
     <section>
       <h2>03 / 仅填表</h2>
       <p class="muted">填写前核对链、合约地址、币种和计价币。此操作只填写，不点击下单按钮。弹窗或验证请在 Chrome 中手动处理。</p>

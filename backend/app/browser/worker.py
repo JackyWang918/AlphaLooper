@@ -6,6 +6,7 @@ from pathlib import Path
 from playwright.sync_api import Error, sync_playwright
 
 from app.browser.alpha import fill_form, inspect_form
+from app.browser.records import read_records
 
 
 def run_worker(pipe: Connection, profile: str):
@@ -55,6 +56,12 @@ def run_worker(pipe: Connection, profile: str):
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
                         filled = fill_form(page, command["payload"])
+                    elif action == "read_records":
+                        if page is None or page.is_closed():
+                            raise ValueError("请先打开交易页面。")
+                        observation = read_records(page, command["url"])
+                        pipe.send({"ok": True, "observation": observation})
+                        continue
                     elif action != "status":
                         raise ValueError("不支持的浏览器操作。")
 

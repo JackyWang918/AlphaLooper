@@ -1,6 +1,10 @@
 from alembic import context
 
-from app import ledger  # noqa: F401 -- register ledger tables in migration metadata
+from app import (
+    account_ledger,  # noqa: F401
+    ledger,  # noqa: F401 -- register ledger tables in migration metadata
+    observations,  # noqa: F401 -- register read-only observations
+)
 from app.database import Base, make_engine
 
 target_metadata = Base.metadata

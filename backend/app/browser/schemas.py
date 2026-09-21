@@ -58,3 +58,14 @@ class FillForm(BaseModel):
         if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) or Decimal(value) <= 0:
             raise ValueError("请输入大于零的普通十进制数，不支持科学计数法。")
         return value
+
+
+class ReadRecords(BaseModel):
+    book: str = Field(default="本机账户", min_length=1, max_length=80, pattern=r".*\S.*")
+    url: str = Field(max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def concrete_token(cls, value):
+        token_identity(value)
+        return value.strip()
