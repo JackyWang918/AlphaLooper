@@ -65,8 +65,12 @@ def extract(observation):
         try:
             quantity, symbol = amount(fields["已成交"])
             gross, quote = amount(fields["成交额"])
+            limit_price, limit_quote = amount(fields["委托价格"])
+            requested_quantity, requested_symbol = amount(fields["数量"])
             if (
                 symbol != fields["代币"]
+                or requested_symbol != symbol
+                or limit_quote != quote
                 or quote not in {"USDT", "USDC"}
                 or fields["方向"] not in {"买入", "卖出"}
                 or not re.fullmatch(
@@ -86,6 +90,8 @@ def extract(observation):
                     "quantity": quantity,
                     "gross": gross,
                     "average_price": fields["成交均价"],
+                    "limit_price": limit_price,
+                    "requested_quantity": requested_quantity,
                     "status": fields["状态"],
                     "captured_at": observation["captured_at"],
                     "chain": observation["chain"],

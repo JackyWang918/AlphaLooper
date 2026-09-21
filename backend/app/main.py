@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from app import account_ledger
@@ -9,6 +10,7 @@ from app.browser.manager import BrowserBusy, BrowserManager
 from app.browser.schemas import FillForm, OpenPage, ReadRecords
 from app.database import make_engine
 from app.ledger_api import router as ledger_router
+from app.live_orders import LiveOrders, SubmitOrder
 from app.research_api import router as research_router
 
 
@@ -16,9 +18,12 @@ from app.research_api import router as research_router
 async def lifespan(app: FastAPI):
     app.state.engine = make_engine()
     app.state.browser = BrowserManager()
+    app.state.live = LiveOrders(app.state.engine, app.state.browser)
+    app.state.live.start()
     try:
         yield
     finally:
+        app.state.live.close()
         app.state.browser.close()
         app.state.engine.dispose()
 
@@ -46,7 +51,12 @@ async def local_control(request: Request, call_next):
 
 def browser_action(action: str, url: str = "", payload: dict | None = None):
     try:
-        result = app.state.browser.execute(action, url, payload)
+        with app.state.live.lock:
+            if action in {"open", "fill", "read_records"} and app.state.live.get():
+                raise HTTPException(
+                    status_code=409, detail="有一笔实盘委托待确认，请先完成巡检。"
+                )
+            result = app.state.browser.execute(action, url, payload)
     except BrowserBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not result["ok"]:
@@ -73,7 +83,11 @@ def browser_open(body: OpenPage):
 def health():
     with app.state.engine.connect() as connection:
         connection.execute(text("SELECT 1"))
-    return {"status": "ok", "database": "connected", "trading_enabled": False}
+    return {
+        "status": "ok",
+        "database": "connected",
+        "trading_enabled": app.state.live.enabled,
+    }
 
 
 @app.post("/api/browser/fill")
@@ -91,3 +105,32 @@ def account_orders_read(body: ReadRecords):
 @app.get("/api/account/orders")
 def account_orders(book: str = "本机账户"):
     return account_ledger.read(app.state.engine, book)
+
+
+class LiveSwitch(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/live/orders")
+def live_status():
+    return app.state.live.status()
+
+
+@app.post("/api/live/enabled")
+def live_switch(body: LiveSwitch):
+    with app.state.live.lock:
+        app.state.live.enabled = body.enabled
+    return {"enabled": body.enabled}
+
+
+@app.post("/api/live/orders")
+def live_submit(body: SubmitOrder):
+    try:
+        return app.state.live.submit(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/live/check")
+def live_check():
+    return app.state.live.check()

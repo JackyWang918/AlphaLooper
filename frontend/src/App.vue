@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import ResearchPanel from './components/ResearchPanel.vue'
 import AccountRecords from './components/AccountRecords.vue'
+import LiveOrder from './components/LiveOrder.vue'
 
 type Filled = { side: string; symbol: string; quote: string; price: string; quantity: string; submitted: boolean }
 type BrowserState = { connected: boolean; url: string; title: string; fill_supported: boolean; symbol?: string; quote?: string; reason?: string; price_step?: string; quantity_step?: string }
@@ -56,7 +57,7 @@ onMounted(() => execute('status'))
 
 <template>
   <main>
-    <header><div><p class="eyebrow">本地交易辅助控制台</p><h1>AlphaLooper</h1></div><span class="badge">仅填表验证阶段</span></header>
+    <header><div><p class="eyebrow">本地交易辅助控制台</p><h1>AlphaLooper</h1></div><span class="badge">单笔实盘开发阶段</span></header>
     <p class="intro">先连接浏览器并登录，再打开你指定的 Alpha 交易页面。</p>
     <p role="status" :class="['notice', { error: failed }]">{{ message }}</p>
     <section>
@@ -88,6 +89,7 @@ onMounted(() => execute('status'))
       <button :disabled="pending || !browser.fill_supported || !price.trim() || !quantity.trim()" @click="execute('fill')">仅填表并核对</button>
       <p v-if="filled" class="notice">回读结果：{{ filled.side === 'buy' ? '买入' : '卖出' }} {{ filled.symbol }}，价格 {{ filled.price }} {{ filled.quote }}，数量 {{ filled.quantity }}。未提交订单。</p>
     </section>
+    <LiveOrder :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" />
     <section>
       <h2>操作反馈</h2>
       <p class="muted">此处显示本次打开控制台后的操作记录。</p>

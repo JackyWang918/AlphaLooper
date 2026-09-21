@@ -1,4 +1,4 @@
-"""Own Playwright in a dedicated process; never submit orders."""
+"""Own Playwright in a dedicated process; explicit live actions are separate from fill."""
 
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 from playwright.sync_api import Error, sync_playwright
 
 from app.browser.alpha import fill_form, inspect_form
+from app.browser.live import inspect_order, preflight, submit_once
 from app.browser.records import read_records
 
 
@@ -56,6 +57,17 @@ def run_worker(pipe: Connection, profile: str):
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
                         filled = fill_form(page, command["payload"])
+                    elif action in {"live_prepare", "live_submit", "live_inspect"}:
+                        if page is None or page.is_closed():
+                            raise ValueError("请先打开交易页面。")
+                        operation = {
+                            "live_prepare": preflight,
+                            "live_submit": submit_once,
+                            "live_inspect": inspect_order,
+                        }[action]
+                        result = operation(page, command["payload"])
+                        pipe.send({"ok": True, **result})
+                        continue
                     elif action == "read_records":
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
@@ -89,7 +101,7 @@ def run_worker(pipe: Connection, profile: str):
                         str(exc)
                         if isinstance(exc, ValueError)
                         else (
-                            "页面操作或回读核对失败。可能存在弹窗、验证或输入值被修改；请检查 Chrome 后刷新状态。未提交订单。"
+                            "页面操作或回读核对失败，请人工检查。若正在实盘提交，结果可能未知，不会自动重试下单。"
                         )
                     )
                     pipe.send({"ok": False, "message": message})
