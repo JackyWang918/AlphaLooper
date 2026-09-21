@@ -9,7 +9,17 @@ type State = { symbol?: string; clock?: number; inventory?: string; cost?: strin
 type Risk = { covered: boolean; loss: string | null; loss_pct: string | null; exit_net: string | null }
 const props = defineProps<{ url: string }>()
 const quote = ref('USDT')
-const config = ref({ amount:'50', window:15, buy_offset:'0.5', sell_offset:'0.5', fee_bps:'10', stop_pct:'2', budget:'10', reserve:'2', wait_seconds:300, exit_seconds:15, exit_level:6 })
+const config = ref({ amount:'50', window:15, buy_offset:'0.5', sell_offset:'0.5', fee_bps:'1', stop_pct:'2', budget:'10', reserve:'2', wait_seconds:300, exit_seconds:15, exit_level:6 })
+const feePercent = computed(() => {
+  const value = config.value.fee_bps.trim()
+  if (!/^\d+(?:\.\d+)?$/.test(value)) return '—'
+  // Convert basis points to percent by shifting decimal digits, without rounding.
+  const [whole = '0', fraction = ''] = value.split('.')
+  const digits = whole.padStart(3, '0')
+  const integer = digits.slice(0, -2).replace(/^0+(?=\d)/, '')
+  const decimals = (digits.slice(-2) + fraction).replace(/0+$/, '')
+  return decimals ? `${integer}.${decimals}` : integer
+})
 const feeConfirmed = ref(false)
 const snapshot = ref<Snapshot | null>(null)
 const estimate = ref<Estimate | null>(null)
@@ -97,7 +107,7 @@ async function simulate(kind:string, advance=0) {
         <label>主动退出重挂间隔（秒，试验值）<input v-model.number="config.exit_seconds" type="number" /></label>
         <label>主动退出买盘档位<input v-model.number="config.exit_level" type="number" /></label>
       </div></details>
-      <label class="check"><input v-model="feeConfirmed" type="checkbox" /> 我已核对手续费假设（10 基点 = 0.1%，不是系统查到的实际费率）</label>
+      <label class="check"><input v-model="feeConfirmed" type="checkbox" /> 我已核对手续费假设（买入和卖出各 {{config.fee_bps || '—'}} 基点 = {{feePercent}}%，按手动填写值计算）</label>
       <button :disabled="!feeConfirmed || !url.trim()" @click="refresh">{{busy?'读取中…':'获取行情并试算'}}</button>
       <label class="check"><input v-model="autoRefresh" type="checkbox" /> 每 10 秒刷新行情（不自动推进沙盒或填写浏览器）</label>
     </fieldset>
