@@ -12,7 +12,7 @@
 
 本机初始化环境：Python 3.12.13（uv 管理）、uv 0.10.12、Node.js 24.14.1、npm 11.11.0。Python 版本约束与锁文件位于 `backend`，前端使用 npm 锁文件。
 
-详细设计见 [技术方案](docs/technical-plan.md)。
+换机或开启新 Codex 会话时，先读 [项目目的与接续说明](docs/project-context.md)。详细设计见 [技术方案](docs/technical-plan.md)。根目录 [AGENTS.md](AGENTS.md) 提供接续阅读顺序和项目约定。
 
 ## 技术选型
 
