@@ -110,3 +110,15 @@ def test_same_time_ordering_unknown_and_decimal_precision():
     result = ledger.update(e, "a", observation(side="卖出", gross="0.2", order_id="2"))
     assert result["stats"][0]["estimated_realized_pnl"] is None
     assert result["orders"][1]["estimated_fee"] == "0.0000123456789012345678"
+
+
+def test_only_first_history_order_and_no_fallback_to_older_order():
+    # Numeric IDs remain text; creation order is supplied by the history page.
+    current = observation(order_id="20")
+    older = observation(order_id="19")["tables"][1]["rows"]
+    current["tables"][1]["rows"].extend(older)
+    result, skipped = ledger.extract(current)
+    assert [order["order_id"] for order in result] == ["20"]
+    assert skipped == 0
+    current["tables"][1]["rows"].pop(1)  # First order is not expanded.
+    assert ledger.extract(current) == ([], 1)

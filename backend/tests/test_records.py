@@ -96,7 +96,7 @@ def test_large_tables_flag_incomplete(page):
     assert not result["verified_for_accounting"]
 
 
-def test_api_persists_evidence_without_ledger_or_execution(tmp_path, monkeypatch):
+def test_unrecognized_order_does_not_write_ledger_or_snapshots(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "records.db")
     command.upgrade(Config("alembic.ini"), "head")
     with TestClient(app) as client:
@@ -110,29 +110,27 @@ def test_api_persists_evidence_without_ledger_or_execution(tmp_path, monkeypatch
         execute = Mock(return_value={"ok": True, "observation": result})
         monkeypatch.setattr(app.state.browser, "execute", execute)
         assert (
-            client.post("/api/browser/records/read", json={"url": URL}).status_code
+            client.post("/api/account/orders/read", json={"url": URL}).status_code
             == 403
         )
         assert not execute.called
         headers = {"X-AlphaLooper-Client": "local-ui"}
         assert (
             client.post(
-                "/api/browser/records/read",
+                "/api/account/orders/read",
                 headers=headers,
                 json={"url": "https://evil.example/alpha/bsc/0x1"},
             ).status_code
             == 422
         )
         assert not execute.called
-        r = client.post("/api/browser/records/read", headers=headers, json={"url": URL})
+        r = client.post("/api/account/orders/read", headers=headers, json={"url": URL})
         assert r.status_code == 200
         execute.assert_called_once_with("read_records", URL, None)
-        saved = client.get("/api/browser/records").json()
-        assert (
-            saved[0]["id"] == r.json()["id"] and not saved[0]["verified_for_accounting"]
-        )
+        assert r.json()["orders"] == []
+        assert client.get("/api/browser/records").status_code == 404
         with app.state.engine.connect() as c:
-            assert len(c.execute(select(observations.observations)).all()) == 1
+            assert len(c.execute(select(observations.observations)).all()) == 0
             assert c.execute(select(ledger.fills)).all() == []
         assert app.state.browser._process is None
 

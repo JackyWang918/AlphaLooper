@@ -27,18 +27,19 @@ async function read() {
     if(!response.ok) throw new Error(typeof body.detail==='string'?body.detail:'读取失败')
     ledger.value=body
     localStorage.setItem('account-book',book.value.trim())
-    feedback.value=`已核对更新 ${body.updated} 笔订单；${body.skipped} 行缺少订单 ID 或字段不匹配，未入账；${body.rejected} 条冲突或旧数据未覆盖。${body.updated===0 ? ' 请确认已登录、打开历史委托并展开订单 ID。' : ''}`
+    feedback.value=body.updated ? '已更新第一笔历史委托，重复读取不会重复记账。' : body.rejected ? '订单结果与已保存记录冲突，未覆盖。' : '未取得第一笔历史委托及订单 ID，请检查页面。'
   } catch(e) {error.value=String(e)} finally {busy.value=false}
 }
 </script>
 <template>
   <section id="account-records">
     <div class="section-title"><h2>真实订单账本与统计</h2><span class="badge">只读 · 费用估算</span></div>
-    <p class="muted">直接采用平台订单汇总，按订单 ID 更新，不重复累计。请在历史委托展开要读取的订单以显示 ID；展开区域仅取 ID，不解析逐笔成交。</p>
+    <p class="muted">单笔流程：挂单 → 每分钟检查当前委托 → 委托消失后核对第一笔历史委托 → 更新账本 → 下一笔。当前仅提供手动核对入口，自动巡检和系统下单尚未接入。</p>
+    <p class="muted">手动核对时，请将历史委托按最新在前显示，并展开第一笔以显示订单 ID。只读取这一笔，不导入其他历史订单。</p>
     <label>账户账本名称<input v-model="book" :disabled="busy" maxlength="80" /></label>
     <p class="muted">切换平台账户时请使用不同账本名称。程序不会自动识别账户身份。统计只包含已读取订单，按币种与计价币分别累计，不代表全部账户资产或今日积分。</p>
     <button :disabled="busy || !book.trim()" @click="load">载入账本</button>
-    <button :disabled="busy || browserBusy || !connected || !book.trim() || !url.trim()" @click="read">{{busy?'处理中…':'读取订单汇总并更新账本'}}</button>
+    <button :disabled="busy || browserBusy || !connected || !book.trim() || !url.trim()" @click="read">{{busy?'处理中…':'核对第一笔历史委托'}}</button>
     <p v-if="!connected" class="muted">请先连接独立 Chrome，并手动登录打开历史委托。</p>
     <p v-if="error" role="alert" class="notice error">{{error}}</p>
     <p v-if="feedback" role="status">{{feedback}}</p>

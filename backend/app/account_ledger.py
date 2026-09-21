@@ -43,69 +43,59 @@ def amount(value):
 
 
 def extract(observation):
-    """Only associate an ID detail row with its immediately preceding summary."""
-    result, skipped = [], 0
+    """Read the first history order only; never fall through to an older order."""
     if observation.get("login_prompt_visible"):
-        return result, skipped
+        return [], 0
     tables = observation.get("tables", [])
     for i, table in enumerate(tables):
         headers = table["headers"] or (tables[i - 1]["headers"] if i else [])
-        if [h for h in headers if h] != HEADERS:
+        if [h for h in headers if h] != HEADERS or not table["rows"]:
             continue
-        pending = None
-        for row in table["rows"]:
-            if len(row) == 14 and row[0] == "":
-                row = row[1:]
-            if len(row) == 13:
-                if pending:
-                    skipped += 1
-                pending = row
-                continue
-            match = (
-                re.match(r"^订单ID[:：]\s*(\d+)\b", row[0]) if len(row) == 1 else None
-            )
-            if not match or pending is None:
-                if pending:
-                    skipped += 1
-                pending = None
-                continue
-            fields = dict(zip(HEADERS, pending))
-            pending = None
-            try:
-                quantity, symbol = amount(fields["已成交"])
-                gross, quote = amount(fields["成交额"])
-                if (
-                    symbol != fields["代币"]
-                    or quote not in {"USDT", "USDC"}
-                    or fields["方向"] not in {"买入", "卖出"}
-                    or not re.fullmatch(
-                        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", fields["创建时间"]
-                    )
-                ):
-                    raise ValueError("订单字段不匹配")
-                if (Decimal(quantity) == 0) != (Decimal(gross) == 0):
-                    raise ValueError("数量与成交额不一致")
-                result.append(
-                    {
-                        "order_id": match[1],
-                        "created_at": fields["创建时间"],
-                        "symbol": symbol,
-                        "quote": quote,
-                        "side": fields["方向"],
-                        "quantity": quantity,
-                        "gross": gross,
-                        "average_price": fields["成交均价"],
-                        "status": fields["状态"],
-                        "captured_at": observation["captured_at"],
-                        "chain": observation["chain"],
-                        "address": observation["address"],
-                    }
+        rows = table["rows"]
+        row = rows[0]
+        if len(row) == 14 and row[0] == "":
+            row = row[1:]
+        if len(row) != 13 or len(rows) < 2 or len(rows[1]) != 1:
+            return [], 1
+        match = re.match(r"^订单ID[:：]\s*(\d+)\b", rows[1][0])
+        if not match:
+            return [], 1
+        fields = dict(zip(HEADERS, row))
+        result = []
+        try:
+            quantity, symbol = amount(fields["已成交"])
+            gross, quote = amount(fields["成交额"])
+            if (
+                symbol != fields["代币"]
+                or quote not in {"USDT", "USDC"}
+                or fields["方向"] not in {"买入", "卖出"}
+                or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", fields["创建时间"]
                 )
-            except ValueError:
-                skipped += 1
-        if pending:
-            skipped += 1
-    return result, skipped
+            ):
+                raise ValueError("订单字段不匹配")
+            if (Decimal(quantity) == 0) != (Decimal(gross) == 0):
+                raise ValueError("数量与成交额不一致")
+            result.append(
+                {
+                    "order_id": match[1],
+                    "created_at": fields["创建时间"],
+                    "symbol": symbol,
+                    "quote": quote,
+                    "side": fields["方向"],
+                    "quantity": quantity,
+                    "gross": gross,
+                    "average_price": fields["成交均价"],
+                    "status": fields["状态"],
+                    "captured_at": observation["captured_at"],
+                    "chain": observation["chain"],
+                    "address": observation["address"],
+                }
+            )
+        except ValueError:
+            return [], 1
+        return result, 0
+    return [], 0
 
 
 def update(engine, book, observation):
@@ -221,7 +211,9 @@ def read(engine, book):
                     "sell_total": str(sell),
                     "estimated_fee": str(fees),
                     "estimated_points": str(buy * 4),
-                    "estimated_realized_pnl": None if unknown or ambiguous else str(pnl),
+                    "estimated_realized_pnl": None
+                    if unknown or ambiguous
+                    else str(pnl),
                     "recorded_quantity": None if unknown else str(quantity),
                     "cost_status": "成本待补齐"
                     if unknown
