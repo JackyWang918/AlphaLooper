@@ -1,0 +1,10 @@
+:root { font-family: Inter, 'Microsoft YaHei', sans-serif; color: #e6edf6; background: #101723; font-synthesis: none; }
+body { margin: 0; }
+main { max-width: 780px; margin: 10vh auto; padding: 24px; }
+.eyebrow { color: #72d8bd; letter-spacing: 2px; font-size: 13px; }
+h1 { font-size: clamp(36px, 7vw, 56px); margin: 12px 0; }
+.intro, .note { color: #a7b5c8; line-height: 1.8; }
+section { margin: 32px 0; padding: 28px; background: #1a2536; border: 1px solid #314057; border-radius: 16px; }
+h2 { font-size: 18px; margin-top: 0; }
+button { margin-top: 12px; padding: 10px 20px; border: none; border-radius: 8px; background: #72d8bd; color: #101723; font: inherit; cursor: pointer; }
+button:disabled { opacity: .6; cursor: wait; }
