@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app.browser.manager import BrowserBusy, BrowserManager
 from app.browser.schemas import FillForm, OpenPage
 from app.database import make_engine
+from app.research_api import router as research_router
 
 
 @asynccontextmanager
@@ -21,6 +22,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AlphaLooper", version="0.1.0", lifespan=lifespan)
+app.include_router(research_router)
 
 
 @app.middleware("http")

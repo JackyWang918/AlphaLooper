@@ -14,7 +14,38 @@
 
 换机或开启新 Codex 会话时，先读 [项目目的与接续说明](docs/project-context.md)。详细设计见 [技术方案](docs/technical-plan.md)。根目录 [AGENTS.md](AGENTS.md) 提供接续阅读顺序和项目约定。
 
-## 技术选型
+## 行情与策略试算
+
+在控制台输入 BSC Alpha 链接，到“行情与策略研究”确认手续费假设并点击“获取行情并试算”。无需登录，支持已匹配交易对的 USDT/USDC 计价；其他链暂未适配。
+
+- 展示已收盘 1 分钟 K 线、成交量、24 小时统计和六档盘口。
+- 用窗口成交量加权均价和收盘价标准差计算挂价，参数可调，价格/数量按交易规则取整。
+- 显式事件沙盒可验证 5 分钟撤单重挂、部分买入先转卖、每分钟 2% 检查、主动退出与 10 U 预算。
+- 沙盒不自动推断成交，不发送浏览器交易指令；参数变化需重置沙盒，刷新页面也会清空模拟状态。
+- 盘口过期、网络失败或数据异常时停止试算，不使用旧行情冒充实时行情。竞价盘口交叉时暂停模拟新买入。
+
+模型默认值、费用和预算口径见 [策略约定](docs/strategy.md)。这是研究工具，没有实现自动实盘交易。
+
+### 行情网络配置
+
+默认使用 httpx 直连。若本地网络需要代理，可将 `backend/.env.example` 复制为 `backend/.env`，设置：
+
+```dotenv
+ALPHALOOPER_HTTP_PROXY=http://127.0.0.1:7897
+ALPHALOOPER_HTTP_TRANSPORT=curl
+```
+
+`curl` 是本机 Python TLS 不兼容时的可选方式，需要已安装 curl；它保持 HTTPS 证书校验，不携带登录 Cookie。公司机器已实测该方式可取回 DGAI 行情。代理地址应按家里网络调整，不能假定始终可用。
+
+在 `backend` 中带环境文件启动：
+
+```powershell
+uv run --env-file .env uvicorn app.main:app --host 127.0.0.1 --port 18760
+```
+
+`.env` 不提交 Git。仅设置环境变量时，也可使用原有启动命令。行情接口为 `/api/research/preview`，模拟接口为 `/api/research/simulate`。
+
+## 技术栈
 
 | 部分 | 选型 |
 | --- | --- |
