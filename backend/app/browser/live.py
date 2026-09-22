@@ -1,6 +1,7 @@
 """Single-order execution adapter. Only invoked by the local live-order service."""
 
 import re
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 
@@ -170,10 +171,13 @@ def submit_once(page, payload):
     if state["side"] != command.side:
         raise ValueError("下单方向发生变化。")
     button = submit_button(page, command)
+    deadline = payload.get("quote_valid_until")
+    if deadline is not None and time.time() > deadline:
+        raise ValueError("行情已过期，未点击买卖按钮。")
     with stage("第一次点击买卖按钮（打开确认弹窗）"):
         button.click(timeout=3000)  # Never retry a possibly sent order.
     with stage("核对订单确认弹窗并点击一次继续"):
-        confirmation = confirm_once(page, command)
+        confirmation = confirm_once(page, command, deadline=deadline)
     return {"clicked": True, "confirmation_clicked": True, "confirmation": confirmation}
 
 

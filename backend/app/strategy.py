@@ -70,11 +70,18 @@ def estimate(m: Snapshot, c: Config):
         quantity = align(c.amount / (buy * (1 + c.fee_bps / 10000)), m.step)
         warnings = ["参数为试验值，成交和损耗未获验证；手续费按手动假设计算。"]
         crossed = m.bids[0][0] >= m.asks[0][0]
+        buy_blockers = []
         if crossed:
+            buy_blockers.append(
+                f"盘口交叉/锁定：买一 {m.bids[0][0]:f} ≥ 卖一 {m.asks[0][0]:f}。"
+            )
             warnings.append(
                 "竞价盘口交叉/锁定；暂停模拟新买入，深度估值不是保证成交报价。"
             )
         if buy >= m.asks[0][0]:
+            buy_blockers.append(
+                f"建议买价 {buy:f} ≥ 卖一 {m.asks[0][0]:f}，不满足当前低于卖一挂买单的规则。"
+            )
             warnings.append(
                 "历史买价已触及卖一，可能主动成交；模拟器暂停新买单，需调整参数。"
             )
@@ -92,6 +99,9 @@ def estimate(m: Snapshot, c: Config):
             "last_closed": rows[-1].close_time,
             "warnings": warnings,
             "buy_allowed": not crossed and buy < m.asks[0][0],
+            "best_bid": m.bids[0][0],
+            "best_ask": m.asks[0][0],
+            "buy_blockers": buy_blockers,
         }
 
 

@@ -39,6 +39,7 @@ class LiveOrders:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.thread = None
+        self.automatic = None
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -50,9 +51,14 @@ class LiveOrders:
             self.thread.join(timeout=50)
 
     def _loop(self):
-        while not self.stop.wait(60):
+        last_check = 0
+        while not self.stop.wait(5):
             try:
-                self.check()
+                if self.automatic and self.automatic.get():
+                    self.automatic.tick()
+                elif time.time() - last_check >= 60:
+                    last_check = time.time()
+                    self.check()
             except Exception:
                 logging.getLogger(__name__).exception("Order monitor failed")
 
@@ -95,8 +101,11 @@ class LiveOrders:
             raise ValueError(result.get("message", "浏览器执行失败"))
         return result
 
-    def submit(self, body: SubmitOrder):
+    def submit(self, body: SubmitOrder, *, owner=None, quote_valid_until=None):
         with self.lock:
+            task = self.automatic.get() if self.automatic else None
+            if task and owner != task["id"]:
+                raise ValueError("自动任务占用交易流程，请在自动任务面板操作。")
             payload = body.model_dump(mode="json")
             id = str(body.request_id)
             old = self.get(id)
@@ -104,7 +113,7 @@ class LiveOrders:
                 if old["request"] != payload:
                     raise ValueError("请求编号已使用，不能更换订单参数重试。")
                 return old
-            if not self.enabled:
+            if not self.enabled and owner is None:
                 raise ValueError("请先在本地控制台开启实盘单笔下单。")
             with localcontext() as context:
                 context.prec = 80
@@ -120,6 +129,7 @@ class LiveOrders:
                 "state": "preparing",
                 "message": "正在核对页面",
                 "baseline_id": None,
+                "task_id": owner,
             }
             with self.engine.connect() as c:
                 c.exec_driver_sql("BEGIN IMMEDIATE")
@@ -132,6 +142,10 @@ class LiveOrders:
                 c.commit()
             try:
                 result = self.call("live_prepare", payload)
+                if quote_valid_until is not None and time.time() > quote_valid_until:
+                    raise ValueError(
+                        "提交准备期间行情已过期，未点击下单，请恢复后重新估价。"
+                    )
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
                 record.update(active=False, state="not_submitted", message=str(exc))
                 self.save(record)
@@ -145,7 +159,15 @@ class LiveOrders:
                 record
             )  # Durable BEFORE any click; a crash cannot trigger replay.
             try:
-                result = self.call("live_submit", payload)
+                result = self.call(
+                    "live_submit",
+                    payload
+                    | (
+                        {"quote_valid_until": quote_valid_until}
+                        if quote_valid_until is not None
+                        else {}
+                    ),
+                )
                 if result.get("confirmation_clicked") is not True:
                     raise ValueError("执行器未确认已完成订单确认步骤，保留待核实状态。")
                 record.update(
@@ -175,10 +197,27 @@ class LiveOrders:
                 self.save(record)
                 return record
             try:
-                result = self.call("live_inspect", record["request"])
+                result = self.call(
+                    "live_progress" if record.get("task_id") else "live_inspect",
+                    record["request"],
+                )
                 record["checked_at"] = time.time()
+                record.pop("last_check_error", None)
                 if result["pending"]:
                     record.update(state="waiting", message="当前委托仍在，继续等待。")
+                    if result.get("progress"):
+                        progress = result["progress"]
+                        previous = record.get(
+                            "progress", {"quantity": "0", "gross": "0"}
+                        )
+                        if any(
+                            Decimal(progress[k]) < Decimal(previous[k])
+                            for k in previous
+                        ):
+                            raise ValueError("当前委托累计成交倒退，停止自动处理。")
+                        if Decimal(progress["quantity"]) > 0:
+                            record.setdefault("first_fill_at", record["created_at"])
+                        record["progress"] = progress
                 else:
                     order = result.get("order")
                     if not matches(order, record["request"], record["baseline_id"]):
@@ -226,6 +265,9 @@ class LiveOrders:
             return record
 
     def finish(self, record, order):
+        previous = record.get("progress", {"quantity": "0", "gross": "0"})
+        if any(Decimal(order[k]) < Decimal(previous[k]) for k in previous):
+            raise ValueError("最终成交结果小于已观察成交，保留待核实。")
         # Final result + accounting are committed together; never double-count on restart.
         finished = dict(
             record,
@@ -264,3 +306,24 @@ class LiveOrders:
             )
             c.commit()
         record.update(finished)
+
+    def cancel(self):
+        with self.lock:
+            record = self.get()
+            if not record or not record.get("task_id"):
+                raise ValueError("没有自动任务可撤销的委托。")
+            if record.get("cancel_requested_at"):
+                return record
+            if record["state"] != "waiting":
+                raise ValueError("提交结果未明确，不能自动撤单。")
+            record.update(cancel_requested_at=time.time(), cancel_state="unknown")
+            self.save(record)  # Before click; never replay after timeout/restart.
+            try:
+                result = self.call("live_cancel", record["request"])
+                record.update(cancel_state="sent", cancel_result=result)
+            except Exception as exc:  # noqa: BLE001
+                record.update(
+                    cancel_error=str(exc), message="撤单结果待核实：" + str(exc)
+                )
+            self.save(record)
+            return record

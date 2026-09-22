@@ -9,13 +9,33 @@ from decimal import Decimal
 from urllib.parse import urlencode
 
 import httpx
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.browser.schemas import token_identity
+from app.database import PROJECT_ROOT
 
 BASE = "https://www.binance.com"
 PREFIX = "/bapi/defi/v1/public/alpha-trade/"
 TOKEN_LIST = "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+ENV_FILE = PROJECT_ROOT / "backend" / ".env"
+
+
+def network_settings():
+    # Resolve against the repository, not the terminal's working directory.
+    # Explicit process settings (including an empty proxy) take precedence.
+    local = dotenv_values(ENV_FILE, encoding="utf-8-sig", interpolate=False)
+    proxy = (
+        os.environ.get("ALPHALOOPER_HTTP_PROXY", local.get("ALPHALOOPER_HTTP_PROXY"))
+        or None
+    )
+    transport = (
+        os.environ.get(
+            "ALPHALOOPER_HTTP_TRANSPORT", local.get("ALPHALOOPER_HTTP_TRANSPORT")
+        )
+        or "httpx"
+    )
+    return proxy, transport
 
 
 class MarketError(ValueError):
@@ -56,8 +76,7 @@ class Snapshot(BaseModel):
 
 def public_get(path: str, params=None):
     url = BASE + path + ("?" + urlencode(params) if params else "")
-    proxy = os.getenv("ALPHALOOPER_HTTP_PROXY") or None
-    transport = os.getenv("ALPHALOOPER_HTTP_TRANSPORT", "httpx")
+    proxy, transport = network_settings()
     try:
         if transport == "curl":
             args = [
@@ -92,7 +111,12 @@ def public_get(path: str, params=None):
     except (httpx.HTTPError, OSError, subprocess.SubprocessError, ValueError) as exc:
         if isinstance(exc, MarketError):
             raise
-        raise MarketError("公开行情请求失败，请检查网络或后端代理配置。") from exc
+        route = "已配置代理" if proxy else "直连，未配置代理"
+        endpoint = path.rstrip("/").rsplit("/", 1)[-1]
+        raise MarketError(
+            f"公开行情请求失败（接口 {endpoint}；{transport}；{route}；{type(exc).__name__}）。"
+            "请检查 Clash 是否运行及 backend/.env 的代理端口。"
+        ) from exc
 
 
 def resolve_pair(tokens, exchange, url, quote):

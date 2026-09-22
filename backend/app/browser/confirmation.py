@@ -159,7 +159,7 @@ def wait_for_confirmation(page, command, timeout_ms=5000):
     raise ValueError(f"等待订单确认弹窗内容超时：{last_error}")
 
 
-def confirm_once(page, command):
+def confirm_once(page, command, deadline=None):
     dialog = wait_for_confirmation(page, command)
     button = dialog.get_by_role("button", name="继续", exact=True)
     if button.count() != 1:
@@ -169,5 +169,7 @@ def confirm_once(page, command):
     # Re-read after the actionability wait; never confirm stale values or another token.
     verify_identity(page, command)
     evidence = validate_confirmation(dialog.inner_text(), command)
+    if deadline is not None and time.time() > deadline:
+        raise ValueError("行情已过期，未点击继续；请关闭弹窗并核对未提交状态。")
     button.click(timeout=3000)  # Never retry this click, including on timeout.
     return evidence

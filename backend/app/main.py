@@ -1,15 +1,17 @@
+import json
 from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from app import account_ledger
+from app import account_ledger, decision_log
+from app.automatic import Automatic, StartTask
 from app.browser.manager import BrowserBusy, BrowserManager
-from app.browser.schemas import FillForm, OpenPage, ReadRecords
+from app.browser.schemas import FillForm, OpenPage, ReadRecords, token_identity
 from app.database import make_engine
 from app.ledger_api import router as ledger_router
 from app.live_orders import LiveOrders, SubmitOrder
@@ -21,6 +23,7 @@ async def lifespan(app: FastAPI):
     app.state.engine = make_engine()
     app.state.browser = BrowserManager()
     app.state.live = LiveOrders(app.state.engine, app.state.browser)
+    app.state.automatic = Automatic(app.state.engine, app.state.live)
     app.state.live.start()
     try:
         yield
@@ -54,13 +57,27 @@ async def local_control(request: Request, call_next):
 def browser_action(action: str, url: str = "", payload: dict | None = None):
     try:
         with app.state.live.lock:
-            if (
-                action in {"open", "fill", "read_records", "order_readiness"}
-                and app.state.live.get()
-            ):
-                raise HTTPException(
-                    status_code=409, detail="有一笔实盘委托待确认，请先完成巡检。"
-                )
+            if action in {"open", "fill", "read_records", "order_readiness"}:
+                order = app.state.live.get()
+                automatic = app.state.live.automatic
+                task = automatic.get() if automatic else None
+                recovery_open = False
+                if action == "open" and task and not automatic.running and not order:
+                    try:
+                        recovery_open = token_identity(url) == token_identity(
+                            task["request"]["url"]
+                        )
+                    except ValueError:
+                        recovery_open = False
+                if (order or task) and not recovery_open:
+                    detail = "有实盘委托或自动任务占用流程，请先处理原任务。"
+                    if action == "open" and task and not order:
+                        detail = (
+                            "自动任务正在运行，请先暂停，再打开该任务原来的币种页面。"
+                            if automatic.running
+                            else "当前任务已暂停，只能重新打开原任务的币种页面，不能切换币种。"
+                        )
+                    raise HTTPException(status_code=409, detail=detail)
             result = app.state.browser.execute(action, url, payload)
     except BrowserBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -129,6 +146,10 @@ def live_status():
 @app.post("/api/live/enabled")
 def live_switch(body: LiveSwitch):
     with app.state.live.lock:
+        if app.state.live.automatic and app.state.live.automatic.get():
+            raise HTTPException(
+                status_code=409, detail="请使用自动任务的暂停或卖完结束操作。"
+            )
         app.state.live.enabled = body.enabled
     return {"enabled": body.enabled}
 
@@ -166,3 +187,87 @@ def live_resolve_unsubmitted(body: ResolveUnsubmitted):
         return app.state.live.resolve_unsubmitted(body.request_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/automatic")
+def automatic_status():
+    return app.state.automatic.status()
+
+
+@app.post("/api/automatic/start")
+def automatic_start(body: StartTask):
+    try:
+        return app.state.automatic.create(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class TaskControl(BaseModel):
+    task_id: UUID
+    action: Literal["pause", "resume", "finish"]
+
+
+@app.post("/api/automatic/control")
+def automatic_control(body: TaskControl):
+    try:
+        return app.state.automatic.control(body.task_id, body.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+DecisionKind = Literal[
+    "control",
+    "buy_wait",
+    "buy",
+    "sell",
+    "risk",
+    "cancel",
+    "execution",
+    "order_check",
+    "fill",
+    "completed",
+    "error",
+]
+
+
+@app.get("/api/automatic/{task_id}/decisions")
+def automatic_decisions(
+    task_id: UUID,
+    before: int | None = Query(None, ge=1),
+    kind: DecisionKind | None = None,
+    limit: int = Query(50, ge=1, le=200),
+):
+    task = app.state.automatic.get(str(task_id))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    return {
+        "task_id": str(task_id),
+        "config": task["request"]["config"],
+        **decision_log.read(app.state.engine, str(task_id), before, kind, limit),
+    }
+
+
+@app.get("/api/automatic/{task_id}/decisions/export")
+def automatic_decisions_export(task_id: UUID, kind: DecisionKind | None = None):
+    task = app.state.automatic.get(str(task_id))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    engine = app.state.engine
+
+    def lines():
+        yield (
+            json.dumps(
+                {"type": "task", "task_id": str(task_id), "request": task["request"]},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        yield from decision_log.export(engine, str(task_id), kind)
+
+    return StreamingResponse(
+        lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="decisions-{task_id}.jsonl"'
+        },
+    )

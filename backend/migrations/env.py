@@ -2,6 +2,7 @@ from alembic import context
 
 from app import (
     account_ledger,  # noqa: F401
+    automatic,  # noqa: F401
     ledger,  # noqa: F401 -- register ledger tables in migration metadata
     live_orders,  # noqa: F401
     observations,  # noqa: F401 -- register read-only observations
