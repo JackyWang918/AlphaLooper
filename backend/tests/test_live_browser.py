@@ -4,11 +4,52 @@ from playwright.sync_api import sync_playwright
 from app.browser.live import (
     inspect_order,
     inspect_unsubmitted,
+    matches,
     order_readiness,
     preflight,
     submit_once,
 )
 from tests.test_alpha import PAYLOAD
+
+
+def history_order(**changes):
+    order = {
+        "order_id": "new-order",
+        "symbol": "DGAI",
+        "quote": "USDT",
+        "side": "买入",
+        "chain": "bsc",
+        "address": "0x10d4183389e99233db3cc981c43443ebd28ebd5e",
+        "requested_quantity": "1",
+        "quantity": "1",
+        "limit_price": "0.9",
+    }
+    order.update(changes)
+    return order
+
+
+def test_buy_history_allows_platform_quantity_rounding_by_one_step():
+    payload = {**PAYLOAD, "quantity": "47.88000000", "price": "1.04397948"}
+    order = history_order(
+        requested_quantity="47.87",
+        quantity="47.87",
+        limit_price="1.04397948",
+        quantity_step="0.01",
+    )
+    assert matches(order, payload, "old-order")
+    assert not matches({**order, "requested_quantity": "47.86"}, payload, "old-order")
+    assert not matches({**order, "requested_quantity": "47.89"}, payload, "old-order")
+
+
+def test_sell_history_still_requires_exact_requested_quantity():
+    payload = {**PAYLOAD, "side": "sell", "quantity": "47.88"}
+    order = history_order(
+        side="卖出",
+        requested_quantity="47.87",
+        quantity="47.87",
+        quantity_step="0.01",
+    )
+    assert not matches(order, payload, "old-order")
 
 
 @pytest.fixture

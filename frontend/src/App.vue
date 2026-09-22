@@ -76,6 +76,10 @@ async function execute(action: 'status' | 'launch' | 'open' | 'fill') {
     pending.value = false
   }
 }
+function openTaskPage(url: string) {
+  tradeUrl.value = url
+  void execute('open')
+}
 
 onMounted(() => execute('status'))
 </script>
@@ -110,7 +114,7 @@ onMounted(() => execute('status'))
     </section>
     </div>
     <div v-show="activeTab==='automatic'" id="panel-automatic" role="tabpanel" aria-labelledby="tab-automatic">
-      <AutomaticTrading :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
+      <AutomaticTrading :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" @open-task-page="openTaskPage" />
     </div>
     <div v-show="activeTab==='tools'" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools">
     <section>

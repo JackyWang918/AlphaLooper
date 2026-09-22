@@ -2,8 +2,8 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
-const emit=defineEmits<{refreshBrowser:[]}>()
-type Task = {id:string; active:boolean; phase:string; message:string; request:{expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{exit_net:string|null; loss:string|null}|null}
+const emit=defineEmits<{refreshBrowser:[];openTaskPage:[url:string]}>()
+type Task = {id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{exit_net:string|null; loss:string|null}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -112,6 +112,10 @@ onUnmounted(()=>clearInterval(timer))
       <ul><li v-for="reason in (current.estimate.buy_blockers??current.estimate.warnings?.filter(w=>w.includes('暂停模拟新买入')||w.includes('历史买价已触及卖一'))??[])" :key="reason">{{reason}}</li></ul>
     </div>
     <p v-if="!running" class="muted">当前不会自动提交或撤单。处理提示后点击“核对后恢复任务”；后端重启也需要手动恢复。</p>
+    <div v-if="!running" class="actions">
+      <button class="secondary" :disabled="busy||browserBusy||!connected" @click="emit('openTaskPage',current.request.url)">重新打开本任务交易页面</button>
+    </div>
+    <p v-if="!running" class="muted">此按钮只恢复本任务原币种页面，不填表、不提交、不撤单，也不会自动恢复任务。</p>
     <p>已完成 {{current.rounds}} 轮 · 累计买入 {{current.buy_total}} U · 目标 {{current.request.config.target_points}} 分（买入额 × 4）</p>
     <p>任务持仓 {{current.inventory}} · 本轮投入成本 {{current.cost}} U · 本轮卖出净收入 {{current.proceeds}} U</p>
     <p>已结束轮次预计盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U · 估算手续费 {{current.fees}} U</p>

@@ -33,6 +33,46 @@ def install_order(page, *, price="0.9 USDT", quantity="1 DGAI", direction="买�
     page.evaluate("window.cancels=0")
 
 
+def install_current_layout(page, *, status="新订单", duplicate_blank_headers=False):
+    headers = [
+        "时间",
+        "代币",
+        "类型",
+        "方向",
+        "价格",
+        "数量",
+        "状态",
+        "反向订单",
+        "条件",
+        "止盈/止损",
+        "全部取消",
+    ]
+    if duplicate_blank_headers:
+        headers[-2:] = ["", ""]
+    fields = [
+        "2026-09-22 18:04:26",
+        "DGAI",
+        "限价",
+        "买入",
+        "0.9 USDT",
+        "1 DGAI",
+        status,
+        "-",
+        "-",
+        "-",
+        '<button onclick="window.cancels++"><svg></svg></button>',
+    ]
+    html = (
+        "<table><thead><tr>"
+        + "".join(f"<th>{value}</th>" for value in headers)
+        + "</tr></thead><tbody><tr>"
+        + "".join(f"<td>{value}</td>" for value in fields)
+        + "</tr></tbody></table>"
+    )
+    page.locator("#current").evaluate("(element,html)=>element.innerHTML=html", html)
+    page.evaluate("window.cancels=0")
+
+
 def test_partial_progress_and_single_scoped_cancel(page):
     install_order(page)
     assert inspect_progress(page, PAYLOAD)["progress"] == {
@@ -45,6 +85,68 @@ def test_partial_progress_and_single_scoped_cancel(page):
     assert cancel_once(page, PAYLOAD)["cancel_clicked"]
     assert page.evaluate("window.cancels") == 1
     assert page.evaluate("window.wrong||false") is False
+
+
+def test_actual_current_layout_reports_zero_progress_for_new_order(page):
+    install_current_layout(page)
+    assert inspect_progress(page, PAYLOAD)["progress"] == {
+        "quantity": "0",
+        "gross": "0",
+    }
+    assert cancel_once(page, PAYLOAD)["cancel_clicked"]
+    assert page.evaluate("window.cancels") == 1
+
+
+def test_split_header_and_body_tables_use_the_platform_header(page):
+    install_current_layout(page)
+    page.locator("#current").evaluate("""panel => {
+      const bodyTable=panel.querySelector('table');
+      const headerTable=document.createElement('table');
+      headerTable.appendChild(bodyTable.querySelector('thead'));
+      panel.insertBefore(headerTable, bodyTable);
+    }""")
+    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+
+
+def test_fixed_platform_layout_works_when_header_is_not_semantic_dom(page):
+    install_current_layout(page)
+    page.locator("#current thead").evaluate("element=>element.remove()")
+    assert inspect_progress(page, PAYLOAD)["progress"] == {
+        "quantity": "0",
+        "gross": "0",
+    }
+
+
+def test_irrelevant_duplicate_blank_headers_do_not_break_field_mapping(page):
+    install_current_layout(page, duplicate_blank_headers=True)
+    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+
+
+def test_current_layout_stops_if_status_may_include_a_partial_fill(page):
+    install_current_layout(page, status="部分成交")
+    with pytest.raises(ValueError, match="没有已成交和成交额列"):
+        inspect_progress(page, PAYLOAD)
+
+
+def test_surplus_empty_edge_header_is_ignored(page):
+    install_current_layout(page)
+    page.locator("#current thead tr").evaluate(
+        "element=>element.appendChild(document.createElement('th'))"
+    )
+    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+
+
+def test_named_header_cell_count_error_reports_observed_layout(page):
+    install_current_layout(page)
+    page.locator("#current thead tr").evaluate(
+        """element => {
+          const header=document.createElement('th');
+          header.textContent='未知业务列';
+          element.appendChild(header);
+        }"""
+    )
+    with pytest.raises(ValueError, match="表头有 12 列、订单行有 11 列"):
+        inspect_progress(page, PAYLOAD)
 
 
 @pytest.mark.parametrize(

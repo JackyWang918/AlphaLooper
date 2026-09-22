@@ -62,16 +62,23 @@ def browser_action(action: str, url: str = "", payload: dict | None = None):
                 automatic = app.state.live.automatic
                 task = automatic.get() if automatic else None
                 recovery_open = False
-                if action == "open" and task and not automatic.running and not order:
+                if action == "open" and (task or order):
                     try:
-                        recovery_open = token_identity(url) == token_identity(
-                            task["request"]["url"]
+                        recovery_urls = []
+                        if task and not automatic.running:
+                            recovery_urls.append(task["request"]["url"])
+                        if order and (not task or not automatic.running):
+                            recovery_urls.append(order["request"]["url"])
+                        requested = token_identity(url)
+                        recovery_open = bool(recovery_urls) and all(
+                            requested == token_identity(expected)
+                            for expected in recovery_urls
                         )
-                    except ValueError:
+                    except (KeyError, TypeError, ValueError):
                         recovery_open = False
                 if (order or task) and not recovery_open:
                     detail = "有实盘委托或自动任务占用流程，请先处理原任务。"
-                    if action == "open" and task and not order:
+                    if action == "open" and task:
                         detail = (
                             "自动任务正在运行，请先暂停，再打开该任务原来的币种页面。"
                             if automatic.running

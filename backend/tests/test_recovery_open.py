@@ -48,13 +48,33 @@ def test_recovery_does_not_unlock_other_actions(services, action, url):
     browser.execute.assert_not_called()
 
 
-@pytest.mark.parametrize("reason", ["running", "pending_order"])
-def test_running_task_or_unresolved_order_still_blocks_navigation(services, reason):
+def test_running_task_still_blocks_navigation(services):
     live, browser = services
-    if reason == "running":
-        live.automatic.running = True
-    else:
-        live.get = lambda: {"active": True}
+    live.automatic.running = True
     with pytest.raises(HTTPException):
         browser_action("open", URL)
+    browser.execute.assert_not_called()
+
+
+def test_paused_task_with_unresolved_order_can_restore_original_page(services):
+    live, browser = services
+    live.get = lambda: {"active": True, "request": {"url": URL}}
+    assert browser_action("open", URL)["ok"]
+    browser.execute.assert_called_once_with("open", URL, None)
+    assert not live.automatic.running
+
+
+def test_unresolved_manual_order_can_restore_its_original_page(services):
+    live, browser = services
+    live.automatic.get = lambda: None
+    live.get = lambda: {"active": True, "request": {"url": URL}}
+    assert browser_action("open", URL)["ok"]
+    browser.execute.assert_called_once_with("open", URL, None)
+
+
+def test_unresolved_order_cannot_open_another_coin(services):
+    live, browser = services
+    live.get = lambda: {"active": True, "request": {"url": URL}}
+    with pytest.raises(HTTPException):
+        browser_action("open", URL.replace("0x123", "0x456"))
     browser.execute.assert_not_called()

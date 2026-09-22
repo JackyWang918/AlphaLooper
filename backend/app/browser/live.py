@@ -126,7 +126,13 @@ def latest_history(page, payload):
         orders, _ = extract(read_records(page, command.url))
     if len(orders) != 1:
         raise ValueError("无法读取第一笔历史委托汇总。")
-    return orders[0]
+    order = orders[0]
+    # Buy orders are entered by quote total. Binance derives the requested base
+    # quantity and may round it down by one visible quantity step.
+    quantity_step = page.locator("#limitAmount").get_attribute("step")
+    if quantity_step:
+        order["quantity_step"] = quantity_step
+    return order
 
 
 def order_readiness(page, payload):
@@ -211,13 +217,22 @@ def inspect_unsubmitted(page, payload):
 def matches(order, payload, baseline_id):
     if not order or order["order_id"] == baseline_id:
         return False
+    try:
+        requested = Decimal(order.get("requested_quantity", "-1"))
+        planned = Decimal(payload["quantity"])
+        if payload["side"] == "buy" and order.get("quantity_step"):
+            step = Decimal(order["quantity_step"])
+            quantity_matches = step > 0 and 0 <= planned - requested <= step
+        else:
+            quantity_matches = requested == planned
+    except (ArithmeticError, ValueError):
+        return False
     return (
         order["symbol"] == payload["expected_symbol"]
         and order["quote"] == payload["expected_quote"]
         and order["side"] == TABS[payload["side"]]
         and (order["chain"], order["address"]) == token_identity(payload["url"])
-        and Decimal(order.get("requested_quantity", "-1"))
-        == Decimal(payload["quantity"])
+        and quantity_matches
         and Decimal(order.get("limit_price", "-1")) == Decimal(payload["price"])
         and Decimal(order["quantity"]) <= Decimal(payload["quantity"])
     )
