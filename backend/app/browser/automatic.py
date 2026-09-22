@@ -9,7 +9,7 @@ import re
 import time
 from decimal import Decimal
 
-from app.browser.alpha import TABS, verify_identity
+from app.browser.alpha import TABS, FormNotReady, verify_identity
 from app.browser.confirmation import MODALS, NUMBER, confirmation_dialogs
 from app.browser.live import current_order, select_panel
 from app.browser.schemas import FillForm
@@ -35,6 +35,10 @@ CURRENT_PLATFORM_HEADERS = (
     "止盈/止损",
     "操作",
 )
+
+
+class CancelNotClicked(ValueError):
+    """Cancellation stopped before the real cancel control was clicked."""
 
 
 def no_dialog(page):
@@ -177,6 +181,16 @@ def cancel_all_button(page, row):
     if button.count() > 1:
         raise ValueError("当前委托区域有多个“全部取消”按钮，未点击。")
 
+    # The production page may expose the same control as styled text rather
+    # than an element with button semantics.
+    text_control = panel.get_by_text(
+        re.compile(r"^(全部取消|取消全部|撤销全部)$"), exact=True
+    ).filter(visible=True)
+    if text_control.count() == 1:
+        return text_control
+    if text_control.count() > 1:
+        raise ValueError("当前委托区域有多个“全部取消”文字控件，未点击。")
+
     # Some observed layouts expose the sole cancel-all control as an icon in
     # the only order row. The task invariant still requires exactly one order.
     headers, _, cells = row_columns(row)
@@ -222,11 +236,20 @@ def inspect_progress(page, payload):
     if payload.get("refresh_before_check"):
         page.reload(wait_until="domcontentloaded", timeout=30000)
         refreshed = True
-    _, detail = current_detail(page, payload)
     try:
+        _, detail = current_detail(page, payload)
         balances = wallet_snapshot(
             page, payload, pending=detail is not None, detail=detail
         )
+        _, after = current_detail(page, payload)
+    except FormNotReady as exc:
+        return {
+            "pending": None,
+            "settling": True,
+            "page_loading": True,
+            "message": str(exc),
+            "page_refreshed": refreshed,
+        }
     except ValueError as exc:
         if "冻结余额尚未释放" in str(exc):
             return {
@@ -235,7 +258,6 @@ def inspect_progress(page, payload):
                 "page_refreshed": refreshed,
             }
         raise
-    _, after = current_detail(page, payload)
     if detail != after:
         return {
             "pending": after is not None,
@@ -251,15 +273,18 @@ def inspect_progress(page, payload):
 
 
 def cancel_once(page, payload):
-    row, progress = current_detail(page, payload)
-    if row is None:
-        return {"cancel_clicked": False, "already_absent": True}
-    button = cancel_all_button(page, row)
-    button.click(trial=True, timeout=3000)
-    row, _ = current_detail(page, payload)
-    if row is None:
-        return {"cancel_clicked": False, "already_absent": True}
-    button = cancel_all_button(page, row)
+    try:
+        row, progress = current_detail(page, payload)
+        if row is None:
+            return {"cancel_clicked": False, "already_absent": True}
+        button = cancel_all_button(page, row)
+        button.click(trial=True, timeout=3000)
+        row, _ = current_detail(page, payload)
+        if row is None:
+            return {"cancel_clicked": False, "already_absent": True}
+        button = cancel_all_button(page, row)
+    except Exception as exc:
+        raise CancelNotClicked(str(exc)) from exc
     button.click(timeout=3000)
     confirmation = confirm_cancel_all(page)
     return {

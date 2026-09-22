@@ -6,7 +6,12 @@ from pathlib import Path
 from playwright.sync_api import Error, sync_playwright
 
 from app.browser.alpha import fill_form, inspect_form
-from app.browser.automatic import available_balance, cancel_once, inspect_progress
+from app.browser.automatic import (
+    CancelNotClicked,
+    available_balance,
+    cancel_once,
+    inspect_progress,
+)
 from app.browser.confirmation import confirmation_preview
 from app.browser.diagnostics import run_test
 from app.browser.live import (
@@ -167,6 +172,15 @@ def run_worker(pipe: Connection, profile: str):
                                 else {"fill_supported": False}
                             ),
                             "filled": filled,
+                        }
+                    )
+                except CancelNotClicked as exc:
+                    pipe.send(
+                        {
+                            "ok": True,
+                            "cancel_clicked": False,
+                            "retryable": True,
+                            "message": str(exc),
                         }
                     )
                 except (Error, ValueError, AssertionError) as exc:

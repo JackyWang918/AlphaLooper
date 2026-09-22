@@ -92,3 +92,28 @@ def test_new_error_does_not_present_previous_market_as_fresh(rig):
         "items"
     ][0]
     assert row["evidence"] == {} and "公开行情" in row["reason"]
+
+
+def test_paused_order_watch_logs_only_meaningful_changes(rig):
+    r = rig
+    tick(r)
+    r.auto.control(r.body.request_id, "pause")
+    task_id = str(r.body.request_id)
+
+    tick(r, 60)
+    first = decision_log.read(r.auto.engine, task_id, kind="order_check")["items"]
+    assert len(first) == 1
+
+    # The read-only watcher remains active, but an unchanged order must not
+    # keep producing strategy log rows while the task is paused.
+    tick(r, 60)
+    unchanged = decision_log.read(r.auto.engine, task_id, kind="order_check")[
+        "items"
+    ]
+    assert unchanged == first
+
+    # A real balance change is still recorded once for reconciliation.
+    r.browser.partial("1")
+    tick(r, 60)
+    changed = decision_log.read(r.auto.engine, task_id, kind="order_check")["items"]
+    assert len(changed) == 2

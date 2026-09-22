@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[];openTaskPage:[url:string]}>()
-type Task = {accounting_version?:number;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
+type Task = {accounting_version?:number;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; current_points?:string; points_per_u?:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -17,7 +17,14 @@ const blockedReason=computed(()=>{
   if(!props.url.trim())return '请先填写目标币种的交易链接。'
   return ''
 })
-const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),buyCheckSeconds=ref(5)
+const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),buyCheckSeconds=ref(20)
+const requiredPoints=computed(()=>{
+  const goal=Number(target.value),existing=Number(currentPoints.value)
+  return Number.isFinite(goal)&&Number.isFinite(existing)&&existing<=goal?goal-existing:null
+})
+function fmtPoints(value:number){return Number.isFinite(value)?value.toLocaleString('zh-CN',{maximumFractionDigits:8}):'—'}
+function earnedPoints(task:Task){return Number(task.buy_total)*Number(task.request.config.points_per_u??4)}
+function totalPoints(task:Task){return Number(task.request.config.current_points??0)+earnedPoints(task)}
 let timer:ReturnType<typeof setInterval>|undefined
 let refreshPromise:Promise<void>|null=null
 let requestId=localStorage.getItem('automatic-request-id')||crypto.randomUUID()
@@ -48,7 +55,7 @@ async function start(){
   try{
     await refresh()
     if(!statusReady.value||current.value)return
-    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,window:windowSize.value,buy_offset:buyOffset.value,sell_offset:sellOffset.value,buy_check_seconds:buyCheckSeconds.value}})
+    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,current_points:currentPoints.value,window:windowSize.value,buy_offset:buyOffset.value,sell_offset:sellOffset.value,buy_check_seconds:buyCheckSeconds.value}})
     // Rotate only after a definite response. A lost response retries the same ID.
     requestId=crypto.randomUUID();localStorage.setItem('automatic-request-id',requestId)
     if(task.active)current.value=task
@@ -100,7 +107,9 @@ onUnmounted(()=>clearInterval(timer))
       <label>账本<input v-model="book" /></label>
       <label>每轮计划买入金额（最多 50 U）<input v-model="amount" inputmode="decimal" /></label>
       <label>本任务目标积分（最多 32,768）<input v-model="target" inputmode="decimal" /></label>
+      <label>启动时已有积分<input v-model="currentPoints" inputmode="decimal" /></label>
     </div>
+    <p class="muted">本任务还需新增：{{requiredPoints===null?'请检查积分输入':fmtPoints(requiredPoints)}} 分。启动后已有积分固定，任务只累计实际买入金额 × 4；卖出不计分。</p>
     <details><summary>估价试验参数</summary><div class="fields">
       <label>1 分钟 K 线窗口<input v-model.number="windowSize" type="number" min="3" max="240" /></label>
       <label>买入波动偏移系数<input v-model="buyOffset" inputmode="decimal" /></label>
@@ -126,7 +135,8 @@ onUnmounted(()=>clearInterval(timer))
       <button class="secondary" :disabled="busy||browserBusy||!connected" @click="emit('openTaskPage',current.request.url)">重新打开本任务交易页面</button>
     </div>
     <p v-if="!running" class="muted">此按钮只恢复本任务原币种页面，不填表、不提交、不撤单，也不会自动恢复任务。</p>
-    <p>已完成 {{current.rounds}} 轮 · 累计买入 {{current.buy_total}} U · 目标 {{current.request.config.target_points}} 分（买入额 × 4）</p>
+    <p>已完成 {{current.rounds}} 轮 · 累计买入 {{current.buy_total}} U</p>
+    <p>积分进度：启动已有 {{current.request.config.current_points??'0'}} 分 + 本任务预计新增 {{fmtPoints(earnedPoints(current))}} 分 = {{fmtPoints(totalPoints(current))}} / {{current.request.config.target_points}} 分。</p>
     <p>代币余额 {{current.inventory}} · 本轮实际支出 {{current.cost}} U · 本轮卖出收入 {{current.proceeds}} U</p>
     <p>已结束轮次现金盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U（余额差不重复扣手续费）</p>
     <p>本轮起始 USDT：{{current.round_start_quote??'尚未开始'}} · 计划买入 {{current.round_plan??'—'}} U · 已撤单重挂 {{current.buy_rehangs??0}} / 10 次。</p>

@@ -21,6 +21,13 @@ intents = Table(
     Column("payload", Text, nullable=False),
 )
 
+PAGE_LOADING_TIMEOUT_SECONDS = 60
+MAX_CANCEL_DISCOVERY_ATTEMPTS = 10
+CANCEL_DISCOVERY_RETRY_SECONDS = 15
+LEGACY_SAFE_CANCEL_ERRORS = {
+    "未找到当前委托区域唯一的“全部取消”控件，未点击。",
+}
+
 
 class SubmitOrder(FillForm):
     request_id: UUID
@@ -197,6 +204,21 @@ class LiveOrders:
             record = self.get()
             if not record:
                 return None
+            if (
+                record.get("cancel_error") in LEGACY_SAFE_CANCEL_ERRORS
+                and not record.get("cancel_confirmed_at")
+            ):
+                # Older code persisted an unknown cancel intent even though its
+                # adapter explicitly confirmed that no control was clicked.
+                record.pop("cancel_requested_at", None)
+                record.pop("cancel_error", None)
+                record["cancel_state"] = "not_clicked"
+                record["cancel_discovery_attempts"] = max(
+                    1, record.get("cancel_discovery_attempts", 0)
+                )
+                record["cancel_retry_after"] = time.time()
+                record["message"] = "上次未点击撤单控件，将重新识别。"
+                self.save(record)
             if record["state"] == "preparing":
                 # Restart happened before the durable submit marker, so no click occurred.
                 record.update(
@@ -211,7 +233,10 @@ class LiveOrders:
                 self.save(record)
                 return record
             try:
-                refresh_before_check = bool(record.get("cancel_refresh_pending"))
+                refresh_before_check = bool(
+                    record.get("cancel_refresh_pending")
+                    or record.get("absence_refresh_pending")
+                )
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",
                     record["request"]
@@ -219,17 +244,39 @@ class LiveOrders:
                 )
                 if refresh_before_check and result.get("page_refreshed"):
                     record["cancel_refresh_pending"] = False
+                    record["absence_refresh_pending"] = False
                     record["cancel_page_refreshed_at"] = time.time()
+                    record["absence_refreshed_at"] = time.time()
                 record["checked_at"] = time.time()
                 record.pop("last_check_error", None)
-                if result.get("settling"):
+                if result.get("page_loading"):
+                    record.pop("settlement_candidate", None)
+                    started = record.setdefault("page_loading_started_at", time.time())
+                    elapsed = time.time() - started
+                    if elapsed >= PAGE_LOADING_TIMEOUT_SECONDS:
+                        raise ValueError(
+                            "等待交易表单加载超过 60 秒，任务已暂停；"
+                            "请确认页面仍为本任务币种。"
+                        )
+                    record.update(
+                        state="settling",
+                        message=(
+                            f"{result.get('message', '交易表单仍在加载。')}"
+                            f"将在 5 秒后重试（已等待 {int(elapsed)} 秒）。"
+                        ),
+                    )
+                elif result.get("settling"):
+                    record.pop("page_loading_started_at", None)
                     record.pop("settlement_candidate", None)
                     record.update(
                         state="settling",
                         message="读取期间委托或冻结余额变化，等待余额稳定。",
                     )
                 elif result["pending"]:
+                    record.pop("page_loading_started_at", None)
                     record.pop("settlement_candidate", None)
+                    record.pop("absence_refresh_pending", None)
+                    record.pop("absence_refreshed_at", None)
                     record.update(
                         state="waiting",
                         observed_pending=True,
@@ -238,17 +285,25 @@ class LiveOrders:
                         message="当前委托仍在，按余额跟踪。",
                     )
                 else:
+                    record.pop("page_loading_started_at", None)
                     if record.get("accounting_version") != 2:
                         raise ValueError(
                             "旧订单没有买入前余额基准，不能转换为新口径。请核对后结束旧任务。"
                         )
                     balances = result["balances"]
-                    if not record.get("observed_pending") and balances == record.get(
-                        "before_balances"
-                    ):
-                        raise ValueError(
-                            "无挂单且余额未变化，提交结果仍未知；不会自动重发。"
+                    if not record.get("absence_refreshed_at"):
+                        record.pop("settlement_candidate", None)
+                        record.update(
+                            state="settling",
+                            absence_refresh_pending=True,
+                            message="当前无委托；下次先刷新交易页，再核对余额。",
                         )
+                        self.save(record)
+                        return record
+                    unchanged_unknown = (
+                        not record.get("observed_pending")
+                        and balances == record.get("before_balances")
+                    )
                     previous = record.get("settlement_candidate")
                     if not previous or previous["balances"] != balances:
                         record["settlement_candidate"] = {
@@ -259,6 +314,11 @@ class LiveOrders:
                             state="settling", message="当前无委托，等待下一次余额核对。"
                         )
                     elif time.time() - previous["at"] >= 2:
+                        if unchanged_unknown:
+                            raise ValueError(
+                                "确认弹窗已点击，但刷新后从未看到当前委托，且余额稳定后仍与提交前相同；"
+                                "无法确认平台是否接受订单，不会自动重发。"
+                            )
                         self.finish(record, balances)
                         return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
@@ -334,15 +394,62 @@ class LiveOrders:
                 raise ValueError("没有自动任务可撤销的委托。")
             if record.get("cancel_requested_at"):
                 return record
+            if record.get("cancel_discovery_exhausted"):
+                return record
+            if time.time() < record.get("cancel_retry_after", 0):
+                return record
             if record["state"] != "waiting":
                 raise ValueError("提交结果未明确，不能自动撤单。")
             record.update(cancel_requested_at=time.time(), cancel_state="unknown")
             self.save(record)  # Before click; never replay after timeout/restart.
             try:
                 result = self.call("live_cancel", record["request"])
+                if result.get("already_absent"):
+                    record.pop("cancel_requested_at", None)
+                    record.pop("cancel_retry_after", None)
+                    record.update(
+                        cancel_state="not_needed",
+                        state="settling",
+                        message="撤单前委托已消失，等待余额核对。",
+                    )
+                    self.save(record)
+                    return record
+                if result.get("retryable") and not result.get("cancel_clicked"):
+                    attempts = record.get("cancel_discovery_attempts", 0) + 1
+                    record.pop("cancel_requested_at", None)
+                    record.update(
+                        cancel_state="not_clicked",
+                        cancel_discovery_attempts=attempts,
+                        cancel_retry_after=time.time()
+                        + CANCEL_DISCOVERY_RETRY_SECONDS,
+                        message=(
+                            f"尚未识别撤单控件，确认未点击；将在 15 秒后重试"
+                            f"（{attempts}/{MAX_CANCEL_DISCOVERY_ATTEMPTS}）。"
+                        ),
+                    )
+                    if attempts >= MAX_CANCEL_DISCOVERY_ATTEMPTS:
+                        record.update(
+                            cancel_discovery_exhausted=True,
+                            cancel_error=(
+                                f"连续 {attempts} 次未识别撤单控件，均确认未点击；"
+                                "已暂停，请检查平台页面布局。"
+                            ),
+                            message=(
+                                f"连续 {attempts} 次未识别撤单控件，均确认未点击；"
+                                "已暂停，请检查平台页面布局。"
+                            ),
+                        )
+                    self.save(record)
+                    return record
                 if result.get("confirmation_clicked") is not True:
                     raise ValueError("执行器未确认已点击取消全部订单弹窗的确认按钮。")
                 confirmed_at = time.time()
+                for key in (
+                    "cancel_retry_after",
+                    "cancel_discovery_exhausted",
+                    "cancel_error",
+                ):
+                    record.pop(key, None)
                 record.update(
                     cancel_state="confirmed",
                     cancel_result=result,

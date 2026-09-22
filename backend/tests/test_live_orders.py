@@ -98,16 +98,25 @@ def test_balance_updates_reset_settlement_candidate(service):
 
 def test_unknown_empty_unchanged_does_not_invent_non_submission(service):
     body = submitted(service, fails=True)
-    assert observe(service)["state"] == "submission_unknown"
-    service.now[0] += 60
-    assert observe(service)["active"]
-    assert service.submit(body)["state"] == "submission_unknown"
+    assert observe(service)["state"] == "settling"
+    assert observe(service)["state"] == "settling"  # refreshed baseline
+    assert service.browser.execute.call_args.kwargs["payload"][
+        "refresh_before_check"
+    ] is True
+    service.now[0] += 5
+    checked = observe(service)
+    assert checked["active"] and "不会自动重发" in checked["last_check_error"]
+    assert service.submit(body)["active"]
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
     assert service.resolve_unsubmitted(body.request_id)["state"] == "not_submitted"
 
 
 def test_unknown_can_reconcile_real_balance_changes_without_retry(service):
     submitted(service, fails=True)
     observe(service, wallet("99.1", "1"))
+    observe(service, wallet("99.1", "1"))  # refreshed baseline
     service.now[0] += 5
     assert not observe(service, wallet("99.1", "1"))["active"]
     assert [c.args[0] for c in service.browser.execute.call_args_list].count(
@@ -143,6 +152,7 @@ def test_restart_does_not_replay_and_preserves_first_error(service):
 def test_wrong_direction_delta_does_not_complete(service):
     submitted(service)
     observe(service, wallet("101", "1"))
+    observe(service, wallet("101", "1"))  # refreshed baseline
     service.now[0] += 5
     result = observe(service, wallet("101", "1"))
     assert result["active"] and "方向" in result["last_check_error"]
@@ -179,6 +189,28 @@ def test_confirmed_cancel_waits_then_refreshes_before_check(service):
     assert checked["cancel_refresh_pending"] is False
 
 
+def test_page_loading_retries_without_error_then_times_out(service):
+    submitted(service)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "pending": None,
+        "settling": True,
+        "page_loading": True,
+        "message": "交易表单仍在加载币种和计价币。",
+    }
+
+    first = service.check()
+    assert first["state"] == "settling"
+    assert first.get("last_check_error") is None
+    assert "5 秒后重试" in first["message"]
+
+    service.now[0] += 59
+    assert service.check().get("last_check_error") is None
+    service.now[0] += 1
+    timed_out = service.check()
+    assert "超过 60 秒" in timed_out["last_check_error"]
+
+
 def test_cancel_confirmation_missing_remains_unknown_and_never_retries(service):
     submitted(service)
     record = service.get()
@@ -192,6 +224,62 @@ def test_cancel_confirmation_missing_remains_unknown_and_never_retries(service):
     assert [call.args[0] for call in service.browser.execute.call_args_list].count(
         "live_cancel"
     ) == 1
+
+
+def test_cancel_control_not_clicked_retries_after_delay(service):
+    submitted(service)
+    record = service.get()
+    record["task_id"] = "task"
+    service.save(record)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "cancel_clicked": False,
+        "retryable": True,
+        "message": "未找到撤单控件，未点击。",
+    }
+
+    first = service.cancel()
+    assert first.get("cancel_requested_at") is None
+    assert first["cancel_state"] == "not_clicked"
+    assert first["cancel_discovery_attempts"] == 1
+    assert first["cancel_retry_after"] == service.now[0] + 15
+    assert service.cancel()["cancel_discovery_attempts"] == 1
+
+    service.now[0] += 15
+    service.browser.execute.return_value = {
+        "ok": True,
+        "confirmation_clicked": True,
+        "cancel_all": True,
+    }
+    retried = service.cancel()
+    assert retried["cancel_state"] == "confirmed"
+    assert [call.args[0] for call in service.browser.execute.call_args_list].count(
+        "live_cancel"
+    ) == 2
+
+
+def test_legacy_explicit_not_clicked_error_becomes_retryable(service):
+    submitted(service)
+    record = service.get()
+    record.update(
+        task_id="task",
+        cancel_requested_at=service.now[0],
+        cancel_state="unknown",
+        cancel_error="未找到当前委托区域唯一的“全部取消”控件，未点击。",
+    )
+    service.save(record)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "pending": True,
+        "balances": wallet(),
+        "current_order": {"side": "buy"},
+    }
+
+    checked = service.check()
+    assert checked.get("cancel_requested_at") is None
+    assert checked.get("cancel_error") is None
+    assert checked["cancel_state"] == "not_clicked"
+    assert checked["cancel_retry_after"] == service.now[0]
 
 
 def test_api_guard_and_history_endpoints_removed(tmp_path, monkeypatch):

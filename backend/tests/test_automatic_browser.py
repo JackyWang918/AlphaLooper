@@ -209,12 +209,44 @@ def test_cancel_all_requires_exactly_one_ordinary_confirmation(page):
     assert page.evaluate("window.cancelConfirmations") == 0
 
 
+def test_cancel_all_accepts_unique_styled_text_control(page):
+    install_order(page)
+    page.get_by_role("button", name="全部取消").evaluate(
+        "element=>element.outerHTML='<span id=styled-cancel onclick=\"window.requestCancelAll()\">全部取消</span>'"
+    )
+    assert cancel_once(page, PAYLOAD)["cancel_clicked"]
+    assert page.evaluate("window.cancelRequests") == 1
+    assert page.evaluate("window.cancelConfirmations") == 1
+
+
 def test_first_post_cancel_inspection_refreshes_page(page):
     loads = []
     page.on("load", lambda: loads.append(page.url))
     result = inspect_progress(page, {**PAYLOAD, "refresh_before_check": True})
     assert result["page_refreshed"]
     assert len(loads) == 1
+
+
+def test_form_suffix_loading_is_retryable(page, monkeypatch):
+    monkeypatch.setattr("app.browser.alpha.FORM_READY_TIMEOUT", 0.01)
+    page.locator("#limitPrice").locator("..").locator(
+        ".bn-textField-suffix"
+    ).evaluate("element=>element.textContent='' ")
+
+    result = inspect_progress(page, PAYLOAD)
+
+    assert result["settling"] is True
+    assert result["page_loading"] is True
+    assert "仍在加载" in result["message"]
+
+
+def test_loaded_unsupported_quote_is_not_retryable(page):
+    page.locator("#limitPrice").locator("..").locator(
+        ".bn-textField-suffix"
+    ).evaluate("element=>element.textContent='BTC'")
+
+    with pytest.raises(ValueError, match="页面计价币为 BTC"):
+        inspect_progress(page, PAYLOAD)
 
 
 def test_explicit_frozen_and_total_balances_include_locked_assets(page):

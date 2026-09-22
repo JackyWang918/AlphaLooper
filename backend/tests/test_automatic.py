@@ -20,6 +20,7 @@ class Browser:
         self.pending = None
         self.filled = D(0)
         self.cancel_fails = False
+        self.cancel_not_clicked = 0
         self.hide_frozen = False
 
     def wallet(self):
@@ -70,6 +71,14 @@ class Browser:
         if action == "live_cancel":
             if self.cancel_fails:
                 raise TimeoutError("撤单超时")
+            if self.cancel_not_clicked:
+                self.cancel_not_clicked -= 1
+                return {
+                    "ok": True,
+                    "cancel_clicked": False,
+                    "retryable": True,
+                    "message": "未找到撤单控件，未点击。",
+                }
             self.pending = None
             return {
                 "ok": True,
@@ -137,8 +146,15 @@ def tick(r, seconds=0):
 
 
 def reconciled(r, seconds=60):
-    tick(r, seconds)
-    return tick(r, 5)
+    initial = r.live.get()
+    initial_id = initial["id"] if initial else None
+    task = tick(r, seconds)
+    for _ in range(3):
+        current = r.live.get()
+        if current is None or current["id"] != initial_id:
+            return task
+        task = tick(r, 5)
+    return task
 
 
 def test_full_cash_cycle_and_no_double_count(rig):
@@ -150,6 +166,7 @@ def test_full_cash_cycle_and_no_double_count(rig):
     assert (
         tick(r, 60)["pending"]["side"] == "buy"
     )  # disappearance alone is insufficient
+    tick(r, 5)  # refreshed balance becomes the settlement candidate
     t = tick(r, 5)
     assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
     bought = t["buy_total"]
@@ -312,6 +329,26 @@ def test_cancel_timeout_never_replayed(rig):
     assert not r.auto.running and r.browser.calls.count("live_cancel") == 1
 
 
+def test_cancel_control_not_clicked_is_retried_after_fifteen_seconds(rig):
+    r = rig
+    tick(r)
+    r.browser.cancel_not_clicked = 1
+
+    t = tick(r, 300)
+    assert r.auto.running
+    assert "15 秒后重试" in t["message"]
+    assert r.browser.calls.count("live_cancel") == 1
+    record = r.live.get()
+    assert record.get("cancel_requested_at") is None
+    assert record["cancel_discovery_attempts"] == 1
+
+    tick(r, 14)
+    assert r.browser.calls.count("live_cancel") == 1
+    tick(r, 1)
+    assert r.browser.calls.count("live_cancel") == 2
+    assert r.live.get()["cancel_state"] == "confirmed"
+
+
 def test_restart_reconciles_but_never_submits_without_resume(rig):
     r = rig
     tick(r)
@@ -415,6 +452,48 @@ def test_target_and_budget_stop_new_buys(rig):
     reconciled(r)
     tick(r)
     assert r.auto.get() is None
+
+
+def test_existing_points_reduce_required_buy_amount_and_stop_threshold(rig):
+    r = rig
+    t = r.auto.get()
+    t["request"]["config"].update(target_points="120", current_points="80")
+    r.auto.save(t)
+
+    t = tick(r)
+    assert t["round_plan"] == "10"
+    assert D(t["pending"]["quote_amount"]) == 10
+
+    # The stopping comparison includes the fixed starting points.
+    t["buy_total"] = "10"
+    t.update(pending=None, round_stage="idle", round_start_quote=None)
+    r.browser.pending = None
+    with r.auto.engine.begin() as connection:
+        connection.execute(intents.delete())
+    r.auto.save(t)
+    tick(r)
+    t = r.auto.get(str(r.body.request_id))
+    assert t["active"] is False
+    assert t["stop_buying"] is True
+
+
+def test_existing_points_cannot_exceed_target():
+    with pytest.raises(ValueError, match="不能大于目标积分"):
+        StartTask(
+            request_id=uuid4(),
+            url="https://www.binance.com/zh-CN/alpha/bsc/0x1",
+            expected_symbol="TEST",
+            config={"target_points": "100", "current_points": "101"},
+        )
+
+
+def test_new_task_buy_estimate_interval_defaults_to_twenty_seconds():
+    body = StartTask(
+        request_id=uuid4(),
+        url="https://www.binance.com/zh-CN/alpha/bsc/0x1",
+        expected_symbol="TEST",
+    )
+    assert body.config.buy_check_seconds == 20
 
 
 def test_legacy_cannot_resume_but_can_retire_without_fake_balances(rig):

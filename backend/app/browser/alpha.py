@@ -9,6 +9,11 @@ from playwright.sync_api import Page, expect
 from app.browser.schemas import FillForm, token_identity
 
 TABS = {"buy": "买入", "sell": "卖出"}
+FORM_READY_TIMEOUT = 5
+
+
+class FormNotReady(ValueError):
+    """The expected trade page is open, but its form is still rendering."""
 
 
 def total_inputs(page: Page):
@@ -66,8 +71,12 @@ def inspect_form(page: Page):
         return result
     symbol = amount.locator("..").locator(".bn-textField-suffix").inner_text().strip()
     quote = price.locator("..").locator(".bn-textField-suffix").inner_text().strip()
-    if not symbol or quote not in {"USDT", "USDC"}:
-        result["reason"] = "币种或计价币尚未加载，当前仅适配 USDT/USDC 表单。"
+    result.update(symbol=symbol, quote=quote)
+    if not symbol or not quote:
+        result["reason"] = "交易表单仍在加载币种和计价币。"
+        return result
+    if quote not in {"USDT", "USDC"}:
+        result["reason"] = f"页面计价币为 {quote}，当前仅适配 USDT/USDC 表单。"
         return result
     active = []
     for side, label in TABS.items():
@@ -96,13 +105,15 @@ def inspect_form(page: Page):
 def verify_identity(page: Page, command: FillForm):
     if token_identity(page.url) != token_identity(command.url):
         raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + FORM_READY_TIMEOUT
     while True:
         state = inspect_form(page)
         if state["fill_supported"]:
             break
-        if time.monotonic() >= deadline:
+        if state.get("quote") and state["quote"] not in {"USDT", "USDC"}:
             raise ValueError(state["reason"])
+        if time.monotonic() >= deadline:
+            raise FormNotReady(state["reason"])
         time.sleep(0.1)
     if (
         state["symbol"] != command.expected_symbol

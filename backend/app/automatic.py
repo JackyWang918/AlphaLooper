@@ -12,7 +12,7 @@ from decimal import localcontext
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from sqlalchemy import Column, Integer, String, Table, Text, select
 
 from app import decision_log
@@ -32,7 +32,7 @@ tasks = Table(
 
 
 class LiveConfig(Config):
-    buy_check_seconds: int = Field(default=5, ge=5, le=300, multiple_of=5)
+    buy_check_seconds: int = Field(default=20, ge=5, le=300, multiple_of=5)
     amount: D = Field(default=D(50), gt=0, le=50)
     budget: D = Field(default=D(10), gt=0, le=10)
     fee_bps: D = Field(default=D(1), ge=1, le=1)
@@ -40,7 +40,14 @@ class LiveConfig(Config):
     wait_seconds: int = Field(default=300, ge=300, le=300)
     max_hold_seconds: int = Field(default=1800, ge=1800, le=1800)
     target_points: D = Field(default=D(32768), gt=0, le=32768)
+    current_points: D = Field(default=D(0), ge=0, le=32768)
     points_per_u: D = Field(default=D(4), ge=4, le=4)
+
+    @model_validator(mode="after")
+    def current_points_not_above_target(self):
+        if self.current_points > self.target_points:
+            raise ValueError("当前已有积分不能大于目标积分。")
+        return self
 
 
 class StartTask(TradingAccount):
@@ -162,6 +169,10 @@ class Automatic:
                 "cost": "0",
                 "proceeds": "0",
                 "buy_total": "0",
+                "starting_points": str(body.config.current_points),
+                "required_points": str(
+                    body.config.target_points - body.config.current_points
+                ),
                 "fees": "0",
                 "realized_pnl": "0",
                 "session_loss": "0",
@@ -442,25 +453,52 @@ class Automatic:
                 if record["state"] == "settling"
                 else (
                     c.exit_seconds
-                    if record.get("cancel_requested_at") or t["exiting"]
+                    if record.get("cancel_requested_at")
+                    or record.get("cancel_retry_after")
+                    or t["exiting"]
                     else 60
                 )
             )
             if now - self.last_poll >= interval or (self.running and minute_due):
+                before_check = {
+                    key: record.get(key)
+                    for key in (
+                        "active",
+                        "state",
+                        "message",
+                        "balances",
+                        "current_order",
+                        "last_check_error",
+                        "result",
+                    )
+                }
                 record = self.live.check()
                 polled = True
                 self.last_poll = now
-                self.save(
-                    t,
-                    "order_check",
-                    record["message"],
-                    {
-                        "request_id": record["id"],
-                        "status": record["state"],
-                        "balances": record.get("balances"),
-                        "error": record.get("last_check_error"),
-                    },
+                after_check = {
+                    key: record.get(key)
+                    for key in before_check
+                }
+                # A paused task keeps a read-only reconciliation watch, but
+                # unchanged polling is operational status rather than a new
+                # strategy decision. State/balance changes remain auditable.
+                changed_while_paused = (
+                    before_check != after_check
+                    and record["active"]
+                    and not record.get("last_check_error")
                 )
+                if self.running or changed_while_paused:
+                    self.save(
+                        t,
+                        "order_check",
+                        record["message"],
+                        {
+                            "request_id": record["id"],
+                            "status": record["state"],
+                            "balances": record.get("balances"),
+                            "error": record.get("last_check_error"),
+                        },
+                    )
             if record.get("last_check_error"):
                 raise ValueError("订单核对失败：" + record["last_check_error"])
         if record and not record["active"]:
@@ -484,8 +522,11 @@ class Automatic:
             t["message"] = record["message"]
             self.save(t)
             return
+        if record and record.get("cancel_discovery_exhausted"):
+            raise ValueError(record["cancel_error"])
         if (
-            D(t["buy_total"]) * c.points_per_u >= c.target_points
+            c.current_points + D(t["buy_total"]) * c.points_per_u
+            >= c.target_points
             or D(t["session_loss"]) >= c.budget
         ):
             t["stop_buying"] = True
@@ -518,6 +559,7 @@ class Automatic:
             and not minute_due
             and not t["exiting"]
             and now - record["created_at"] < c.wait_seconds
+            and now < record.get("cancel_retry_after", float("inf"))
         ):
             self.save(t)
             return
@@ -581,6 +623,10 @@ class Automatic:
                 ):
                     raise ValueError("撤单尚未确认，不重复撤单或重挂；请核对平台。")
                 return
+            retry_cancel = bool(
+                record.get("cancel_retry_after")
+                and now >= record["cancel_retry_after"]
+            )
             timeout = (
                 c.exit_seconds
                 if t["exiting"] and record["request"]["side"] == "sell"
@@ -603,6 +649,7 @@ class Automatic:
                 or enough_bought
                 or sell_dust
                 or (t["exiting"] and not t.get("pending_exit"))
+                or retry_cancel
             ):
                 reason = (
                     "页面缺少冻结余额，撤单释放后核算资产。"
@@ -613,6 +660,8 @@ class Automatic:
                     reason = "累计买入超过计划金额 50%，撤销剩余买单后转卖。"
                 elif sell_dust:
                     reason = "卖出剩余价值不超过 2 U，撤销余单后结束本轮。"
+                elif retry_cancel:
+                    reason = "上次确认未点击撤单控件，重新识别并尝试撤单。"
                 self.save(
                     t,
                     "cancel",
@@ -620,6 +669,10 @@ class Automatic:
                     {"request_id": record["id"], "timeout_seconds": timeout},
                 )
                 canceled = self.live.cancel()
+                if canceled.get("cancel_retry_after"):
+                    t["message"] = canceled["message"]
+                    self.save(t, "execution", canceled["message"])
+                    return
                 if canceled.get("cancel_error"):
                     raise ValueError(canceled["cancel_error"])
                 t["message"] = reason
@@ -656,7 +709,8 @@ class Automatic:
                 plan = min(
                     c.amount,
                     start,
-                    c.target_points / c.points_per_u - D(t["buy_total"]),
+                    (c.target_points - c.current_points) / c.points_per_u
+                    - D(t["buy_total"]),
                 )
                 if start <= 0 or plan <= 0:
                     raise ValueError("没有可用计价币可开始新一轮。")

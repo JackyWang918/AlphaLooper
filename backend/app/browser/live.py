@@ -40,7 +40,8 @@ def select_panel(page, name):
 
 def current_order(page, payload):
     command = FillForm(**payload)
-    verify_identity(page, command)
+    if token_identity(page.url) != token_identity(command.url):
+        raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
     panel = select_panel(page, "当前委托")
     # Empty requires an explicit visible message in the selected account panel.
     empty = panel.get_by_text(
