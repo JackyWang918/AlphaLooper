@@ -145,10 +145,18 @@ class LiveOrders:
                 record
             )  # Durable BEFORE any click; a crash cannot trigger replay.
             try:
-                self.call("live_submit", payload)
-                record.update(state="waiting", message="已点击提交，等待平台订单结果。")
+                result = self.call("live_submit", payload)
+                if result.get("confirmation_clicked") is not True:
+                    raise ValueError("执行器未确认已完成订单确认步骤，保留待核实状态。")
+                record.update(
+                    state="waiting",
+                    confirmation_clicked=True,
+                    confirmation=result.get("confirmation"),
+                    message="已核对订单确认单并点击继续，等待平台订单结果。",
+                )
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
-                record["message"] = "提交结果待核实：" + str(exc)
+                record["submission_error"] = str(exc)
+                record["message"] = "提交结果待核实：" + record["submission_error"]
             self.save(record)
             return record
 
@@ -182,7 +190,14 @@ class LiveOrders:
                     self.finish(record, order)
                     return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
-                record.update(message=str(exc), checked_at=time.time())
+                record.update(last_check_error=str(exc), checked_at=time.time())
+                if (
+                    record.get("submission_error")
+                    and record["state"] == "submission_unknown"
+                ):
+                    record["message"] = "提交结果待核实：" + record["submission_error"]
+                else:
+                    record["message"] = str(exc)
             self.save(record)
             return record
 

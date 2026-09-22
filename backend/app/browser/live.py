@@ -8,6 +8,7 @@ from playwright.sync_api import Error, expect
 
 from app.account_ledger import HEADERS, extract
 from app.browser.alpha import TABS, fill_form, verify_identity
+from app.browser.confirmation import confirm_once
 from app.browser.records import read_records
 from app.browser.schemas import FillForm, token_identity
 
@@ -169,10 +170,11 @@ def submit_once(page, payload):
     if state["side"] != command.side:
         raise ValueError("下单方向发生变化。")
     button = submit_button(page, command)
-    button.click(
-        timeout=3000
-    )  # Exactly one attempt. Never retry a possibly sent order.
-    return {"clicked": True}
+    with stage("第一次点击买卖按钮（打开确认弹窗）"):
+        button.click(timeout=3000)  # Never retry a possibly sent order.
+    with stage("核对订单确认弹窗并点击一次继续"):
+        confirmation = confirm_once(page, command)
+    return {"clicked": True, "confirmation_clicked": True, "confirmation": confirmation}
 
 
 def inspect_order(page, payload):

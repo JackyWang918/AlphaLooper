@@ -6,6 +6,7 @@ from pathlib import Path
 from playwright.sync_api import Error, sync_playwright
 
 from app.browser.alpha import fill_form, inspect_form
+from app.browser.confirmation import confirmation_preview
 from app.browser.live import (
     inspect_order,
     inspect_unsubmitted,
@@ -69,6 +70,7 @@ def run_worker(pipe: Connection, profile: str):
                         "live_inspect",
                         "order_readiness",
                         "live_unsubmitted",
+                        "confirmation_preview",
                     }:
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
@@ -78,6 +80,7 @@ def run_worker(pipe: Connection, profile: str):
                             "live_inspect": inspect_order,
                             "order_readiness": order_readiness,
                             "live_unsubmitted": inspect_unsubmitted,
+                            "confirmation_preview": confirmation_preview,
                         }[action]
                         result = operation(page, command["payload"])
                         pipe.send({"ok": True, **result})

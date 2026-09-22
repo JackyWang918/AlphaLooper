@@ -2,9 +2,10 @@
 import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
 const props=defineProps<{url:string;connected:boolean;symbol?:string;quote?:string;fillSupported:boolean;browserBusy:boolean;browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[]}>()
-type Intent={id:string;created_at:number;state:string;message:string;request:{side:string;price:string;quantity:string;expected_symbol:string};result?:{status:string;gross:string;quantity:string};active:boolean}
+type Intent={id:string;created_at:number;state:string;message:string;submission_error?:string;last_check_error?:string;request:{side:string;price:string;quantity:string;expected_symbol:string};result?:{status:string;gross:string;quantity:string};active:boolean}
 const enabled=ref(false),busy=ref(false),error=ref('')
 const readiness=ref('')
+const confirmationFeedback=ref('')
 const confirmedNotSubmitted=ref(false)
 const current=ref<Intent|null>(null),recent=ref<Intent[]>([])
 watch(()=>current.value?.id,()=>{confirmedNotSubmitted.value=false})
@@ -62,6 +63,7 @@ async function submit() {
 }
 function next() {requestId.value=crypto.randomUUID();localStorage.setItem('live-request-id',requestId.value);price.value='';quantity.value='';error.value='';readiness.value=''}
 async function check(){busy.value=true;error.value='';try{await request('check',{});await refresh()}catch(e){error.value=String(e)}finally{busy.value=false}}
+async function previewConfirmation(){busy.value=true;error.value='';try{const data=await request('confirmation-preview',{});confirmationFeedback.value='弹窗只读核对：'+data.reason}catch(e){error.value=String(e)}finally{busy.value=false}}
 async function resolveUnsubmitted() {
   if(!current.value||!confirmedNotSubmitted.value) return
   busy.value=true;error.value=''
@@ -86,7 +88,7 @@ onUnmounted(()=>clearInterval(timer))
 <template>
 <section>
   <div class="section-title"><h2>04 / 实盘单笔下单</h2><span class="badge">{{enabled?'已开启':'默认关闭'}}</span></div>
-  <p>此入口会真实提交一笔限价单。由你开启并点击提交后执行；买入含估算手续费上限 50 U。不会自动开启下一笔，也尚未接入自动撤单和策略循环。</p>
+  <p>此入口会真实提交一笔限价单。由你开启并点击提交后执行；程序填写后会核对平台订单确认单，并自动点击一次“继续”。买入含预计手续费上限 50 U。不会自动开启下一笔，也尚未接入自动撤单和策略循环。</p>
   <button class="secondary" :disabled="busy" @click="toggle">{{enabled?'关闭新单提交':'开启实盘单笔下单'}}</button>
   <p class="muted">关闭仅阻止新单，不撤销平台挂单。已有委托由后端每 60 秒巡检，刷新控制台不会重复下单；后端重启后新单开关关闭，继续核对未结束记录。</p>
   <p role="status">受控浏览器：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported && symbol && quote">{{symbol}} / {{quote}}</span><span v-else>未识别</span></p>
@@ -101,14 +103,18 @@ onUnmounted(()=>clearInterval(timer))
   </div>
   <p v-if="blockedReason" class="notice" role="status">暂不能提交：{{blockedReason}}</p>
   <p v-if="price&&quantity&&inputProblem&&blockedReason!==inputProblem" class="notice error">{{inputProblem}}</p>
-  <button :disabled="!!blockedReason" @click="submit">提交这一笔真实限价单</button>
+  <button :disabled="!!blockedReason" @click="submit">提交并确认这一笔真实限价单</button>
   <button class="secondary" :disabled="busy||browserBusy||!!current||!fillSupported||!symbol||!quote||!price||!quantity" @click="checkReadiness">仅检查订单读取（不下单）</button>
   <button class="secondary" :disabled="busy||!!current" @click="next">准备下一笔（清空输入）</button>
   <button class="secondary" :disabled="busy||!current" @click="check">立即检查当前订单</button>
+  <button class="secondary" :disabled="busy||!current" @click="previewConfirmation">核对当前弹窗（不点击继续）</button>
   <p v-if="error" class="notice error" role="alert">{{error}}</p>
   <p v-if="readiness" class="notice" role="status">{{readiness}}</p>
+  <p v-if="confirmationFeedback" class="notice" role="status">{{confirmationFeedback}}</p>
   <p v-if="current" class="notice">{{states[current.state]||current.state}}：{{current.message}}</p>
-  <p v-else class="muted">当前没有待确认的系统委托。</p>
+  <p v-if="current?.submission_error" class="notice error">首次提交错误：{{current.submission_error}}</p>
+  <p v-if="current?.last_check_error" class="muted">最近巡检反馈：{{current.last_check_error}}</p>
+  <p v-if="!current" class="muted">当前没有待确认的系统委托。</p>
   <div v-if="current" class="notice">
     <p>如果没有完成平台二次确认：先手动关闭确认弹窗，核对当前无挂单、历史没有本次新订单，再解除本地等待。</p>
     <label><input v-model="confirmedNotSubmitted" type="checkbox" :disabled="busy" />我确认未完成二次确认，已关闭弹窗，且平台没有本次订单。</label>

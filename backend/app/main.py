@@ -146,6 +146,15 @@ def live_check():
     return app.state.live.check()
 
 
+@app.post("/api/live/confirmation-preview")
+def live_confirmation_preview():
+    with app.state.live.lock:
+        record = app.state.live.get()
+        if not record:
+            raise HTTPException(status_code=409, detail="当前没有待确认的系统委托。")
+        return browser_action("confirmation_preview", payload=record["request"])
+
+
 class ResolveUnsubmitted(BaseModel):
     request_id: UUID
     confirmed_not_submitted: Literal[True]

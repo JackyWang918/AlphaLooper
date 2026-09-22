@@ -31,10 +31,24 @@ def page():
         <div role="tabpanel" id="current"><p>暂无订单</p></div>
         <div role="tabpanel" id="history" hidden><p>暂无订单</p></div>
         <script>
-        window.submits=0;
+        window.submits=0; window.confirmations=0;
         function side(el){document.querySelectorAll('[role=tab]:not([aria-controls])').forEach(t=>t.setAttribute('aria-selected',String(t===el)));}
         function panel(el){document.querySelectorAll('[aria-controls]').forEach(t=>{t.setAttribute('aria-selected',String(t===el));document.getElementById(t.getAttribute('aria-controls')).hidden=t!==el;});}
-        function submitOrder(){window.submits++;document.getElementById('current').innerHTML='<table><tbody><tr><td>DGAI</td><td>买入</td><td>0.9 USDT</td><td>1 DGAI</td><td>0 DGAI</td></tr></tbody></table>';}
+        function submitOrder(){
+          window.submits++;
+          const side=document.querySelector('[role=tab]:not([aria-controls])[aria-selected=true]').textContent;
+          document.body.insertAdjacentHTML('beforeend',`<div role="dialog" id="confirmation">
+            <h2>DGAI</h2><p>DGrid AI</p>
+            <div><span>类型</span><span>限价 / ${side}</span></div>
+            <div><span>委托价</span><span>0.90000000 USDT</span></div>
+            <div><span>数量</span><span>1.00 DGAI</span></div>
+            <div><span>成交额</span><span>0.90000000 USDT</span></div>
+            <div><span>预估手续费</span><span>0.0001 DGAI</span></div>
+            <div><span>付款账户</span><span>资金账户</span></div>
+            <button onclick="confirmOrder()">继续</button>
+          </div>`);
+        }
+        function confirmOrder(){window.confirmations++;document.getElementById('confirmation').remove();document.getElementById('current').innerHTML='<table><tbody><tr><td>DGAI</td><td>买入</td><td>0.9 USDT</td><td>1 DGAI</td><td>0 DGAI</td></tr></tbody></table>';}
         </script>""",
             ),
         )
@@ -48,6 +62,7 @@ def test_submit_once_pending_then_latest_final(page):
     assert page.evaluate("window.submits") == 0
     assert submit_once(page, PAYLOAD)["clicked"]
     assert page.evaluate("window.submits") == 1
+    assert page.evaluate("window.confirmations") == 1
     assert inspect_order(page, PAYLOAD) == {"pending": True}
     with pytest.raises(ValueError, match="已有挂单"):
         submit_once(page, PAYLOAD)
@@ -190,3 +205,95 @@ def test_sell_direction_and_duplicate_button_stop(page):
     with pytest.raises(ValueError, match="唯一"):
         submit_once(page, {**PAYLOAD, "side": "sell"})
     assert page.evaluate("window.submits") == 0
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_confirm_both_directions_exactly_once(page, side):
+    result = submit_once(page, {**PAYLOAD, "side": side})
+    assert result["confirmation_clicked"]
+    assert result["confirmation"]["fee_currency"] == "DGAI"
+    assert page.evaluate("[window.submits,window.confirmations]") == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "dialog.innerHTML=dialog.innerHTML.replace('1.00 DGAI','2.00 DGAI')",
+        "dialog.insertAdjacentHTML('beforeend','<button>继续</button>')",
+        "dialog.insertAdjacentHTML('beforeend','<p>安全验证</p>')",
+        "dialog.after(dialog.cloneNode(true))",
+        "dialog.querySelector('button').disabled=true",
+        "dialog.remove()",
+    ],
+)
+def test_confirmation_failures_never_click_continue(page, mutation):
+    page.evaluate(
+        """mutation => {
+      const show=window.submitOrder;
+      window.submitOrder=()=>{show();const dialog=document.querySelector('#confirmation');
+        new Function('dialog',mutation)(dialog);
+      };
+    }""",
+        mutation,
+    )
+    with pytest.raises(ValueError):
+        submit_once(page, PAYLOAD)
+    assert page.evaluate("[window.submits,window.confirmations]") == [1, 0]
+
+
+def test_modal_values_rechecked_after_trial_click(page):
+    page.evaluate("""() => {
+      const show=window.submitOrder;
+      window.submitOrder=()=>{show();const dialog=document.querySelector('#confirmation');
+        dialog.querySelector('button').addEventListener('pointerover',()=>{
+          const spans=dialog.querySelectorAll('span');
+          spans[5].textContent='2.00 DGAI';
+        },{once:true});
+      };
+    }""")
+    with pytest.raises(ValueError, match="数量"):
+        submit_once(page, PAYLOAD)
+    assert page.evaluate("window.confirmations") == 0
+
+
+def test_confirmation_nested_wrappers_and_unrelated_continue(page):
+    page.evaluate("""() => {
+      document.body.insertAdjacentHTML('beforeend','<button onclick="window.wrong=true">继续</button>');
+      const show=window.submitOrder;
+      window.submitOrder=()=>{show();const dialog=document.querySelector('#confirmation');
+        const wrapper=document.createElement('div');wrapper.className='bn-modal';
+        dialog.replaceWith(wrapper);wrapper.append(dialog);
+      };
+    }""")
+    assert submit_once(page, PAYLOAD)["confirmation_clicked"]
+    assert page.evaluate("window.wrong||false") is False
+    assert page.evaluate("window.confirmations") == 1
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_waits_for_dialog_and_delayed_field_values(page, partial):
+    page.evaluate(
+        """partial => {
+      const show=window.submitOrder;
+      window.submitOrder=()=>{
+        if(!partial){setTimeout(show,300);return;}
+        show();const dialog=document.querySelector('#confirmation');
+        const original=dialog.innerHTML;
+        dialog.innerHTML='<h2>DGAI</h2><div>类型</div>';
+        setTimeout(()=>dialog.innerHTML=original,300);
+      };
+    }""",
+        partial,
+    )
+    assert submit_once(page, PAYLOAD)["confirmation_clicked"]
+    assert page.evaluate("window.confirmations") == 1
+
+
+def test_confirmation_preview_never_clicks(page):
+    from app.browser.confirmation import confirmation_preview
+
+    page.evaluate("submitOrder()")
+    result = confirmation_preview(page, PAYLOAD)
+    assert result["valid"] and result["read_only"]
+    assert result["dialog_count"] == 1
+    assert page.evaluate("window.confirmations") == 0

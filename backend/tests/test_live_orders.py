@@ -61,7 +61,7 @@ def test_disabled_and_budget_fail_before_browser(service):
 def test_one_click_dedup_single_active_and_final_accounting(service):
     service.browser.execute.side_effect = [
         {"ok": True, "baseline_id": "122"},
-        {"ok": True, "clicked": True},
+        {"ok": True, "clicked": True, "confirmation_clicked": True},
         {"ok": True, "pending": True},
         {"ok": True, "pending": False, "order": final_order()},
     ]
@@ -108,7 +108,7 @@ def test_timeout_restart_does_not_resubmit_and_old_history_not_completion(servic
 def test_wrong_order_or_partial_open_does_not_finalize(service):
     service.browser.execute.side_effect = [
         {"ok": True, "baseline_id": None},
-        {"ok": True, "clicked": True},
+        {"ok": True, "clicked": True, "confirmation_clicked": True},
     ]
     service.submit(request())
     service.browser.execute.side_effect = None
@@ -149,10 +149,38 @@ def test_preflight_failure_never_clicks(service):
     ]
 
 
-def test_manual_unsubmitted_resolution_keeps_audit_and_never_replays(service):
+def test_missing_confirmation_ack_is_unknown_and_never_replayed(service):
     service.browser.execute.side_effect = [
         {"ok": True, "baseline_id": "123"},
         {"ok": True, "clicked": True},
+    ]
+    body = request()
+    assert service.submit(body)["state"] == "submission_unknown"
+    assert service.submit(body)["state"] == "submission_unknown"
+    assert service.browser.execute.call_count == 2
+    with pytest.raises(ValueError, match="上一笔"):
+        service.submit(request())
+
+
+def test_monitor_failure_does_not_overwrite_original_submission_error(service):
+    service.browser.execute.side_effect = [
+        {"ok": True, "baseline_id": "123"},
+        {"ok": False, "message": "等待订单确认弹窗内容超时"},
+        {"ok": False, "message": "当前委托被弹窗遮挡"},
+    ]
+    body = request()
+    service.submit(body)
+    result = service.check()
+    assert result["submission_error"] == "等待订单确认弹窗内容超时"
+    assert result["last_check_error"] == "当前委托被弹窗遮挡"
+    assert "内容超时" in result["message"]
+    assert result["active"]
+
+
+def test_manual_unsubmitted_resolution_keeps_audit_and_never_replays(service):
+    service.browser.execute.side_effect = [
+        {"ok": True, "baseline_id": "123"},
+        {"ok": True, "clicked": True, "confirmation_clicked": True},
         {"ok": True, "pending": False, "order": final_order()},
     ]
     body = request()
@@ -181,7 +209,7 @@ def test_manual_unsubmitted_resolution_keeps_audit_and_never_replays(service):
 def test_resolution_rejects_pending_changed_history_or_dialog(service, response):
     service.browser.execute.side_effect = [
         {"ok": True, "baseline_id": "123"},
-        {"ok": True, "clicked": True},
+        {"ok": True, "clicked": True, "confirmation_clicked": True},
         response,
     ]
     body = request()
@@ -196,7 +224,7 @@ def test_account_conflict_keeps_pending(service):
 
     service.browser.execute.side_effect = [
         {"ok": True, "baseline_id": None},
-        {"ok": True, "clicked": True},
+        {"ok": True, "clicked": True, "confirmation_clicked": True},
     ]
     service.submit(request())
     with service.engine.begin() as c:
@@ -231,7 +259,7 @@ def test_api_requires_local_enable_and_never_replays(tmp_path, monkeypatch):
         execute = Mock(
             side_effect=[
                 {"ok": True, "baseline_id": None},
-                {"ok": True, "clicked": True},
+                {"ok": True, "clicked": True, "confirmation_clicked": True},
             ]
         )
         monkeypatch.setattr(app.state.browser, "execute", execute)
@@ -261,7 +289,7 @@ def test_api_requires_local_enable_and_never_replays(tmp_path, monkeypatch):
         execute.reset_mock()
         execute.side_effect = [
             {"ok": True, "baseline_id": None},
-            {"ok": True, "clicked": True},
+            {"ok": True, "clicked": True, "confirmation_clicked": True},
         ]
         client.post("/api/live/enabled", json={"enabled": True}, headers=headers)
         assert (
