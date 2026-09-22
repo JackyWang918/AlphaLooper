@@ -1,7 +1,13 @@
 import pytest
 from playwright.sync_api import sync_playwright
 
-from app.browser.live import inspect_order, preflight, submit_once
+from app.browser.live import (
+    inspect_order,
+    inspect_unsubmitted,
+    order_readiness,
+    preflight,
+    submit_once,
+)
 from tests.test_alpha import PAYLOAD
 
 
@@ -79,6 +85,99 @@ def test_submit_once_pending_then_latest_final(page):
 def test_unloaded_panel_is_not_empty_and_no_click(page):
     page.locator("#current").evaluate("e=>e.innerHTML='' ")
     with pytest.raises(ValueError):
+        preflight(page, PAYLOAD)
+    assert page.evaluate("window.submits") == 0
+
+
+def test_unsubmitted_check_blocks_lingering_confirmation(page):
+    page.locator("body").evaluate(
+        "e=>e.insertAdjacentHTML('beforeend','<div role=dialog>确认买入</div>')"
+    )
+    with pytest.raises(ValueError, match="关闭"):
+        inspect_unsubmitted(page, PAYLOAD)
+    assert page.evaluate("window.submits") == 0
+
+
+def test_observed_current_empty_message_allows_preflight_without_submit(page):
+    page.locator("#current p").evaluate("e=>e.textContent='无进行中的订单'")
+    assert preflight(page, PAYLOAD) == {"baseline_id": None}
+    assert page.evaluate("window.submits") == 0
+
+
+def test_order_readiness_only_reads_and_returns_to_current_panel(page):
+    page.locator("#limitPrice").fill("0.8")
+    page.locator("#limitAmount").fill("2")
+    assert order_readiness(page, PAYLOAD) == {"baseline_id": None}
+    assert page.locator("#limitPrice").input_value() == "0.8"
+    assert page.locator("#limitAmount").input_value() == "2"
+    assert (
+        page.get_by_role("tab", name="当前委托").get_attribute("aria-selected")
+        == "true"
+    )
+    assert page.evaluate("window.submits") == 0
+
+
+@pytest.mark.parametrize("separate_column", [False, True])
+@pytest.mark.parametrize("delayed", [False, True])
+def test_history_disclosure_layouts_read_without_trading(
+    page, separate_column, delayed
+):
+    from app.account_ledger import HEADERS
+
+    fields = [
+        "2026-09-22 12:00:00",
+        "DGAI",
+        "限价",
+        "买入",
+        "0.9 USDT",
+        "0.9 USDT",
+        "1 DGAI",
+        "1 DGAI",
+        "0.9 USDT",
+        "-",
+        "-",
+        "-",
+        "已成交",
+    ]
+    icon = '<svg width="16" height="16" onclick="expandHistory(this)"><path d="M0 0 L16 16"/></svg>'
+    if separate_column:
+        fields.insert(0, icon)
+    else:
+        fields[0] = icon + fields[0]
+    html = "<table><thead><tr>" + "".join(f"<th>{h}</th>" for h in HEADERS)
+    html += "</tr></thead><tbody><tr>" + "".join(f"<td>{v}</td>" for v in fields)
+    html += "</tr></tbody></table>"
+    if delayed:
+        page.locator("#history").evaluate(
+            """(e,html)=>{
+              e.innerHTML='<table><tbody><tr><td>加载中</td></tr></tbody></table>';
+              setTimeout(()=>e.innerHTML=html, 400);
+            }""",
+            html,
+        )
+    else:
+        page.locator("#history").evaluate("(e,html)=>e.innerHTML=html", html)
+    page.evaluate("""() => { window.expandHistory = icon => {
+      icon.closest('tr').insertAdjacentHTML('afterend','<tr><td colspan="14">订单ID: 123</td></tr>');
+    }; }""")
+    assert order_readiness(page, PAYLOAD) == {"baseline_id": "123"}
+    assert page.evaluate("window.submits") == 0
+    assert page.locator("#limitPrice").input_value() == ""
+
+
+@pytest.mark.parametrize("location", ["outside", "hidden"])
+def test_current_empty_message_must_be_visible_inside_panel(page, location):
+    page.locator("#current").evaluate("e=>e.innerHTML=''")
+    page.locator("#current").evaluate("e=>e.style.minHeight='100px'")
+    if location == "outside":
+        page.locator("body").evaluate(
+            "e=>e.insertAdjacentHTML('beforeend','<p>无进行中的订单</p>')"
+        )
+    else:
+        page.locator("#current").evaluate(
+            "e=>e.innerHTML='<p hidden>无进行中的订单</p>'"
+        )
+    with pytest.raises(ValueError, match="等待当前委托列表加载"):
         preflight(page, PAYLOAD)
     assert page.evaluate("window.submits") == 0
 

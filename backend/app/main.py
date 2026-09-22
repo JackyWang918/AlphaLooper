@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from typing import Literal
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -52,7 +54,10 @@ async def local_control(request: Request, call_next):
 def browser_action(action: str, url: str = "", payload: dict | None = None):
     try:
         with app.state.live.lock:
-            if action in {"open", "fill", "read_records"} and app.state.live.get():
+            if (
+                action in {"open", "fill", "read_records", "order_readiness"}
+                and app.state.live.get()
+            ):
                 raise HTTPException(
                     status_code=409, detail="有一笔实盘委托待确认，请先完成巡检。"
                 )
@@ -95,6 +100,11 @@ def browser_fill(body: FillForm):
     return browser_action("fill", payload=body.model_dump())
 
 
+@app.post("/api/browser/order-readiness")
+def order_readiness_check(body: FillForm):
+    return browser_action("order_readiness", payload=body.model_dump())
+
+
 @app.post("/api/account/orders/read")
 def account_orders_read(body: ReadRecords):
     result = browser_action("read_records", url=body.url)
@@ -134,3 +144,16 @@ def live_submit(body: SubmitOrder):
 @app.post("/api/live/check")
 def live_check():
     return app.state.live.check()
+
+
+class ResolveUnsubmitted(BaseModel):
+    request_id: UUID
+    confirmed_not_submitted: Literal[True]
+
+
+@app.post("/api/live/resolve-unsubmitted")
+def live_resolve_unsubmitted(body: ResolveUnsubmitted):
+    try:
+        return app.state.live.resolve_unsubmitted(body.request_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

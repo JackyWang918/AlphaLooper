@@ -1,14 +1,25 @@
 """Single-order execution adapter. Only invoked by the local live-order service."""
 
 import re
+from contextlib import contextmanager
 from decimal import Decimal
 
-from playwright.sync_api import expect
+from playwright.sync_api import Error, expect
 
-from app.account_ledger import extract
+from app.account_ledger import HEADERS, extract
 from app.browser.alpha import TABS, fill_form, verify_identity
 from app.browser.records import read_records
 from app.browser.schemas import FillForm, token_identity
+
+
+@contextmanager
+def stage(name):
+    try:
+        yield
+    except (Error, AssertionError) as exc:
+        raise ValueError(f"{name}失败：控件未就绪、被遮挡或页面结构不匹配。") from exc
+    except ValueError as exc:
+        raise ValueError(f"{name}：{exc}") from exc
 
 
 def select_panel(page, name):
@@ -22,8 +33,7 @@ def select_panel(page, name):
         raise ValueError("委托区域缺少可核对的面板关联，当前页面尚不支持自动执行。")
     panel = page.locator('[role="tabpanel"]').filter(visible=True)
     panel = panel.and_(page.locator(f'[id="{panel_id}"]'))
-    if panel.count() != 1 or not panel.is_visible():
-        raise ValueError("委托区域尚未加载。")
+    expect(panel).to_be_visible(timeout=5000)
     if panel.get_attribute("aria-busy") == "true":
         raise ValueError("委托区域正在加载，请稍后检查。")
     return panel
@@ -34,13 +44,21 @@ def current_order(page, payload):
     verify_identity(page, command)
     panel = select_panel(page, "当前委托")
     # Empty requires an explicit visible message in the selected account panel.
-    empty = panel.get_by_text(re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录)$"))
+    empty = panel.get_by_text(
+        re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录|无进行中的订单)$")
+    )
     rows = panel.locator("tbody tr").filter(visible=True)
+    with stage("等待当前委托列表加载"):
+        expect(rows.first.locator("td").nth(4).or_(empty).first).to_be_visible(
+            timeout=5000
+        )
     data = [r for r in rows.all() if r.locator("td").count() >= 5]
     if not data and empty.count() == 1 and empty.is_visible():
         return {"empty": True}
     if len(data) != 1:
-        raise ValueError("当前委托不是可确认的单笔订单，暂停自动处理。")
+        raise ValueError(
+            "已找到当前委托区域，但未能确认无挂单或识别唯一订单；本次检查已停止，请核对平台列表。"
+        )
     cells = [s.strip() for s in data[0].locator("td").all_inner_texts()]
     side = TABS[command.side]
     if command.expected_symbol not in cells or side not in cells:
@@ -52,15 +70,24 @@ def current_order(page, payload):
 def latest_history(page, payload):
     command = FillForm(**payload)
     verify_identity(page, command)
-    panel = select_panel(page, "历史委托")
+    with stage("切换历史委托标签"):
+        panel = select_panel(page, "历史委托")
     rows = panel.locator("tbody tr").filter(visible=True)
-    if not rows.count():
-        empty = panel.get_by_text(
-            re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录)$")
+    empty = panel.get_by_text(re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录)$"))
+    with stage("等待历史委托列表加载"):
+        expect(rows.first.locator("td").nth(12).or_(empty).first).to_be_visible(
+            timeout=5000
         )
+    if not rows.count():
         if empty.count() == 1 and empty.is_visible():
             return None
         raise ValueError("历史委托尚未加载，不能确认结果。")
+    if (
+        rows.first.locator("td").count() < 13
+        and empty.count() == 1
+        and empty.is_visible()
+    ):
+        return None
     observation = read_records(page, command.url)
     orders, _ = extract(observation)
     if not orders:
@@ -70,28 +97,57 @@ def latest_history(page, payload):
         )
         if expand.count() != 1:
             cells = rows.first.locator("td")
-            if cells.count() != 14 or cells.first.inner_text().strip():
+            headers = [
+                h.strip() for h in panel.locator("th").all_inner_texts() if h.strip()
+            ]
+            if headers != HEADERS:
+                raise ValueError("历史委托表头不匹配，不能自动展开。")
+            first_text = cells.first.inner_text().strip() if cells.count() else ""
+            if cells.count() == 14 and not first_text:
+                icons = cells.first.locator("svg").filter(visible=True)
+                expand = icons if icons.count() == 1 else cells.first
+            elif cells.count() == 13 and re.fullmatch(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", first_text
+            ):
+                # Some layouts put the disclosure icon in the creation-time cell.
+                expand = cells.first.locator("svg").filter(visible=True)
+                if expand.count() != 1:
+                    raise ValueError("第一笔历史委托的时间列中没有唯一展开图标。")
+            else:
                 raise ValueError(
-                    "无法识别第一笔历史委托的展开控件，请手动展开后再检查。"
+                    f"无法识别第一笔历史委托的展开控件（{cells.count()} 列），请手动展开后再检查。"
                 )
-            expand = cells.first
-        expand.click(timeout=3000)
-        expect(panel.get_by_text(re.compile(r"^订单ID[:：]")).first).to_be_visible()
+        with stage("展开第一笔历史委托"):
+            expand.click(timeout=3000)
+        with stage("等待第一笔历史委托的订单 ID"):
+            expect(panel.get_by_text(re.compile(r"^订单ID[:：]")).first).to_be_visible()
         orders, _ = extract(read_records(page, command.url))
     if len(orders) != 1:
         raise ValueError("无法读取第一笔历史委托汇总。")
     return orders[0]
 
 
-def preflight(page, payload):
-    if not current_order(page, payload)["empty"]:
-        raise ValueError("平台已有挂单，不能叠加新单。")
-    previous = latest_history(page, payload)
-    fill_form(page, payload)
-    command = FillForm(**payload)
-    button = submit_button(page, command)
-    button.click(trial=True, timeout=3000)
+def order_readiness(page, payload):
+    """Read orders only: no form writes, trading clicks, or ledger writes."""
+    with stage("检查当前委托"):
+        if not current_order(page, payload)["empty"]:
+            raise ValueError("平台已有挂单，不能叠加新单。")
+    with stage("读取提交前最新历史委托"):
+        previous = latest_history(page, payload)
+    with stage("返回当前委托"):
+        select_panel(page, "当前委托")
     return {"baseline_id": previous["order_id"] if previous else None}
+
+
+def preflight(page, payload):
+    result = order_readiness(page, payload)
+    with stage("提交前填表与回读"):
+        fill_form(page, payload)
+    with stage("检查提交按钮可点击性（未点击）"):
+        command = FillForm(**payload)
+        button = submit_button(page, command)
+        button.click(trial=True, timeout=3000)
+    return result
 
 
 def submit_button(page, command):
@@ -125,6 +181,25 @@ def inspect_order(page, payload):
     if not current_order(page, payload)["empty"]:
         return {"pending": True}
     return {"pending": False, "order": latest_history(page, payload)}
+
+
+def inspect_unsubmitted(page, payload):
+    # A lingering confirmation could still send the old intent later.
+    with stage("检查交易确认弹窗是否已关闭"):
+        if (
+            page.locator('[role="dialog"], [aria-modal="true"], .bn-modal')
+            .filter(visible=True)
+            .count()
+        ):
+            raise ValueError("请先手动关闭平台确认弹窗，再核对未提交状态。")
+    result = inspect_order(page, payload)
+    if (
+        page.locator('[role="dialog"], [aria-modal="true"], .bn-modal')
+        .filter(visible=True)
+        .count()
+    ):
+        raise ValueError("平台仍有弹窗，请先手动关闭。")
+    return result
 
 
 def matches(order, payload, baseline_id):

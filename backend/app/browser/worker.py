@@ -6,7 +6,13 @@ from pathlib import Path
 from playwright.sync_api import Error, sync_playwright
 
 from app.browser.alpha import fill_form, inspect_form
-from app.browser.live import inspect_order, preflight, submit_once
+from app.browser.live import (
+    inspect_order,
+    inspect_unsubmitted,
+    order_readiness,
+    preflight,
+    submit_once,
+)
 from app.browser.records import read_records
 
 
@@ -57,13 +63,21 @@ def run_worker(pipe: Connection, profile: str):
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
                         filled = fill_form(page, command["payload"])
-                    elif action in {"live_prepare", "live_submit", "live_inspect"}:
+                    elif action in {
+                        "live_prepare",
+                        "live_submit",
+                        "live_inspect",
+                        "order_readiness",
+                        "live_unsubmitted",
+                    }:
                         if page is None or page.is_closed():
                             raise ValueError("请先打开交易页面。")
                         operation = {
                             "live_prepare": preflight,
                             "live_submit": submit_once,
                             "live_inspect": inspect_order,
+                            "order_readiness": order_readiness,
+                            "live_unsubmitted": inspect_unsubmitted,
                         }[action]
                         result = operation(page, command["payload"])
                         pipe.send({"ok": True, **result})

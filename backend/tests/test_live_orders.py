@@ -149,6 +149,48 @@ def test_preflight_failure_never_clicks(service):
     ]
 
 
+def test_manual_unsubmitted_resolution_keeps_audit_and_never_replays(service):
+    service.browser.execute.side_effect = [
+        {"ok": True, "baseline_id": "123"},
+        {"ok": True, "clicked": True},
+        {"ok": True, "pending": False, "order": final_order()},
+    ]
+    body = request()
+    service.submit(body)
+    result = service.resolve_unsubmitted(body.request_id)
+    assert result["state"] == "not_submitted" and not result["active"]
+    assert result["resolution"] == "user_confirmed_not_submitted"
+    assert service.get() is None
+    assert service.submit(body)["state"] == "not_submitted"
+    assert [c.args[0] for c in service.browser.execute.call_args_list] == [
+        "live_prepare",
+        "live_submit",
+        "live_unsubmitted",
+    ]
+    assert account_ledger.read(service.engine, "本机账户")["stats"] == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ok": True, "pending": True},
+        {"ok": True, "pending": False, "order": {"order_id": "124"}},
+        {"ok": False, "message": "确认弹窗未关闭"},
+    ],
+)
+def test_resolution_rejects_pending_changed_history_or_dialog(service, response):
+    service.browser.execute.side_effect = [
+        {"ok": True, "baseline_id": "123"},
+        {"ok": True, "clicked": True},
+        response,
+    ]
+    body = request()
+    service.submit(body)
+    with pytest.raises(ValueError):
+        service.resolve_unsubmitted(body.request_id)
+    assert service.get()["active"]
+
+
 def test_account_conflict_keeps_pending(service):
     import json
 
@@ -203,6 +245,24 @@ def test_api_requires_local_enable_and_never_replays(tmp_path, monkeypatch):
             == 409
         )
         assert execute.call_count == 0
+        execute.side_effect = None
+        execute.return_value = {"ok": True, "baseline_id": "122"}
+        assert (
+            client.post("/api/browser/order-readiness", json=PAYLOAD).status_code == 403
+        )
+        assert (
+            client.post(
+                "/api/browser/order-readiness", json=PAYLOAD, headers=headers
+            ).json()["baseline_id"]
+            == "122"
+        )
+        assert execute.call_args.args[0] == "order_readiness"
+        assert client.get("/api/live/orders").json()["recent"] == []
+        execute.reset_mock()
+        execute.side_effect = [
+            {"ok": True, "baseline_id": None},
+            {"ok": True, "clicked": True},
+        ]
         client.post("/api/live/enabled", json={"enabled": True}, headers=headers)
         assert (
             client.post("/api/live/orders", json=body, headers=headers).json()["state"]
@@ -214,6 +274,27 @@ def test_api_requires_local_enable_and_never_replays(tmp_path, monkeypatch):
         )
         assert (
             client.post("/api/browser/fill", json=PAYLOAD, headers=headers).status_code
+            == 409
+        )
+        assert execute.call_count == 2
+        resolution = {"request_id": body["request_id"], "confirmed_not_submitted": True}
+        assert (
+            client.post("/api/live/resolve-unsubmitted", json=resolution).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/live/resolve-unsubmitted",
+                json={**resolution, "confirmed_not_submitted": False},
+                headers=headers,
+            ).status_code
+            == 422
+        )
+        assert execute.call_count == 2
+        assert (
+            client.post(
+                "/api/browser/order-readiness", json=PAYLOAD, headers=headers
+            ).status_code
             == 409
         )
         assert execute.call_count == 2

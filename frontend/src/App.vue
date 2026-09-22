@@ -89,7 +89,7 @@ onMounted(() => execute('status'))
       <button :disabled="pending || !browser.fill_supported || !price.trim() || !quantity.trim()" @click="execute('fill')">仅填表并核对</button>
       <p v-if="filled" class="notice">回读结果：{{ filled.side === 'buy' ? '买入' : '卖出' }} {{ filled.symbol }}，价格 {{ filled.price }} {{ filled.quote }}，数量 {{ filled.quantity }}。未提交订单。</p>
     </section>
-    <LiveOrder :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" />
+    <LiveOrder :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
     <section>
       <h2>操作反馈</h2>
       <p class="muted">此处显示本次打开控制台后的操作记录。</p>

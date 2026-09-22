@@ -186,6 +186,30 @@ class LiveOrders:
             self.save(record)
             return record
 
+    def resolve_unsubmitted(self, request_id):
+        with self.lock:
+            record = self.get(str(request_id))
+            if not record or not record["active"]:
+                raise ValueError("该委托已结束或不存在，请刷新状态。")
+            result = self.call("live_unsubmitted", record["request"])
+            if result["pending"]:
+                raise ValueError("平台仍有挂单，不能标记为未提交。")
+            order = result.get("order")
+            latest_id = order["order_id"] if order else None
+            if latest_id != record["baseline_id"]:
+                raise ValueError(
+                    "平台历史订单已变化，请先核对实际订单结果，不能解除等待。"
+                )
+            record.update(
+                active=False,
+                state="not_submitted",
+                resolved_at=time.time(),
+                resolution="user_confirmed_not_submitted",
+                message="用户确认未完成平台二次确认；核对无挂单且历史未变化，已结束本地等待。未重新提交。",
+            )
+            self.save(record)
+            return record
+
     def finish(self, record, order):
         # Final result + accounting are committed together; never double-count on restart.
         finished = dict(
