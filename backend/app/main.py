@@ -8,10 +8,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from app import account_ledger, decision_log
+from app import decision_log
 from app.automatic import Automatic, StartTask
 from app.browser.manager import BrowserBusy, BrowserManager
-from app.browser.schemas import FillForm, OpenPage, ReadRecords, token_identity
+from app.browser.schemas import FillForm, OpenPage, token_identity
 from app.database import make_engine
 from app.ledger_api import router as ledger_router
 from app.live_orders import LiveOrders, SubmitOrder
@@ -57,7 +57,7 @@ async def local_control(request: Request, call_next):
 def browser_action(action: str, url: str = "", payload: dict | None = None):
     try:
         with app.state.live.lock:
-            if action in {"open", "fill", "read_records", "order_readiness"}:
+            if action in {"open", "fill", "order_readiness"}:
                 order = app.state.live.get()
                 automatic = app.state.live.automatic
                 task = automatic.get() if automatic else None
@@ -127,18 +127,6 @@ def browser_fill(body: FillForm):
 @app.post("/api/browser/order-readiness")
 def order_readiness_check(body: FillForm):
     return browser_action("order_readiness", payload=body.model_dump())
-
-
-@app.post("/api/account/orders/read")
-def account_orders_read(body: ReadRecords):
-    result = browser_action("read_records", url=body.url)
-    observation = result["observation"]
-    return account_ledger.update(app.state.engine, body.book, observation)
-
-
-@app.get("/api/account/orders")
-def account_orders(book: str = "本机账户"):
-    return account_ledger.read(app.state.engine, book)
 
 
 class LiveSwitch(BaseModel):
@@ -211,7 +199,7 @@ def automatic_start(body: StartTask):
 
 class TaskControl(BaseModel):
     task_id: UUID
-    action: Literal["pause", "resume", "finish"]
+    action: Literal["pause", "resume", "finish", "retire_legacy"]
 
 
 @app.post("/api/automatic/control")

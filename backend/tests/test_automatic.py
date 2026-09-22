@@ -5,87 +5,95 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine
 
-from app import account_ledger
 from app.automatic import Automatic, StartTask, tasks
 from app.decision_log import decisions
 from app.live_orders import LiveOrders, SubmitOrder, intents
 
 
 class Browser:
+    """Wallet with locked funds and incremental partial fills; no history API."""
+
     def __init__(self):
         self.calls = []
         self.balance = D(0)
+        self.cash = D(100)
         self.pending = None
-        self.latest = None
-        self.progress = {"quantity": "0", "gross": "0"}
-        self.serial = 0
+        self.filled = D(0)
         self.cancel_fails = False
+        self.hide_frozen = False
+
+    def wallet(self):
+        quote_locked = base_locked = D(0)
+        if self.pending:
+            left = D(self.pending["quantity"]) - self.filled
+            if self.pending["side"] == "buy":
+                quote_locked = max(
+                    D(0),
+                    D(self.pending["quote_amount"])
+                    - self.filled * D(self.pending["price"]),
+                )
+            else:
+                base_locked = left
+        return {
+            "quote_available": str(self.cash - quote_locked),
+            "base_available": str(self.balance - base_locked),
+            "quote_total": None
+            if self.hide_frozen and quote_locked
+            else str(self.cash),
+            "base_total": None
+            if self.hide_frozen and base_locked
+            else str(self.balance),
+        }
 
     def execute(self, action, payload=None):
         self.calls.append(action)
         if action in {"order_readiness", "live_prepare"}:
-            return {
-                "ok": True,
-                "baseline_id": self.latest["order_id"] if self.latest else None,
-            }
+            assert self.pending is None
+            return {"ok": True, "balances": self.wallet()}
         if action == "live_balance":
-            return {"ok": True, "available": str(self.balance)}
+            return {"ok": True, **self.wallet()}
         if action == "live_submit":
             assert self.pending is None
-            self.pending = payload
-            self.progress = {"quantity": "0", "gross": "0"}
+            self.pending = dict(payload)
+            if payload["side"] == "sell" and payload.get("sell_all"):
+                self.pending["quantity"] = str(self.balance)
+            self.filled = D(0)
+            return {"ok": True, "confirmation_clicked": True}
+        if action in {"live_progress", "live_inspect", "live_unsubmitted"}:
             return {
                 "ok": True,
-                "confirmation_clicked": True,
-                "confirmation": {"fee_currency": "USDT"},
-            }
-        if action == "live_progress":
-            return {
-                "ok": True,
-                "pending": bool(self.pending),
-                "progress": self.progress,
-                "order": self.latest,
-            }
-        if action == "live_unsubmitted":
-            return {
-                "ok": True,
-                "pending": bool(self.pending),
-                "order": self.latest,
+                "pending": self.pending is not None,
+                "balances": self.wallet(),
+                "current_order": self.pending,
             }
         if action == "live_cancel":
             if self.cancel_fails:
                 raise TimeoutError("撤单超时")
-            self.finish(self.progress["quantity"], status="已撤销")
+            self.pending = None
             return {"ok": True, "cancel_clicked": True}
         raise AssertionError(action)
 
-    def finish(self, quantity=None, status="已成交"):
-        r = self.pending
-        q = D(quantity if quantity is not None else r["quantity"])
-        self.balance += q if r["side"] == "buy" else -q
-        self.serial += 1
-        self.latest = {
-            "order_id": str(self.serial),
-            "created_at": f"2026-09-22 12:00:{self.serial:02d}",
-            "symbol": "TEST",
-            "quote": "USDT",
-            "chain": "bsc",
-            "address": "0x1",
-            "side": "买入" if r["side"] == "buy" else "卖出",
-            "quantity": str(q),
-            "gross": str(q * D(r["price"])),
-            "requested_quantity": r["quantity"],
-            "limit_price": r["price"],
-            "status": status,
-            "captured_at": 100,
-        }
+    def partial(self, quantity):
+        q = D(quantity) - self.filled
+        assert q >= 0
+        p = D(self.pending["price"])
+        if self.pending["side"] == "buy":
+            self.balance += q
+            self.cash -= q * p
+        else:
+            self.balance -= q
+            self.cash += q * p
+        self.filled += q
+
+    def finish(self, quantity=None):
+        self.partial(self.pending["quantity"] if quantity is None else quantity)
         self.pending = None
 
 
 @pytest.fixture
 def rig(market, monkeypatch):
     engine = create_engine("sqlite://")
-    for table in (intents, tasks, account_ledger.orders, decisions):
+    for table in (intents, tasks, decisions):
         table.create(engine)
     browser = Browser()
     now = [market.fetched_at / 1000]
@@ -122,49 +130,172 @@ def tick(r, seconds=0):
     return r.auto.get()
 
 
-def test_buy_sell_next_round_with_real_results_and_exactly_once(rig):
+def reconciled(r, seconds=60):
+    tick(r, seconds)
+    return tick(r, 5)
+
+
+def test_full_cash_cycle_and_no_double_count(rig):
     r = rig
     t = tick(r)
-    assert t["pending"]["side"] == "buy"
+    assert t["pending"]["quote_amount"] == "50"
+    assert t["round_start_quote"] == "100"
     r.browser.finish()
-    t = tick(r, 60)
-    assert t["pending"]["side"] == "sell"
+    assert (
+        tick(r, 60)["pending"]["side"] == "buy"
+    )  # disappearance alone is insufficient
+    t = tick(r, 5)
+    assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
     bought = t["buy_total"]
     r.browser.finish()
-    t = tick(r, 60)
-    assert t["rounds"] == 1 and t["pending"]["side"] == "buy"
+    t = reconciled(r)
+    assert t["rounds"] == 1 and t["pending"] is None
+    assert D(t["realized_pnl"]) == r.browser.cash - 100
     assert t["buy_total"] == bought
+    tick(r)
     assert r.browser.calls.count("live_submit") == 3
     tick(r, 5)
     assert r.browser.calls.count("live_submit") == 3
 
 
-def test_partial_buy_timeout_cancel_final_then_only_sell_partial(rig):
+def test_small_partial_buys_accumulate_and_only_top_up_remaining(rig):
     r = rig
     tick(r)
-    price = r.browser.pending["price"]
-    r.browser.progress = {"quantity": "1", "gross": str(D(price))}
+    r.browser.partial("1")
     t = tick(r, 300)
-    assert r.browser.calls.count("live_cancel") == 1
-    assert r.browser.calls.count("live_submit") == 1
     first = t["first_buy_at"]
-    t = tick(r, 15)
-    assert t["pending"]["side"] == "sell" and D(t["pending"]["quantity"]) == 1
+    assert r.browser.calls.count("live_cancel") == 1
+    t = reconciled(r, 15)
+    assert t["pending"]["side"] == "buy" and D(t["pending"]["quote_amount"]) == D(
+        "40.05"
+    )
+    assert t["buy_rehangs"] == 1 and t["round_start_quote"] == "100"
+    r.browser.finish("2")
+    t = reconciled(r)
+    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("29.85")
     assert t["first_buy_at"] == first
 
 
-def test_empty_buy_cancel_requotes_new_market(rig):
+def test_exactly_half_keeps_buying_strictly_over_half_sells(rig):
     r = rig
-    old = tick(r)["pending"]["price"]
+    tick(r)
+    r.browser.finish("1")
+    r.browser.cash = D(75)
+    r.browser.balance = D("2.52")
+    t = reconciled(r)
+    assert t["pending"]["side"] == "buy" and D(t["cost"]) == 25
+    r.browser.finish("0.01")
+    t = reconciled(r)
+    assert t["pending"]["side"] == "sell"
+
+
+def test_ten_rehangs_excludes_initial_and_is_bounded_after_resume(rig):
+    r = rig
+    tick(r)
+    for rehang in range(1, 11):
+        tick(r, 300)
+        t = reconciled(r, 15)
+        assert t["buy_rehangs"] == rehang and t["pending"]["side"] == "buy"
     tick(r, 300)
-    for candle in r.market.candles:
-        candle.quote_volume += D("0.1")
-    t = tick(r, 15)
-    assert t["pending"]["side"] == "buy"
-    assert D(t["pending"]["price"]) > D(old)
+    t = reconciled(r, 15)
+    assert not r.auto.running and t["pending"] is None
+    assert "10 次撤单重挂" in t["message"]
+    r.auto.control(r.body.request_id, "resume")
+    tick(r)
+    assert not r.auto.running and r.browser.calls.count("live_submit") == 11
+    r.auto.control(r.body.request_id, "finish")
+    tick(r)
+    tick(r)
+    assert r.auto.get() is None
 
 
-def test_cancel_timeout_never_replayed_after_resume(rig):
+def test_stop_denominator_is_start_cash_and_includes_locked_assets(rig):
+    r = rig
+    tick(r)
+    r.browser.partial("3")  # 29.85 bought, remainder locked
+    t = tick(r, 60)
+    assert not t["exiting"]
+    assert t["risk"]["denominator"] == "100"
+    assert D(t["risk"]["equity"]) == D("99.85")
+    # 2 U exactly is 2% of the initial 100 U, regardless of the 29.85 invested.
+    risk = r.auto.risk(t, {"quote_total": "70", "base_total": "3"}, D(28) / 3)
+    assert D(risk["loss_pct"]) == 2
+
+
+def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    t = reconciled(r)
+    r.browser.partial("1")
+    t = tick(r, 60)
+    assert D(t["risk"]["equity"]) == r.browser.cash + r.browser.balance * D("9.9")
+    r.market.candles[-1].close = D(8)
+    t = tick(r, 60)
+    assert t["exiting"] and r.browser.calls.count("live_cancel") == 1
+    t = reconciled(r, 15)
+    assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
+    assert D(t["pending"]["price"]) == 8
+
+
+def test_missing_frozen_is_not_false_loss_releases_for_reconciliation(rig):
+    r = rig
+    tick(r)
+    r.browser.hide_frozen = True
+    t = tick(r, 60)
+    assert t["risk"]["loss"] is None and not t["exiting"]
+    assert r.browser.calls.count("live_cancel") == 1
+    assert r.browser.calls.count("live_submit") == 1
+
+
+def test_dust_at_two_is_finished_cash_difference_not_asset_pnl(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    q = r.browser.balance - D("0.2")
+    r.browser.finish(str(q))
+    t = reconciled(r)
+    assert t["rounds"] == 1 and t["round_stage"] == "idle"
+    assert D(t["dust"]) == D("0.2")
+    assert D(t["realized_pnl"]) == r.browser.cash - 100
+    assert D(t["last_round"]["residual_value"]) <= 2
+
+
+def test_above_two_residual_is_sold_again(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.browser.finish(str(r.browser.balance - D("0.3")))
+    t = reconciled(r)
+    assert t["rounds"] == 0 and t["pending"]["side"] == "sell"
+
+
+def test_existing_tokens_included_in_sell_100(rig):
+    r = rig
+    r.browser.balance = D(7)
+    tick(r)
+    r.browser.finish()
+    t = reconciled(r)
+    assert D(t["pending"]["quantity"]) == r.browser.balance
+    assert D(t["pending"]["quantity"]) > 7
+
+
+def test_hold_timeout_does_not_reset_on_buy_rehang(rig):
+    r = rig
+    tick(r)
+    r.browser.partial("1")
+    tick(r, 300)
+    t = reconciled(r, 15)
+    first = t["first_buy_at"]
+    t = tick(r, 1500)
+    assert t["exiting"]
+    t = reconciled(r, 15)
+    assert t["first_buy_at"] == first and t["pending"]["side"] == "sell"
+
+
+def test_cancel_timeout_never_replayed(rig):
     r = rig
     tick(r)
     r.browser.cancel_fails = True
@@ -172,30 +303,43 @@ def test_cancel_timeout_never_replayed_after_resume(rig):
     assert not r.auto.running
     r.auto.control(r.body.request_id, "resume")
     tick(r, 60)
-    assert not r.auto.running
-    assert r.browser.calls.count("live_cancel") == 1
-    assert r.browser.calls.count("live_submit") == 1
+    assert not r.auto.running and r.browser.calls.count("live_cancel") == 1
 
 
-def test_restarted_task_only_reads_then_resume_sells(rig):
+def test_restart_reconciles_but_never_submits_without_resume(rig):
     r = rig
     tick(r)
     r.browser.finish()
     restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
-    restarted.tick()
-    assert not restarted.running
-    assert D(restarted.get()["inventory"]) > 0
+    r.auto = restarted
+    reconciled(r)
+    assert not restarted.running and D(restarted.get()["cost"]) > 0
+    bought = restarted.get()["buy_total"]
+    tick(r)
+    assert restarted.get()["buy_total"] == bought
     assert r.browser.calls.count("live_submit") == 1
     restarted.control(r.body.request_id, "resume")
+    tick(r)
+    assert r.auto.get()["pending"]["side"] == "sell"
+
+
+def test_intent_counter_survives_crash_between_submit_and_task_save(rig):
+    r = rig
+    tick(r)
+    t = r.auto.get()
+    t.update(buy_attempts=0, buy_rehangs=0, counted_attempt=None)
+    r.auto.save(t)
+    restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
     restarted.tick()
-    assert restarted.get()["pending"]["side"] == "sell"
-    assert r.browser.calls.count("live_submit") == 2
+    restarted.tick()
+    assert restarted.get()["buy_attempts"] == 1
+    assert r.browser.calls.count("live_submit") == 1
 
 
-def test_start_retry_does_not_resume_and_manual_submit_is_blocked(rig):
+def test_start_retry_and_manual_submit_block(rig):
     r = rig
     r.auto.control(r.body.request_id, "pause")
-    assert r.auto.create(r.body)["id"] == str(r.body.request_id)
+    r.auto.create(r.body)
     assert not r.auto.running
     with pytest.raises(ValueError, match="自动任务"):
         r.live.submit(
@@ -203,46 +347,7 @@ def test_start_retry_does_not_resume_and_manual_submit_is_blocked(rig):
         )
 
 
-def test_resolve_unconfirmed_order_ends_empty_task_and_allows_new_task(rig):
-    r = rig
-    task = tick(r)
-    record = r.live.get(task["pending"]["request_id"])
-    r.browser.pending = None
-    record.update(
-        state="submission_unknown",
-        message="提交结果待核实：确认弹窗成交额显示精度不同，未点击继续。",
-        submission_error="确认弹窗成交额显示精度不同，未点击继续。",
-    )
-    r.live.save(record)
-    status = r.auto.status()["current"]
-    assert status["pending_order"]["state"] == "submission_unknown"
-
-    finished = r.auto.resolve_unsubmitted(r.body.request_id)
-    assert not finished["active"] and finished["pending"] is None
-    assert r.auto.get() is None and r.live.get() is None
-    assert r.browser.calls.count("live_submit") == 1
-
-    replacement = r.body.model_copy(update={"request_id": uuid4()})
-    assert r.auto.create(replacement)["active"]
-
-
-def test_target_stops_buying_exits_and_completes(rig):
-    r = rig
-    t = r.auto.get()
-    t["request"]["config"]["target_points"] = "4"
-    r.auto.save(t)
-    tick(r)
-    r.browser.finish()
-    t = tick(r, 60)
-    assert t["stop_buying"] and t["exiting"] and t["pending"]["side"] == "sell"
-    assert D(t["pending"]["price"]) == D("9.9")
-    r.browser.finish()
-    tick(r, 15)
-    assert r.auto.get() is None and not r.auto.running
-    assert r.browser.calls.count("live_submit") == 2
-
-
-def test_pause_does_not_cancel_but_finish_cancels_buy(rig):
+def test_pause_never_cancels_finish_cancels_buy(rig):
     r = rig
     tick(r)
     r.auto.control(r.body.request_id, "pause")
@@ -251,129 +356,12 @@ def test_pause_does_not_cancel_but_finish_cancels_buy(rig):
     r.auto.control(r.body.request_id, "finish")
     tick(r)
     assert r.browser.calls.count("live_cancel") == 1
-    tick(r, 15)
+    reconciled(r, 15)
+    tick(r)
     assert r.auto.get() is None
 
 
-def test_hold_timeout_keeps_first_buy_time_across_rehang(rig):
-    r = rig
-    tick(r)
-    r.browser.finish()
-    t = tick(r, 60)
-    start = t["first_buy_at"]
-    t = tick(r, 1740)
-    assert t["exiting"] and r.browser.calls.count("live_cancel") == 1
-    t = tick(r, 15)
-    assert t["first_buy_at"] == start and t["pending_exit"]
-    assert D(t["pending"]["price"]) == D("9.9")
-
-
-def test_minute_stop_loss_and_budget_stop_new_buys(rig):
-    r = rig
-    tick(r)
-    r.browser.finish()
-    t = tick(r, 60)
-    r.market.candles[-1].close = D("9.5")
-    t = r.auto.get()
-    t["session_loss"] = "9"
-    r.auto.save(t)
-    t = tick(r, 5)
-    assert not t["exiting"]
-    t = tick(r, 55)
-    assert t["exiting"]
-    assert r.browser.calls.count("live_cancel") == 1
-    t = tick(r, 15)
-    assert t["stop_buying"]  # mark-to-exit loss plus prior loss exceeds budget
-
-
-def test_dust_is_not_reported_as_cleared(rig):
-    r = rig
-    tick(r)
-    r.browser.finish(quantity="0.001", status="已撤销")
-    t = tick(r, 60)
-    assert not r.auto.running and t["active"] and D(t["inventory"]) > 0
-    assert "最小" in t["message"]
-    assert r.browser.calls.count("live_submit") == 1
-
-
-def test_balance_mismatch_and_stale_market_stop_before_sell(rig):
-    r = rig
-    tick(r)
-    r.browser.finish()
-    r.browser.balance += 10
-    t = tick(r, 60)
-    assert not r.auto.running and "余额" in t["message"]
-    assert r.browser.calls.count("live_submit") == 1
-    r.auto.control(r.body.request_id, "resume")
-    r.auto.market = SimpleNamespace(snapshot=lambda *args: r.market)
-    t = tick(r, 60)
-    assert not r.auto.running and "过期" in t["message"]
-
-
-def test_regressive_partial_result_never_replaces_order(rig):
-    r = rig
-    tick(r)
-    p = D(r.browser.pending["price"])
-    r.browser.progress = {"quantity": "1", "gross": str(p)}
-    tick(r, 60)
-    r.browser.finish(quantity="0.5")
-    t = tick(r, 60)
-    assert not r.auto.running and "最终成交" in t["message"]
-    assert r.live.get()["active"]
-
-
-def test_completed_fill_consumption_survives_restart_without_double_count(rig):
-    r = rig
-    tick(r)
-    r.auto.control(r.body.request_id, "pause")
-    r.browser.finish()
-    r.live.check()  # crash between live accounting and task accounting
-    restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
-    restarted.tick()
-    amount = restarted.get()["buy_total"]
-    restarted.tick()
-    assert restarted.get()["buy_total"] == amount
-    assert restarted.get()["pending"] is None
-
-
-def test_late_fill_during_cancel_is_included_in_sell(rig):
-    r = rig
-    tick(r)
-    price = D(r.browser.pending["price"])
-    r.browser.progress = {"quantity": "1", "gross": str(price)}
-    original = r.browser.execute
-
-    def late(action, payload=None):
-        if action == "live_cancel":
-            r.browser.progress = {"quantity": "2", "gross": str(2 * price)}
-        return original(action, payload)
-
-    r.browser.execute = late
-    tick(r, 300)
-    t = tick(r, 15)
-    assert D(t["inventory"]) == 2
-    assert D(t["pending"]["quantity"]) == 2
-
-
-def test_token_fee_uses_available_net_balance_and_preserves_baseline(rig):
-    r = rig
-    t = r.auto.get()
-    t["baseline_balance"] = "7"
-    r.auto.save(t)
-    r.browser.balance = D(7)
-    tick(r)
-    record = r.live.get()
-    record["confirmation"]["fee_currency"] = "TEST"
-    r.live.save(record)
-    r.browser.finish(quantity="1")
-    r.browser.balance -= D("0.0001")
-    t = tick(r, 60)
-    assert D(t["inventory"]) == D("0.9999")
-    assert D(t["pending"]["quantity"]) == D("0.99")
-    assert D(t["cost"]) == D("9.95")
-
-
-def test_prepare_expiry_stops_before_submission_and_can_resume_once(rig):
+def test_quote_expiry_stops_before_submission(rig):
     r = rig
     original = r.browser.execute
 
@@ -384,59 +372,36 @@ def test_prepare_expiry_stops_before_submission_and_can_resume_once(rig):
         return result
 
     r.browser.execute = slow
-    t = tick(r)
-    assert not r.auto.running and t["pending"] is None
-    assert "live_submit" not in r.browser.calls
-    r.browser.execute = original
-    r.auto.control(r.body.request_id, "resume")
     tick(r)
-    assert r.browser.calls.count("live_submit") == 1
+    assert not r.auto.running and "live_submit" not in r.browser.calls
 
 
-def test_no_new_buy_when_budget_reserve_exhausted(rig):
+def test_target_and_budget_stop_new_buys(rig):
     r = rig
     t = r.auto.get()
-    t["session_loss"] = "8.1"
+    t["request"]["config"]["target_points"] = "120"
     r.auto.save(t)
     tick(r)
-    assert r.auto.get() is None
-    assert "live_submit" not in r.browser.calls
-
-
-def test_no_book_does_not_trigger_exit(rig):
-    r = rig
-    tick(r)
     r.browser.finish()
-    tick(r, 60)
-    r.market.bids = r.market.asks = []
-    t = tick(r, 60)
-    assert not t["exiting"]
-    assert t["risk"]["basis"] == "latest_closed_1m_candle"
-
-
-def test_low_ask_does_not_block_model_buy(rig):
-    r = rig
-    r.market.asks = [(D("0.8"), D(100))]
-    t = tick(r)
-    assert t["estimate"]["buy_blockers"] == []
-    assert t["pending"]["side"] == "buy"
-    assert r.browser.calls.count("live_submit") == 1
-
-
-def test_finish_before_first_tick_does_not_submit(rig):
-    r = rig
+    t = reconciled(r)
+    # Rounding can leave a small shortfall; don't invent buy volume.
+    assert t["pending"]["side"] == "sell"
     r.auto.control(r.body.request_id, "finish")
+    r.browser.finish()
+    reconciled(r)
     tick(r)
     assert r.auto.get() is None
-    assert "live_submit" not in r.browser.calls
 
 
-def test_live_task_crossed_book_does_not_block_buy(rig):
+def test_legacy_cannot_resume_but_can_retire_without_fake_balances(rig):
     r = rig
-    r.market.bids = [(D("10.2"), D(100))]
+    t = r.auto.get()
+    del t["accounting_version"]
+    r.auto.save(t)
     t = tick(r)
-    assert t["pending"]["side"] == "buy"
-    assert r.browser.calls.count("live_submit") == 1
+    assert not r.auto.running and "旧任务" in t["message"]
+    r.auto.control(r.body.request_id, "retire_legacy")
+    assert r.auto.get() is None and "live_submit" not in r.browser.calls
 
 
 def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
@@ -491,7 +456,7 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
         )  # task metadata, start, pause; duplicate start logs nothing
         assert client.get(log_url, params={"limit": 10000}).status_code == 422
         assert client.get(f"/api/automatic/{uuid4()}/decisions").status_code == 404
-        assert browser.calls == ["order_readiness", "live_balance"]
+        assert browser.calls == ["order_readiness"]
         assert (
             client.post(
                 "/api/browser/open",
@@ -522,3 +487,38 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
             ).status_code
             == 422
         )
+
+
+def test_reconcile_missing_frozen_rechecks_loss_before_any_rebuy(rig):
+    r = rig
+    tick(r)
+    r.browser.partial("1")
+    r.browser.hide_frozen = True
+    r.market.candles[-1].close = D(7)
+    t = tick(r, 60)
+    assert t["risk_reconcile"] and not t["exiting"]
+    t = reconciled(r, 15)
+    assert t["exiting"] and t["pending"]["side"] == "sell"
+    assert r.browser.calls.count("live_submit") == 2
+
+
+def test_partially_filled_buy_over_half_cancels_before_five_minutes(rig):
+    r = rig
+    tick(r)
+    r.browser.partial("3")
+    tick(r, 60)
+    assert r.browser.calls.count("live_cancel") == 1
+    t = reconciled(r, 15)
+    assert t["pending"]["side"] == "sell"
+
+
+def test_partial_sell_dust_cancels_remaining_order_before_settlement(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.browser.partial(str(r.browser.balance - D("0.2")))
+    tick(r, 60)
+    assert r.browser.calls.count("live_cancel") == 1
+    t = reconciled(r, 15)
+    assert t["rounds"] == 1 and t["pending"] is None

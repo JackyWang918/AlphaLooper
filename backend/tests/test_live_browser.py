@@ -4,52 +4,11 @@ from playwright.sync_api import sync_playwright
 from app.browser.live import (
     inspect_order,
     inspect_unsubmitted,
-    matches,
     order_readiness,
     preflight,
     submit_once,
 )
 from tests.test_alpha import PAYLOAD
-
-
-def history_order(**changes):
-    order = {
-        "order_id": "new-order",
-        "symbol": "DGAI",
-        "quote": "USDT",
-        "side": "买入",
-        "chain": "bsc",
-        "address": "0x10d4183389e99233db3cc981c43443ebd28ebd5e",
-        "requested_quantity": "1",
-        "quantity": "1",
-        "limit_price": "0.9",
-    }
-    order.update(changes)
-    return order
-
-
-def test_buy_history_allows_platform_quantity_rounding_by_one_step():
-    payload = {**PAYLOAD, "quantity": "47.88000000", "price": "1.04397948"}
-    order = history_order(
-        requested_quantity="47.87",
-        quantity="47.87",
-        limit_price="1.04397948",
-        quantity_step="0.01",
-    )
-    assert matches(order, payload, "old-order")
-    assert not matches({**order, "requested_quantity": "47.86"}, payload, "old-order")
-    assert not matches({**order, "requested_quantity": "47.89"}, payload, "old-order")
-
-
-def test_sell_history_still_requires_exact_requested_quantity():
-    payload = {**PAYLOAD, "side": "sell", "quantity": "47.88"}
-    order = history_order(
-        side="卖出",
-        requested_quantity="47.87",
-        quantity="47.87",
-        quantity_step="0.01",
-    )
-    assert not matches(order, payload, "old-order")
 
 
 @pytest.fixture
@@ -67,6 +26,8 @@ def page():
         <div><input id="limitPrice" step="0.00001"><span class="bn-textField-suffix">USDT</span></div>
         <div><input id="limitAmount" step="0.01"><span class="bn-textField-suffix">DGAI</span></div>
         <div><input id="limitTotal" step="0.00001"><span class="bn-textField-suffix">USDT</span></div>
+        <p id="cash">可用 100 USDT</p><p id="coins">可用 1 DGAI</p>
+        <button id="percent" onclick="document.getElementById('limitAmount').value='0.99';window.percents=(window.percents||0)+1">100%</button>
         <button onclick="submitOrder()">买入 DGAI</button><button onclick="submitOrder()">卖出 DGAI</button>
         <div role="tab" aria-selected="true" aria-controls="current" onclick="panel(this)">当前委托</div>
         <div role="tab" aria-selected="false" aria-controls="history" onclick="panel(this)">历史委托</div>
@@ -90,7 +51,7 @@ def page():
             <button onclick="confirmOrder()">继续</button>
           </div>`);
         }
-        function confirmOrder(){window.confirmations++;document.getElementById('confirmation').remove();document.getElementById('current').innerHTML='<table><tbody><tr><td>DGAI</td><td>买入</td><td>0.9 USDT</td><td>1 DGAI</td><td>0 DGAI</td></tr></tbody></table>';}
+        function confirmOrder(){window.confirmations++;document.getElementById('confirmation').remove();document.getElementById('current').innerHTML='<table><thead><tr><th>代币</th><th>类型</th><th>方向</th><th>价格</th><th>数量</th><th>状态</th><th>操作</th></tr></thead><tbody><tr><td>DGAI</td><td>限价</td><td>买入</td><td>0.9 USDT</td><td>1 DGAI</td><td>新订单</td><td></td></tr></tbody></table>';}
         </script>""",
             ),
         )
@@ -99,44 +60,23 @@ def page():
         browser.close()
 
 
-def test_submit_once_pending_then_latest_final(page):
-    assert preflight(page, PAYLOAD) == {"baseline_id": None}
+def test_submit_once_pending_then_balance_reconciliation_without_history(page):
+    assert preflight(page, PAYLOAD)["balances"]["quote_available"] == "100"
     assert page.evaluate("window.submits") == 0
     assert submit_once(page, PAYLOAD)["clicked"]
-    assert page.evaluate("window.submits") == 1
-    assert page.evaluate("window.confirmations") == 1
-    assert inspect_order(page, PAYLOAD) == {"pending": True}
+    assert page.evaluate("[window.submits,window.confirmations]") == [1, 1]
+    assert inspect_order(page, PAYLOAD)["pending"]
     with pytest.raises(ValueError, match="已有挂单"):
         submit_once(page, PAYLOAD)
-    assert page.evaluate("window.submits") == 1
-    from app.account_ledger import HEADERS
-
-    cells = [
-        "2026-09-22 12:00:00",
-        "DGAI",
-        "限价",
-        "买入",
-        "0.9 USDT",
-        "0.9 USDT",
-        "1 DGAI",
-        "1 DGAI",
-        "0.9 USDT",
-        "-",
-        "-",
-        "-",
-        "已成交",
-    ]
-    html = (
-        "<table><thead><tr>"
-        + "".join(f"<th>{h}</th>" for h in HEADERS)
-        + "</tr></thead><tbody><tr>"
-        + "".join(f"<td>{v}</td>" for v in cells)
-        + "</tr><tr><td>订单ID: 123</td></tr></tbody></table>"
-    )
     page.locator("#current").evaluate("e=>e.innerHTML='<p>暂无订单</p>'")
-    page.locator("#history").evaluate("(e,html)=>e.innerHTML=html", html)
+    page.locator("#cash").evaluate("e=>e.textContent='可用 99.1 USDT'")
+    page.locator("#coins").evaluate("e=>e.textContent='可用 1.9999 DGAI'")
     result = inspect_order(page, PAYLOAD)
-    assert not result["pending"] and result["order"]["order_id"] == "123"
+    assert not result["pending"] and result["balances"]["quote_available"] == "99.1"
+    assert (
+        page.get_by_role("tab", name="历史委托").get_attribute("aria-selected")
+        == "false"
+    )
 
 
 def test_unloaded_panel_is_not_empty_and_no_click(page):
@@ -157,14 +97,14 @@ def test_unsubmitted_check_blocks_lingering_confirmation(page):
 
 def test_observed_current_empty_message_allows_preflight_without_submit(page):
     page.locator("#current p").evaluate("e=>e.textContent='无进行中的订单'")
-    assert preflight(page, PAYLOAD) == {"baseline_id": None}
+    assert preflight(page, PAYLOAD)["balances"]["quote_available"] == "100"
     assert page.evaluate("window.submits") == 0
 
 
 def test_order_readiness_only_reads_and_returns_to_current_panel(page):
     page.locator("#limitPrice").fill("0.8")
     page.locator("#limitAmount").fill("2")
-    assert order_readiness(page, PAYLOAD) == {"baseline_id": None}
+    assert order_readiness(page, PAYLOAD)["balances"]["quote_available"] == "100"
     assert page.locator("#limitPrice").input_value() == "0.8"
     assert page.locator("#limitAmount").input_value() == "2"
     assert (
@@ -172,54 +112,6 @@ def test_order_readiness_only_reads_and_returns_to_current_panel(page):
         == "true"
     )
     assert page.evaluate("window.submits") == 0
-
-
-@pytest.mark.parametrize("separate_column", [False, True])
-@pytest.mark.parametrize("delayed", [False, True])
-def test_history_disclosure_layouts_read_without_trading(
-    page, separate_column, delayed
-):
-    from app.account_ledger import HEADERS
-
-    fields = [
-        "2026-09-22 12:00:00",
-        "DGAI",
-        "限价",
-        "买入",
-        "0.9 USDT",
-        "0.9 USDT",
-        "1 DGAI",
-        "1 DGAI",
-        "0.9 USDT",
-        "-",
-        "-",
-        "-",
-        "已成交",
-    ]
-    icon = '<svg width="16" height="16" onclick="expandHistory(this)"><path d="M0 0 L16 16"/></svg>'
-    if separate_column:
-        fields.insert(0, icon)
-    else:
-        fields[0] = icon + fields[0]
-    html = "<table><thead><tr>" + "".join(f"<th>{h}</th>" for h in HEADERS)
-    html += "</tr></thead><tbody><tr>" + "".join(f"<td>{v}</td>" for v in fields)
-    html += "</tr></tbody></table>"
-    if delayed:
-        page.locator("#history").evaluate(
-            """(e,html)=>{
-              e.innerHTML='<table><tbody><tr><td>加载中</td></tr></tbody></table>';
-              setTimeout(()=>e.innerHTML=html, 400);
-            }""",
-            html,
-        )
-    else:
-        page.locator("#history").evaluate("(e,html)=>e.innerHTML=html", html)
-    page.evaluate("""() => { window.expandHistory = icon => {
-      icon.closest('tr').insertAdjacentHTML('afterend','<tr><td colspan="14">订单ID: 123</td></tr>');
-    }; }""")
-    assert order_readiness(page, PAYLOAD) == {"baseline_id": "123"}
-    assert page.evaluate("window.submits") == 0
-    assert page.locator("#limitPrice").input_value() == ""
 
 
 @pytest.mark.parametrize("location", ["outside", "hidden"])
@@ -240,7 +132,10 @@ def test_current_empty_message_must_be_visible_inside_panel(page, location):
 
 
 def test_sell_direction_and_duplicate_button_stop(page):
-    assert preflight(page, {**PAYLOAD, "side": "sell"})["baseline_id"] is None
+    assert (
+        preflight(page, {**PAYLOAD, "side": "sell"})["balances"]["base_available"]
+        == "1"
+    )
     page.get_by_role("button", name="卖出 DGAI").evaluate(
         "e=>e.after(e.cloneNode(true))"
     )
@@ -337,3 +232,34 @@ def test_confirmation_preview_never_clicks(page):
     assert result["valid"] and result["read_only"]
     assert result["dialog_count"] == 1
     assert page.evaluate("window.confirmations") == 0
+
+
+def test_platform_sell_all_uses_percentage_control_not_quantity_fill(page):
+    from app.browser.alpha import fill_form
+
+    page.locator("#limitAmount").evaluate(
+        "e=>e.addEventListener('input',()=>window.quantityTyped=true)"
+    )
+    result = fill_form(
+        page, {**PAYLOAD, "side": "sell", "quantity": "1.000001", "sell_all": True}
+    )
+    assert not result["submitted"]
+    assert page.evaluate("window.percents") == 1
+    assert page.evaluate("window.quantityTyped||false") is False
+    assert page.locator("#limitAmount").input_value() == "0.99"
+    assert page.locator("#limitPrice").input_value() == "0.9"
+    assert page.evaluate("window.submits") == 0
+
+
+def test_sell_all_does_not_fallback_to_typing_when_control_missing(page):
+    page.locator("#percent").evaluate("e=>e.remove()")
+    with pytest.raises(ValueError, match="100%"):
+        submit_once(page, {**PAYLOAD, "side": "sell", "sell_all": True})
+    assert page.evaluate("window.submits") == 0
+
+
+def test_explicit_quote_amount_preserves_fifty_usdt(page):
+    from app.browser.alpha import fill_form
+
+    fill_form(page, {**PAYLOAD, "quote_amount": "50"})
+    assert page.locator("#limitTotal").input_value() == "50"

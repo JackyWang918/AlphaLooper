@@ -4,8 +4,8 @@ import pytest
 
 from app import decision_log
 from app.automatic import Automatic
+from tests.test_automatic import reconciled, tick
 from tests.test_automatic import rig as base_rig  # noqa: F401
-from tests.test_automatic import tick
 
 
 @pytest.fixture(name="rig")
@@ -34,11 +34,11 @@ def test_fill_log_dedup_and_restart_reads_without_browser(rig):
     r = rig
     tick(r)
     r.browser.finish()
-    tick(r, 60)
+    reconciled(r)
     fills = decision_log.read(r.auto.engine, str(r.body.request_id), kind="fill")[
         "items"
     ]
-    assert len(fills) == 1 and fills[0]["details"]["result"]["order_id"] == "1"
+    assert len(fills) == 1 and fills[0]["details"]["result"]["local_order_id"]
     restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
     before_calls = list(r.browser.calls)
     assert restarted.get()["id"] == str(r.body.request_id)
@@ -87,7 +87,7 @@ def test_new_error_does_not_present_previous_market_as_fresh(rig):
         raise ValueError("公开行情请求失败")
 
     r.auto.market.snapshot = fail
-    tick(r, 60)
+    reconciled(r)
     row = decision_log.read(r.auto.engine, str(r.body.request_id), kind="error")[
         "items"
     ][0]

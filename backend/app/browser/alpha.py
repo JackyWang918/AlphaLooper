@@ -127,7 +127,8 @@ def fill_form(page: Page, payload: dict):
     command = FillForm(**payload)
     initial = verify_identity(page, command)
     check_step(command.price, initial["price_step"])
-    check_step(command.quantity, initial["quantity_step"])
+    if not command.sell_all and command.quote_amount is None:
+        check_step(command.quantity, initial["quantity_step"])
     tab = page.get_by_role("tab", name=TABS[command.side], exact=True)
     # fill() alone can write behind an overlay; verify pointer actionability first.
     tab.click(trial=True, timeout=3000)
@@ -136,7 +137,8 @@ def fill_form(page: Page, payload: dict):
     expect(tab).to_have_attribute("aria-selected", "true")
     state = verify_identity(page, command)
     check_step(command.price, state["price_step"])
-    check_step(command.quantity, state["quantity_step"])
+    if not command.sell_all and command.quote_amount is None:
+        check_step(command.quantity, state["quantity_step"])
     price, amount = page.locator("#limitPrice"), page.locator("#limitAmount")
     # Resolve all required fields before changing the order price.
     total = wait_total_input(page) if command.side == "buy" else None
@@ -145,12 +147,20 @@ def fill_form(page: Page, payload: dict):
     if command.side == "buy":
         with localcontext() as context:
             context.prec = 80
-            quote_amount = format(
+            quote_amount = command.quote_amount or format(
                 Decimal(command.price) * Decimal(command.quantity), "f"
             )
         total.click(trial=True, timeout=3000)
         total.fill(quote_amount)
         total.press("Tab")
+    elif command.sell_all:
+        percent = page.get_by_text(re.compile(r"^100\s*%$")).filter(visible=True)
+        if percent.count() != 1:
+            raise ValueError("未找到唯一可见的卖出 100% 控件，未填写数量。")
+        percent.click(timeout=3000)
+        quote_amount = None
+        # Percentage widgets can reset the limit price. Set the requested price last.
+        price.fill(command.price)
     else:
         amount.click(trial=True, timeout=3000)
         amount.fill(command.quantity)

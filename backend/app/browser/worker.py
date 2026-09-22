@@ -15,7 +15,6 @@ from app.browser.live import (
     preflight,
     submit_once,
 )
-from app.browser.records import read_records
 from app.browser.schemas import token_identity
 
 
@@ -119,13 +118,6 @@ def run_worker(pipe: Connection, profile: str):
                         }[action]
                         result = operation(page, command["payload"])
                         pipe.send({"ok": True, **result})
-                        continue
-                    elif action == "read_records":
-                        if context is None or not context.browser.is_connected():
-                            raise ValueError("请先打开交易页面。")
-                        page = select_target_page(context, page, command["url"])
-                        observation = read_records(page, command["url"])
-                        pipe.send({"ok": True, "observation": observation})
                         continue
                     elif action != "status":
                         raise ValueError("不支持的浏览器操作。")

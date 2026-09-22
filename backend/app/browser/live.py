@@ -3,14 +3,11 @@
 import re
 import time
 from contextlib import contextmanager
-from decimal import Decimal
 
 from playwright.sync_api import Error, expect
 
-from app.account_ledger import HEADERS, extract
 from app.browser.alpha import TABS, fill_form, verify_identity
 from app.browser.confirmation import confirm_once
-from app.browser.records import read_records
 from app.browser.schemas import FillForm, token_identity
 
 
@@ -69,82 +66,17 @@ def current_order(page, payload):
     return {"empty": False}
 
 
-def latest_history(page, payload):
-    command = FillForm(**payload)
-    verify_identity(page, command)
-    with stage("切换历史委托标签"):
-        panel = select_panel(page, "历史委托")
-    rows = panel.locator("tbody tr").filter(visible=True)
-    empty = panel.get_by_text(re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录)$"))
-    with stage("等待历史委托列表加载"):
-        expect(rows.first.locator("td").nth(12).or_(empty).first).to_be_visible(
-            timeout=5000
-        )
-    if not rows.count():
-        if empty.count() == 1 and empty.is_visible():
-            return None
-        raise ValueError("历史委托尚未加载，不能确认结果。")
-    if (
-        rows.first.locator("td").count() < 13
-        and empty.count() == 1
-        and empty.is_visible()
-    ):
-        return None
-    observation = read_records(page, command.url)
-    orders, _ = extract(observation)
-    if not orders:
-        # Expand only the first row via a labelled control or the observed empty chevron cell.
-        expand = rows.first.get_by_role(
-            "button", name=re.compile(r"^(展开|展开详情|Expand)$")
-        )
-        if expand.count() != 1:
-            cells = rows.first.locator("td")
-            headers = [
-                h.strip() for h in panel.locator("th").all_inner_texts() if h.strip()
-            ]
-            if headers != HEADERS:
-                raise ValueError("历史委托表头不匹配，不能自动展开。")
-            first_text = cells.first.inner_text().strip() if cells.count() else ""
-            if cells.count() == 14 and not first_text:
-                icons = cells.first.locator("svg").filter(visible=True)
-                expand = icons if icons.count() == 1 else cells.first
-            elif cells.count() == 13 and re.fullmatch(
-                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", first_text
-            ):
-                # Some layouts put the disclosure icon in the creation-time cell.
-                expand = cells.first.locator("svg").filter(visible=True)
-                if expand.count() != 1:
-                    raise ValueError("第一笔历史委托的时间列中没有唯一展开图标。")
-            else:
-                raise ValueError(
-                    f"无法识别第一笔历史委托的展开控件（{cells.count()} 列），请手动展开后再检查。"
-                )
-        with stage("展开第一笔历史委托"):
-            expand.click(timeout=3000)
-        with stage("等待第一笔历史委托的订单 ID"):
-            expect(panel.get_by_text(re.compile(r"^订单ID[:：]")).first).to_be_visible()
-        orders, _ = extract(read_records(page, command.url))
-    if len(orders) != 1:
-        raise ValueError("无法读取第一笔历史委托汇总。")
-    order = orders[0]
-    # Buy orders are entered by quote total. Binance derives the requested base
-    # quantity and may round it down by one visible quantity step.
-    quantity_step = page.locator("#limitAmount").get_attribute("step")
-    if quantity_step:
-        order["quantity_step"] = quantity_step
-    return order
-
-
 def order_readiness(page, payload):
-    """Read orders only: no form writes, trading clicks, or ledger writes."""
-    with stage("检查当前委托"):
+    """Only current orders and wallet balances; never visit platform history."""
+    from app.browser.automatic import wallet_snapshot
+
+    with stage("检查当前委托及余额"):
         if not current_order(page, payload)["empty"]:
             raise ValueError("平台已有挂单，不能叠加新单。")
-    with stage("读取提交前最新历史委托"):
-        previous = latest_history(page, payload)
-    with stage("返回当前委托"):
-        select_panel(page, "当前委托")
-    return {"baseline_id": previous["order_id"] if previous else None}
+        wallet = wallet_snapshot(page, payload, pending=False)
+        if not current_order(page, payload)["empty"]:
+            raise ValueError("读取余额期间出现挂单，未提交。")
+    return {"balances": wallet}
 
 
 def preflight(page, payload):
@@ -188,11 +120,11 @@ def submit_once(page, payload):
 
 
 def inspect_order(page, payload):
+    from app.browser.automatic import inspect_progress
+
     if token_identity(page.url) != token_identity(payload["url"]):
         raise ValueError("当前交易页面已切换。")
-    if not current_order(page, payload)["empty"]:
-        return {"pending": True}
-    return {"pending": False, "order": latest_history(page, payload)}
+    return inspect_progress(page, payload)
 
 
 def inspect_unsubmitted(page, payload):
@@ -212,27 +144,3 @@ def inspect_unsubmitted(page, payload):
     ):
         raise ValueError("平台仍有弹窗，请先手动关闭。")
     return result
-
-
-def matches(order, payload, baseline_id):
-    if not order or order["order_id"] == baseline_id:
-        return False
-    try:
-        requested = Decimal(order.get("requested_quantity", "-1"))
-        planned = Decimal(payload["quantity"])
-        if payload["side"] == "buy" and order.get("quantity_step"):
-            step = Decimal(order["quantity_step"])
-            quantity_matches = step > 0 and 0 <= planned - requested <= step
-        else:
-            quantity_matches = requested == planned
-    except (ArithmeticError, ValueError):
-        return False
-    return (
-        order["symbol"] == payload["expected_symbol"]
-        and order["quote"] == payload["expected_quote"]
-        and order["side"] == TABS[payload["side"]]
-        and (order["chain"], order["address"]) == token_identity(payload["url"])
-        and quantity_matches
-        and Decimal(order.get("limit_price", "-1")) == Decimal(payload["price"])
-        and Decimal(order["quantity"]) <= Decimal(payload["quantity"])
-    )

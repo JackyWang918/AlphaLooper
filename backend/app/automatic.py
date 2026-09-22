@@ -16,11 +16,11 @@ from pydantic import Field
 from sqlalchemy import Column, Integer, String, Table, Text, select
 
 from app import decision_log
-from app.browser.schemas import ReadRecords, token_identity
+from app.browser.schemas import TradingAccount, token_identity
 from app.database import Base
 from app.live_orders import SubmitOrder
 from app.market import MarketClient, validate_snapshot
-from app.strategy import Config, State, align, estimate, exposure, reference_price
+from app.strategy import Config, align, estimate, reference_price
 
 tasks = Table(
     "auto_tasks",
@@ -43,7 +43,7 @@ class LiveConfig(Config):
     points_per_u: D = Field(default=D(4), ge=4, le=4)
 
 
-class StartTask(ReadRecords):
+class StartTask(TradingAccount):
     request_id: UUID
     expected_symbol: str = Field(min_length=1, max_length=30)
     expected_quote: Literal["USDT", "USDC"] = "USDT"
@@ -94,7 +94,11 @@ class Automatic:
                                 "buy_total",
                                 "session_loss",
                                 "realized_pnl",
-                                "fees",
+                                "round_start_quote",
+                                "round_stage",
+                                "buy_rehangs",
+                                "balances",
+                                "dust",
                                 "rounds",
                                 "first_buy_at",
                                 "exiting",
@@ -137,8 +141,7 @@ class Automatic:
                 raise ValueError("仍有任务或单笔委托待处理，请先完成原任务。")
             # Reading the balance and order baseline is required before allocating a task.
             payload = self.probe(request)
-            self.live.call("order_readiness", payload)
-            balance = self.live.call("live_balance", payload)["available"]
+            balances = self.live.call("order_readiness", payload)["balances"]
             task = {
                 "id": str(body.request_id),
                 "request": request,
@@ -147,7 +150,14 @@ class Automatic:
                 "updated_at": self.clock(),
                 "phase": "running",
                 "message": "自动任务已启动，等待最新行情。",
-                "baseline_balance": balance,
+                "accounting_version": 2,
+                "balances": balances,
+                "round_start_quote": None,
+                "round_plan": "0",
+                "round_stage": "idle",
+                "buy_attempts": 0,
+                "buy_rehangs": 0,
+                "dust": "0",
                 "inventory": "0",
                 "cost": "0",
                 "proceeds": "0",
@@ -193,7 +203,26 @@ class Automatic:
             t = self.get()
             if not t or t["id"] != str(id):
                 raise ValueError("当前任务已变化，请刷新。")
-            if action == "pause":
+            if action == "retire_legacy":
+                if t.get("accounting_version") == 2:
+                    raise ValueError("新口径任务请使用停止买入、卖完结束。")
+                self.live.call("order_readiness", self.probe(t["request"]))
+                old_order = self.live.get()
+                if old_order:
+                    old_order.update(
+                        active=False,
+                        state="legacy_closed",
+                        message="用户结束旧版记录；未按新口径补造盈亏。",
+                    )
+                    self.live.save(old_order)
+                self.running = False
+                t.update(
+                    active=False,
+                    pending=None,
+                    phase="completed",
+                    message="旧版记录已结束；平台无挂单，旧盈亏不转换。",
+                )
+            elif action == "pause":
                 self.running = False
                 t.update(
                     phase="paused",
@@ -275,76 +304,67 @@ class Automatic:
             raise ValueError("行情与任务币种不匹配。")
         return m
 
-    def position(self, t, record=None):
-        """Include open-order partial fills in risk without booking them twice."""
-        inventory, cost, proceeds = map(D, (t["inventory"], t["cost"], t["proceeds"]))
-        if record and record.get("progress"):
-            q, gross = map(
-                D, (record["progress"]["quantity"], record["progress"]["gross"])
-            )
-            fee = D("0.0001")
-            if record["request"]["side"] == "buy":
-                base_fee = (
-                    record.get("confirmation", {}).get("fee_currency")
-                    == t["request"]["expected_symbol"]
-                )
-                inventory += q * (1 - fee) if base_fee else q
-                cost += gross if base_fee else gross * (1 + fee)
-            else:
-                inventory -= q
-                proceeds += gross * (1 - fee)
-            if q and t["first_buy_at"] is None and record["request"]["side"] == "buy":
-                # Order summaries do not provide the first individual fill timestamp.
-                # Use submission time as a conservative lower bound; never restart it.
-                t["first_buy_at"] = record["created_at"]
-        if inventory < 0:
-            raise ValueError("实际卖出数量超过任务持仓，停止并核对。")
-        return State(inventory=inventory, cost=cost, proceeds=proceeds)
-
     def consume(self, t, record):
-        """Task accounting and clearing its pending pointer commit together."""
+        """Consume a local order exactly once together with the cleared pointer."""
         result = record["result"]
-        q, gross = D(result["quantity"]), D(result["gross"])
-        fee = gross * D("0.0001")
+        wallet = result["balances"]
+        t.update(balances=wallet, inventory=wallet["base_available"])
         if record["request"]["side"] == "buy":
-            if q:
+            paid = -D(result["cash_delta"])
+            t["buy_total"] = str(D(t["buy_total"]) + paid)
+            t["cost"] = str(D(t["round_start_quote"]) - D(wallet["quote_available"]))
+            t["buy_end_quote"] = wallet["quote_available"]
+            if paid > 0:
                 t["first_buy_at"] = t["first_buy_at"] or record["created_at"]
-            base_fee = (
-                record.get("confirmation", {}).get("fee_currency")
-                == t["request"]["expected_symbol"]
-            )
-            t["inventory"] = str(
-                D(t["inventory"]) + (q * D("0.9999") if base_fee else q)
-            )
-            t["cost"] = str(D(t["cost"]) + gross + (D(0) if base_fee else fee))
-            t["buy_total"] = str(D(t["buy_total"]) + gross)
+            if D(t["cost"]) > D(t["round_plan"]) / 2:
+                t["round_stage"] = "sell"
         else:
-            if q > D(t["inventory"]):
-                raise ValueError("最终卖出量超过任务持仓。")
-            t["inventory"] = str(D(t["inventory"]) - q)
-            t["proceeds"] = str(D(t["proceeds"]) + gross - fee)
-        t["fees"] = str(D(t["fees"]) + fee)
+            t["proceeds"] = str(D(wallet["quote_available"]) - D(t["buy_end_quote"]))
         t.update(last_order=record["id"], pending=None)
         self.save(
             t,
             "fill",
-            "已核对订单最终结果并计入任务。",
+            "当前委托已结束，按余额差记录实际资金变化。",
             {"request_id": record["id"], "result": result},
         )
 
-    def settle(self, t):
-        if D(t["inventory"]) != 0 or not D(t["cost"]):
-            return
-        pnl = D(t["proceeds"]) - D(t["cost"])
+    def settle(self, t, price):
+        if t["round_stage"] != "sell" or t["pending"]:
+            return False
+        residual = D(t["balances"]["base_available"]) * price
+        if residual > D(2):
+            return False
+        pnl = D(t["balances"]["quote_available"]) - D(t["round_start_quote"])
         t.update(
             realized_pnl=str(D(t["realized_pnl"]) + pnl),
             session_loss=str(D(t["session_loss"]) + max(D(0), -pnl)),
+            last_round={
+                "start_quote": t["round_start_quote"],
+                "end_quote": t["balances"]["quote_available"],
+                "cash_pnl": str(pnl),
+                "residual_quantity": t["inventory"],
+                "residual_value": str(residual),
+                "buy_rehangs": t["buy_rehangs"],
+            },
             cost="0",
             proceeds="0",
             first_buy_at=None,
             exiting=False,
             rounds=t["rounds"] + 1,
+            round_stage="idle",
+            round_start_quote=None,
+            dust=t["inventory"],
+            buy_attempts=0,
+            buy_rehangs=0,
+            risk=None,
         )
+        self.save(
+            t,
+            "completed",
+            "本轮结束：无挂单且剩余代币价值不超过 2 U，记录 USDT 现金差额。",
+            t["last_round"],
+        )
+        return True
 
     def tick(self):
         with self.live.lock, localcontext() as context:
@@ -356,19 +376,55 @@ class Automatic:
                 return
             try:
                 self._tick(t)
-            except Exception as exc:  # noqa: BLE001 -- persisted actionable pause, no retry clicks
+            except Exception as exc:  # noqa: BLE001
                 self.pause(t, str(exc))
+
+    def risk(self, t, wallet, price):
+        if wallet.get("quote_total") is None or wallet.get("base_total") is None:
+            return {
+                "loss": None,
+                "loss_pct": None,
+                "equity": None,
+                "basis": "latest_closed_1m_candle",
+                "reason": "页面未显示冻结余额或剩余委托量",
+            }
+        start = D(t["round_start_quote"])
+        equity = D(wallet["quote_total"]) + D(wallet["base_total"]) * price
+        loss = max(D(0), start - equity)
+        return {
+            "loss": str(loss),
+            "loss_pct": str(loss / start * 100),
+            "equity": str(equity),
+            "denominator": str(start),
+            "price": str(price),
+            "basis": "latest_closed_1m_candle",
+        }
 
     def _tick(self, t):
         now = self.clock()
+        if t.get("accounting_version") != 2:
+            raise ValueError(
+                "旧任务缺少本轮起始 USDT 余额，不能套用新口径；请先处理平台挂单，再结束旧版记录。"
+            )
         c = LiveConfig(**t["request"]["config"])
+        minute_due = int(now) // 60 > t["last_minute"]
         record = self.live.get(t["pending"]["request_id"]) if t["pending"] else None
+        if record:
+            self.count_attempt(t, record)
+        polled = False
         if record and record["active"]:
-            interval = c.exit_seconds if record.get("cancel_requested_at") else 60
-            if now - self.last_poll >= interval or (
-                self.running and int(now) // 60 > t["last_minute"]
-            ):
+            interval = (
+                5
+                if record["state"] == "settling"
+                else (
+                    c.exit_seconds
+                    if record.get("cancel_requested_at") or t["exiting"]
+                    else 60
+                )
+            )
+            if now - self.last_poll >= interval or (self.running and minute_due):
                 record = self.live.check()
+                polled = True
                 self.last_poll = now
                 self.save(
                     t,
@@ -377,7 +433,7 @@ class Automatic:
                     {
                         "request_id": record["id"],
                         "status": record["state"],
-                        "progress": record.get("progress"),
+                        "balances": record.get("balances"),
                         "error": record.get("last_check_error"),
                     },
                 )
@@ -391,25 +447,21 @@ class Automatic:
                 t.update(pending=None, last_order=record["id"])
                 self.pause(t, "上一笔未提交：" + record["message"] + "；检查后可恢复。")
                 return
-        self.settle(t)
         if not self.running:
             self.save(t)
             return
         if t["pending"] and record is None:
-            # Persisted plan without a live intent: after restart discard its stale
-            # quote and regenerate only after the explicit resume above.
+            # A persisted plan with no live intent has not submitted; regenerate it.
             t["pending"] = None
             self.save(t)
         if record and record["state"] == "submission_unknown":
-            raise ValueError("原订单提交结果未知；请核对平台，不能开始下一笔。")
-        held = self.position(t, record)
-        target = D(t["buy_total"]) + (
-            D(record["progress"]["gross"])
-            if record and record.get("progress") and record["request"]["side"] == "buy"
-            else D(0)
-        )
+            raise ValueError("原订单提交结果未知；不能重复提交。")
+        if record and record["state"] == "settling":
+            t["message"] = record["message"]
+            self.save(t)
+            return
         if (
-            target * c.points_per_u >= c.target_points
+            D(t["buy_total"]) * c.points_per_u >= c.target_points
             or D(t["session_loss"]) >= c.budget
         ):
             t["stop_buying"] = True
@@ -418,84 +470,85 @@ class Automatic:
             and now - t["first_buy_at"] >= c.max_hold_seconds
         ):
             t["exiting"] = True
-        minute_due = int(now) // 60 > t["last_minute"]
-        if not record and not held.inventory:
-            reserve = max(c.reserve, c.amount * (c.stop_pct / 100 + D("0.0002")))
+        if not record and t["round_stage"] == "idle":
+            reserve = max(c.reserve, c.amount * c.stop_pct / 100)
             if t["stop_buying"] or D(t["session_loss"]) + reserve >= c.budget:
                 t.update(
                     active=False,
                     phase="completed",
-                    message="任务已结束，无待处理委托或任务持仓。",
+                    message="任务已结束，无待处理委托；余量按 2 U 规则保留。",
                 )
                 self.running = False
-                self.save(
-                    t,
-                    "completed",
-                    "停止新买入：已要求收尾、已达标或损耗预算预留不足。",
-                    {"reserve": str(reserve), "budget": str(c.budget)},
-                )
+                self.save(t, "completed")
                 return
-        # Fetch when an action is possible or on the minute risk boundary.
-        if not record and not held.inventory and now < t.get("next_buy_check_at", 0):
+        if (
+            not record
+            and t["round_stage"] in {"idle", "buy"}
+            and not t["exiting"]
+            and now < t.get("next_buy_check_at", 0)
+        ):
+            return
+        # A paused task only reconciles. Running orders need fresh balances for risk.
+        if (
+            record
+            and not minute_due
+            and not t["exiting"]
+            and now - record["created_at"] < c.wait_seconds
+        ):
             self.save(t)
             return
-        m = self.snapshot(t, c) if not record or minute_due else None
-        if m:
-            risk = exposure(held, m, c)
-            self.evidence = {
-                "config": c.model_dump(mode="json"),
-                "market_time": m.fetched_at,
-                "symbol": m.symbol,
-                "tick": m.tick,
-                "step": m.step,
-                "min_qty": m.min_qty,
-                "min_notional": m.min_notional,
-                "valuation_basis": "latest_closed_1m_candle",
-                "candles": [
-                    row.model_dump(mode="json")
-                    for row in sorted(
-                        [row for row in m.candles if row.close_time < m.fetched_at],
-                        key=lambda row: row.time,
-                    )[-c.window :]
-                ],
-                "position_including_partial": held.model_dump(mode="json"),
-                "risk": risk,
-                "checks": {
-                    "minute_check_due": minute_due,
-                    "loss_threshold_pct": c.stop_pct,
-                    "loss_threshold_hit": risk["loss_pct"] is not None
-                    and risk["loss_pct"] >= c.stop_pct,
-                    "budget": c.budget,
-                    "budget_hit": D(t["session_loss"]) + (risk["loss"] or D(0))
-                    >= c.budget,
-                    "points": target * c.points_per_u,
-                    "target_points": c.target_points,
-                    "target_hit": target * c.points_per_u >= c.target_points,
-                    "held_seconds": None
-                    if t["first_buy_at"] is None
-                    else now - t["first_buy_at"],
-                    "hold_limit_seconds": c.max_hold_seconds,
-                },
-            }
-            t["risk"] = json.loads(json.dumps(risk, default=str))
-            t["market_at"] = m.fetched_at
-            if minute_due:
-                t["last_minute"] = int(now) // 60
-                if held.inventory and (risk["loss_pct"] >= c.stop_pct):
+        m = self.snapshot(t, c)
+        price_ref = reference_price(m)
+        self.evidence = {
+            "config": c.model_dump(mode="json"),
+            "market_time": m.fetched_at,
+            "valuation_basis": "latest_closed_1m_candle",
+            "candles": [
+                row.model_dump(mode="json")
+                for row in sorted(
+                    [row for row in m.candles if row.close_time < m.fetched_at],
+                    key=lambda row: row.time,
+                )[-c.window :]
+            ],
+        }
+        t["market_at"] = m.fetched_at
+        if record and polled and record.get("balances"):
+            wallet = record["balances"]
+            # With an open buy the newly available tokens establish first fill.
+            if record["request"]["side"] == "buy" and D(wallet["base_available"]) > D(
+                record["before_balances"]["base_available"]
+            ):
+                t["first_buy_at"] = t["first_buy_at"] or record["created_at"]
+            if (
+                t["first_buy_at"] is not None
+                and now - t["first_buy_at"] >= c.max_hold_seconds
+            ):
+                t["exiting"] = True
+        else:
+            wallet = t["balances"]
+        reconcile = False
+        if t["round_start_quote"] is not None and (
+            minute_due or (not record and t.get("risk_reconcile"))
+        ):
+            risk = self.risk(t, wallet, price_ref)
+            t["risk"] = risk
+            self.evidence.update(balances=wallet, risk=risk)
+            t["last_minute"] = int(now) // 60
+            if risk["loss_pct"] is None:
+                # Never label frozen funds as loss. Release this single order once
+                # to obtain a usable valuation; do not guess account equity.
+                reconcile = bool(record)
+                t["risk_reconcile"] = True
+            else:
+                t["risk_reconcile"] = False
+                if D(risk["loss_pct"]) >= c.stop_pct:
                     t["exiting"] = True
-                if D(t["session_loss"]) + (risk["loss"] or D(0)) >= c.budget:
-                    t.update(stop_buying=True, exiting=True)
-            if held.inventory:
-                self.save(
-                    t,
-                    "risk",
-                    "持仓风险评估："
-                    + (
-                        "已进入主动退出。"
-                        if t["exiting"]
-                        else "继续按普通卖出规则处理。"
-                    ),
-                )
+            if (
+                risk["loss"] is not None
+                and D(t["session_loss"]) + D(risk["loss"]) >= c.budget
+            ):
+                t.update(stop_buying=True, exiting=True)
+            self.save(t, "risk", "按本轮买入前总 USDT 检查资产损耗。")
         if record:
             if record.get("cancel_requested_at"):
                 self.save(t)
@@ -503,102 +556,106 @@ class Automatic:
                     record.get("cancel_error")
                     or now - record["cancel_requested_at"] >= 60
                 ):
-                    raise ValueError(
-                        "撤单尚未确认，不重放撤单或重挂；请核对平台后恢复。"
-                    )
+                    raise ValueError("撤单尚未确认，不重复撤单或重挂；请核对平台。")
                 return
             timeout = (
                 c.exit_seconds
                 if t["exiting"] and record["request"]["side"] == "sell"
                 else c.wait_seconds
             )
-            if now - record["created_at"] >= timeout or (
-                t["exiting"] and not t.get("pending_exit")
+            enough_bought = (
+                record["request"]["side"] == "buy"
+                and wallet.get("quote_total") is not None
+                and D(t["round_start_quote"]) - D(wallet["quote_total"])
+                > D(t["round_plan"]) / 2
+            )
+            sell_dust = (
+                record["request"]["side"] == "sell"
+                and wallet.get("base_total") is not None
+                and D(wallet["base_total"]) * price_ref <= 2
+            )
+            if (
+                now - record["created_at"] >= timeout
+                or reconcile
+                or enough_bought
+                or sell_dust
+                or (t["exiting"] and not t.get("pending_exit"))
             ):
+                reason = (
+                    "页面缺少冻结余额，撤单释放后核算资产。"
+                    if reconcile
+                    else "挂单超时或进入主动退出，先撤单核对余额。"
+                )
+                if enough_bought:
+                    reason = "累计买入超过计划金额 50%，撤销剩余买单后转卖。"
+                elif sell_dust:
+                    reason = "卖出剩余价值不超过 2 U，撤销余单后结束本轮。"
                 self.save(
                     t,
                     "cancel",
-                    "决定撤单：挂单超时或进入主动退出；先核对最终成交再重挂。",
-                    {
-                        "request_id": record["id"],
-                        "elapsed_seconds": now - record["created_at"],
-                        "timeout_seconds": timeout,
-                        "entering_exit": t["exiting"] and not t.get("pending_exit"),
-                    },
+                    reason,
+                    {"request_id": record["id"], "timeout_seconds": timeout},
                 )
                 canceled = self.live.cancel()
-                t["message"] = "已请求撤单，等待最终成交结果，未重挂。"
                 if canceled.get("cancel_error"):
                     raise ValueError(canceled["cancel_error"])
+                t["message"] = reason
                 self.save(
-                    t,
-                    "execution",
-                    "撤单动作返回，等待平台最终结果。",
-                    {
-                        "request_id": record["id"],
-                        "cancel_state": canceled.get("cancel_state"),
-                    },
+                    t, "execution", "已请求一次撤单，等待当前委托消失及余额稳定。"
                 )
-            else:
-                t["message"] = "等待当前真实委托成交；每分钟核对。"
-            self.save(t)
             return
-        if not held.inventory:
+        # Once all locked funds are released, use a fresh wallet for the next action.
+        wallet = self.live.call("order_readiness", self.probe(t["request"]))["balances"]
+        t.update(balances=wallet, inventory=wallet["base_available"])
+        if t["exiting"] and t["round_start_quote"] is not None:
+            t["round_stage"] = "sell"
+            t.setdefault("buy_end_quote", wallet["quote_available"])
+        if self.settle(t, price_ref):
+            # Do not place the next round in the same tick as settlement.
+            return
+        if t["round_stage"] in {"idle", "buy"}:
+            if t["buy_rehangs"] >= 10 and t["buy_attempts"] >= 11:
+                raise ValueError(
+                    "已完成 10 次撤单重挂，累计买入仍未超过计划金额 50%；请调整策略，或选择停止买入、卖完结束。"
+                )
             e = estimate(m, c)
             t["estimate"] = json.loads(json.dumps(e, default=str))
             self.evidence["estimate"] = e
             if not e["buy_allowed"]:
-                t["next_buy_check_at"] = self.clock() + c.buy_check_seconds
-                t["message"] = (
-                    "暂不买入："
-                    + "；".join(e["buy_blockers"])
-                    + f" 约 {c.buy_check_seconds} 秒后重新估价。"
-                )
+                t["next_buy_check_at"] = now + c.buy_check_seconds
+                t["message"] = "暂不买入：" + "；".join(e["buy_blockers"])
                 self.save(t, "buy_wait")
                 return
-            remaining = c.target_points / c.points_per_u - D(t["buy_total"])
-            price = e["buy"]
-            quantity = min(
-                e["quantity"],
-                max(
-                    align(remaining / price, m.step, True),
-                    align(m.min_qty, m.step, True),
-                    align(m.min_notional / price, m.step, True),
-                ),
-            )
-            side = "buy"
-            decision_reason = "采用 K 线模型买价；按预算、目标和步长计算数量。"
-        else:
-            if t["exiting"]:
-                price = align(reference_price(m), m.tick)
-                decision_reason = "主动退出：采用最新已收盘一分钟 K 线收盘价。"
-            else:
-                e = estimate(m, c)
-                self.evidence["estimate"] = e
-                price = e["sell"]
-                decision_reason = "普通卖出：采用 K 线模型卖价。"
-            available = D(
-                self.live.call("live_balance", self.probe(t["request"]))["available"]
-            )
-            owned = available - D(t["baseline_balance"])
-            self.evidence["balance"] = {
-                "available": available,
-                "baseline": t["baseline_balance"],
-                "task_available": owned,
-            }
-            # Only small fee/precision differences may adjust the task's inventory.
-            # Never consume tokens that existed before this task.
-            tolerance = max(m.step, held.inventory * D("0.0002"))
-            if owned < 0 or abs(owned - held.inventory) > tolerance:
-                raise ValueError(
-                    "可用余额与任务持仓不符，请核对代币费用、账户或人工交易。"
+            if t["round_stage"] == "idle":
+                start = D(wallet["quote_available"])
+                plan = min(
+                    c.amount,
+                    start,
+                    c.target_points / c.points_per_u - D(t["buy_total"]),
                 )
-            t["inventory"] = str(owned)
-            quantity = align(owned, m.step)
-            price = align(price, m.tick, not t["exiting"])
+                if start <= 0 or plan <= 0:
+                    raise ValueError("没有可用计价币可开始新一轮。")
+                t.update(
+                    round_start_quote=str(start),
+                    round_plan=str(plan),
+                    round_stage="buy",
+                    buy_end_quote=str(start),
+                )
+            price = e["buy"]
+            quote_amount = min(
+                D(t["round_plan"]) - D(t["cost"]), D(wallet["quote_available"])
+            )
+            quantity = align(quote_amount / price, m.step)
+            side = "buy"
+            reason = "按本轮剩余计划金额买入，累计投入超过 50% 后转卖。"
+        else:
+            price = align(price_ref, m.tick) if t["exiting"] else estimate(m, c)["sell"]
+            quantity = D(wallet["base_available"])
+            quote_amount = None
             side = "sell"
-        if quantity <= 0 or quantity < m.min_qty or price * quantity < m.min_notional:
-            raise ValueError("剩余数量不足最小委托量/金额，需人工处理；未标记清仓。")
+            reason = "采用平台卖出 100%，包含已有零头。"
+        if quantity <= 0 or quantity < m.min_qty or quantity * price < m.min_notional:
+            raise ValueError("本次金额或数量低于平台最小委托，停止并检查策略。")
         validate_snapshot(m, int(self.clock() * 1000))
         body = SubmitOrder(
             **{
@@ -609,32 +666,34 @@ class Automatic:
             side=side,
             price=format(price, "f"),
             quantity=format(quantity, "f"),
+            quote_amount=format(quote_amount, "f")
+            if quote_amount is not None
+            else None,
+            sell_all=side == "sell",
         )
         pending = body.model_dump(mode="json")
-        if side == "buy":
-            pending["quote_amount"] = format(price * quantity, "f")
         t.update(
             pending=pending,
             pending_exit=t["exiting"],
-            message=f"自动{side}：{body.quantity} @ {body.price}",
+            message=f"自动{side}：{body.price}",
         )
         self.save(
             t,
-            "buy" if side == "buy" else "sell",
-            decision_reason,
+            side,
+            reason,
             {
-                "price": body.price,
-                "quantity": body.quantity,
-                "quote_amount": pending.get("quote_amount"),
                 "request_id": str(body.request_id),
+                "price": body.price,
+                "quote_amount": body.quote_amount,
+                "sell_all": body.sell_all,
             },
         )
         record = self.live.submit(
-            body,
-            owner=t["id"],
-            quote_valid_until=m.fetched_at / 1000 + 15,
+            body, owner=t["id"], quote_valid_until=m.fetched_at / 1000 + 15
         )
         self.last_poll = 0
+        # Persisted intent is counted exactly once, including unknown submissions.
+        self.count_attempt(t, record)
         self.save(
             t,
             "execution",
@@ -645,3 +704,13 @@ class Automatic:
             if record["state"] == "not_submitted":
                 t.update(pending=None, last_order=record["id"])
             self.pause(t, record["message"])
+
+    def count_attempt(self, t, record):
+        if (
+            record["request"]["side"] == "buy"
+            and record["state"] not in {"not_submitted", "preparing"}
+            and record["id"] != t.get("counted_attempt")
+        ):
+            t["buy_attempts"] += 1
+            t["buy_rehangs"] = max(0, t["buy_attempts"] - 1)
+            t["counted_attempt"] = record["id"]

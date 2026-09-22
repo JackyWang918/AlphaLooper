@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[];openTaskPage:[url:string]}>()
-type Task = {id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{exit_net:string|null; loss:string|null}|null}
+type Task = {accounting_version?:number;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -80,7 +80,7 @@ onUnmounted(()=>clearInterval(timer))
 <section>
   <div class="section-title"><h2>05 / 自动实盘交易</h2><span class="badge">{{running?'自动运行中':current?'已暂停 / 待恢复':'未启动'}}</span></div>
   <p>启动后程序自动估价、买入、卖出并继续下一轮。请先在受控 Chrome 登录、打开目标币种，再刷新浏览器识别结果。</p>
-  <p class="muted">每单等待 5 分钟；每分钟检查 2% 损耗；持仓满 30 分钟转主动退出；损耗预算 10 U；达标后停止买入并清仓。手续费按每侧 0.01% 估算。当前按本任务累计，不在午夜重置。</p>
+  <p class="muted">普通挂单等待 5 分钟，首次买入之外最多撤单重挂 10 次；累计投入超过本轮计划金额 50% 后转卖。每分钟检查资产损耗，2% 的分母为本轮买入前总 USDT；持仓满 30 分钟转主动退出。损耗预算 10 U，按任务累计。</p>
   <p>受控 Chrome：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported&&symbol&&quote">{{symbol}} / {{quote}}</span><span v-else>尚未识别</span></p>
   <p v-if="browserReason&&!fillSupported" class="muted">页面识别反馈：{{browserReason}}</p>
   <button class="secondary" :disabled="busy||browserBusy" @click="emit('refreshBrowser')">{{browserBusy?'正在识别…':'重新识别交易页面'}}</button>
@@ -88,7 +88,7 @@ onUnmounted(()=>clearInterval(timer))
   <fieldset :disabled="busy||!!current">
     <div class="fields">
       <label>账本<input v-model="book" /></label>
-      <label>每轮金额（最多 50 U，含估算费用）<input v-model="amount" inputmode="decimal" /></label>
+      <label>每轮计划买入金额（最多 50 U）<input v-model="amount" inputmode="decimal" /></label>
       <label>本任务目标积分（最多 32,768）<input v-model="target" inputmode="decimal" /></label>
     </div>
     <details><summary>估价试验参数</summary><div class="fields">
@@ -117,23 +117,29 @@ onUnmounted(()=>clearInterval(timer))
     </div>
     <p v-if="!running" class="muted">此按钮只恢复本任务原币种页面，不填表、不提交、不撤单，也不会自动恢复任务。</p>
     <p>已完成 {{current.rounds}} 轮 · 累计买入 {{current.buy_total}} U · 目标 {{current.request.config.target_points}} 分（买入额 × 4）</p>
-    <p>任务持仓 {{current.inventory}} · 本轮投入成本 {{current.cost}} U · 本轮卖出净收入 {{current.proceeds}} U</p>
-    <p>已结束轮次预计盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U · 估算手续费 {{current.fees}} U</p>
-    <p v-if="current.risk">按最新已收盘 K 线估算退出净收入：{{current.risk.exit_net??'未知'}} U；本轮预计损耗：{{current.risk.loss??'未知'}} U。</p>
-    <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（汇总订单无法提供首笔成交精确时间，保守使用买单提交时间）。</p>
-    <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 卖出 {{current.pending.quantity}} {{current.request.expected_symbol}}</template></p>
+    <p>代币余额 {{current.inventory}} · 本轮实际支出 {{current.cost}} U · 本轮卖出收入 {{current.proceeds}} U</p>
+    <p>已结束轮次现金盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U（余额差不重复扣手续费）</p>
+    <p>本轮起始 USDT：{{current.round_start_quote??'尚未开始'}} · 计划买入 {{current.round_plan??'—'}} U · 已撤单重挂 {{current.buy_rehangs??0}} / 10 次。</p>
+    <p v-if="current.balances">最近已核对可用 USDT {{current.balances.quote_available}} · 上轮保留零头 {{current.dust??'0'}}。</p>
+    <p v-if="current.risk">含冻结资产的 K 线估值：{{current.risk.equity??'待核对'}} U；预计损耗 {{current.risk.loss??'待核对'}} U / {{current.risk.loss_pct??'待核对'}}%。{{current.risk.reason}}</p>
+    <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（观察到余额增加后，使用对应买单提交时间；重挂不重置）。</p>
+    <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 使用平台 100% 卖出（包含已有零头）</template></p>
     <div v-if="current.pending_order?.state==='submission_unknown'" class="notice error">
-      <p>这笔订单没有完成二次确认，程序正在等待你核对。首次错误：{{current.pending_order.submission_error||current.pending_order.message}}</p>
-      <p>请关闭仍然显示的订单确认弹窗，并确认币安“当前委托”中没有这笔订单。程序还会核对当前无挂单且历史订单没有变化。</p>
+      <p>这笔订单的提交结果尚未确认，程序正在等待你核对。首次错误：{{current.pending_order.submission_error||current.pending_order.message}}</p>
+      <p>请关闭仍然显示的订单确认弹窗，并确认币安“当前委托”中没有这笔订单。程序还会核对当前无挂单且余额与提交前一致。</p>
       <label><input v-model="confirmedNotSubmitted" type="checkbox" :disabled="busy" />我已关闭确认弹窗，并确认平台没有这笔订单。</label>
       <button class="secondary" :disabled="busy||!confirmedNotSubmitted" @click="resolveUnsubmitted">核对未提交并结束旧任务</button>
+    </div>
+    <div v-if="current.accounting_version!==2" class="notice">
+      <p>此为旧版任务，缺少新核算所需起始余额。请先处理平台挂单，再结束旧版记录；旧统计保留，不转换为新盈亏。</p>
+      <button class="secondary" :disabled="busy" @click="control('retire_legacy')">核对无挂单并结束旧版记录</button>
     </div>
     <div class="actions">
       <button class="secondary" :disabled="busy||!running" @click="control('pause')">暂停自动操作</button>
       <button :disabled="busy||running" @click="control('resume')">核对后恢复任务</button>
       <button class="secondary" :disabled="busy" @click="control('finish')">停止买入，卖完结束</button>
     </div>
-    <p class="muted">暂停不撤挂单，只读巡检继续。后端重启后保持暂停，需点击恢复。页面异常、撤单结果未知、持仓不符或余量不足最小委托时会停下并保留记录；不会将余量当作清仓。启动前已有的代币余额不纳入本任务。</p>
+    <p class="muted">暂停不撤挂单，只读巡检继续。后端重启后保持暂停，需点击恢复。卖出使用平台 100%，包含原有零头；无挂单且剩余价值不超过 2 U 即结束本轮。现金盈亏不计剩余代币估值。挂单期间若缺少冻结余额及剩余委托量，会先撤单释放资金再核算；页面异常或撤单结果未知时暂停。</p>
   </div>
   <details v-if="recent.length"><summary>最近任务</summary><ul><li v-for="task in recent" :key="task.id">{{task.id.slice(0,8)}} · {{task.request.expected_symbol}} · {{task.message}} · 买入 {{task.buy_total}} U · 盈亏 {{task.realized_pnl}} U</li></ul></details>
   <DecisionLog :tasks="recent" :current-id="current?.id" />

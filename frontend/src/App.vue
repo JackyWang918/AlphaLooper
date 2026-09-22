@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import ResearchPanel from './components/ResearchPanel.vue'
-import AccountRecords from './components/AccountRecords.vue'
 import LiveOrder from './components/LiveOrder.vue'
 import AutomaticTrading from './components/AutomaticTrading.vue'
 
@@ -131,7 +130,6 @@ onMounted(() => execute('status'))
     </section>
     <LiveOrder :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
     <ResearchPanel v-model:url="tradeUrl" />
-    <AccountRecords :url="tradeUrl" :connected="browser.connected" :browser-busy="pending" />
     <section>
       <h2>操作反馈</h2>
       <p class="muted">此处显示本次打开控制台后的操作记录。</p>

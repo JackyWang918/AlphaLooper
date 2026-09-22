@@ -36,7 +36,6 @@ def test_paused_task_can_open_original_coin_without_resuming(services):
         ("open", URL.replace("0x123", "0x456")),
         ("open", "https://www.binance.com/alpha"),
         ("fill", URL),
-        ("read_records", URL),
         ("order_readiness", URL),
     ],
 )

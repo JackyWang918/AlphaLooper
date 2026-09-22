@@ -45,12 +45,19 @@ class FillForm(BaseModel):
     quantity: str = Field(max_length=40)
     expected_symbol: str = Field(min_length=1, max_length=30)
     expected_quote: str = Field(min_length=1, max_length=30)
+    quote_amount: str | None = Field(default=None, max_length=40)
+    sell_all: bool = False
 
     @field_validator("url")
     @classmethod
     def concrete_token(cls, value):
         token_identity(value)
         return value.strip()
+
+    @field_validator("quote_amount")
+    @classmethod
+    def optional_amount(cls, value):
+        return None if value is None else cls.positive_decimal(value)
 
     @field_validator("price", "quantity")
     @classmethod
@@ -60,8 +67,10 @@ class FillForm(BaseModel):
         return value
 
 
-class ReadRecords(BaseModel):
-    book: str = Field(default="本机账户", min_length=1, max_length=80, pattern=r".*\S.*")
+class TradingAccount(BaseModel):
+    book: str = Field(
+        default="本机账户", min_length=1, max_length=80, pattern=r".*\S.*"
+    )
     url: str = Field(max_length=2048)
 
     @field_validator("url")

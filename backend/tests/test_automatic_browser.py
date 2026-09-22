@@ -75,10 +75,9 @@ def install_current_layout(page, *, status="新订单", duplicate_blank_headers=
 
 def test_partial_progress_and_single_scoped_cancel(page):
     install_order(page)
-    assert inspect_progress(page, PAYLOAD)["progress"] == {
-        "quantity": "0.2",
-        "gross": "0.18",
-    }
+    assert (
+        inspect_progress(page, PAYLOAD)["current_order"]["remaining_quantity"] == "0.8"
+    )
     page.locator("body").evaluate(
         "e=>e.insertAdjacentHTML('beforeend','<button onclick=\"window.wrong=true\">撤单</button>')"
     )
@@ -89,10 +88,7 @@ def test_partial_progress_and_single_scoped_cancel(page):
 
 def test_actual_current_layout_reports_zero_progress_for_new_order(page):
     install_current_layout(page)
-    assert inspect_progress(page, PAYLOAD)["progress"] == {
-        "quantity": "0",
-        "gross": "0",
-    }
+    assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
     assert cancel_once(page, PAYLOAD)["cancel_clicked"]
     assert page.evaluate("window.cancels") == 1
 
@@ -105,27 +101,23 @@ def test_split_header_and_body_tables_use_the_platform_header(page):
       headerTable.appendChild(bodyTable.querySelector('thead'));
       panel.insertBefore(headerTable, bodyTable);
     }""")
-    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+    assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
 
 
 def test_fixed_platform_layout_works_when_header_is_not_semantic_dom(page):
     install_current_layout(page)
     page.locator("#current thead").evaluate("element=>element.remove()")
-    assert inspect_progress(page, PAYLOAD)["progress"] == {
-        "quantity": "0",
-        "gross": "0",
-    }
+    assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
 
 
 def test_irrelevant_duplicate_blank_headers_do_not_break_field_mapping(page):
     install_current_layout(page, duplicate_blank_headers=True)
-    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+    assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
 
 
 def test_current_layout_stops_if_status_may_include_a_partial_fill(page):
     install_current_layout(page, status="部分成交")
-    with pytest.raises(ValueError, match="没有已成交和成交额列"):
-        inspect_progress(page, PAYLOAD)
+    assert inspect_progress(page, PAYLOAD)["pending"]
 
 
 def test_surplus_empty_edge_header_is_ignored(page):
@@ -133,7 +125,7 @@ def test_surplus_empty_edge_header_is_ignored(page):
     page.locator("#current thead tr").evaluate(
         "element=>element.appendChild(document.createElement('th'))"
     )
-    assert inspect_progress(page, PAYLOAD)["progress"]["quantity"] == "0"
+    assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
 
 
 def test_named_header_cell_count_error_reports_observed_layout(page):
@@ -149,9 +141,7 @@ def test_named_header_cell_count_error_reports_observed_layout(page):
         inspect_progress(page, PAYLOAD)
 
 
-@pytest.mark.parametrize(
-    "changes", [{"price": "0.8 USDT"}, {"quantity": "2 DGAI"}, {"direction": "卖出"}]
-)
+@pytest.mark.parametrize("changes", [{"price": "0.8 USDT"}, {"direction": "卖出"}])
 def test_cancel_rejects_wrong_order_without_click(page, changes):
     install_order(page, **changes)
     with pytest.raises(ValueError):
@@ -160,10 +150,8 @@ def test_cancel_rejects_wrong_order_without_click(page, changes):
 
 
 def test_balance_read_switches_side_but_never_submits(page):
-    page.locator("body").evaluate(
-        "e=>e.insertAdjacentHTML('beforeend','<p>可用余额： 1.9998 DGAI</p>')"
-    )
-    assert available_balance(page, PAYLOAD) == {"available": "1.9998"}
+    page.locator("#coins").evaluate("e=>e.textContent='可用余额： 1.9998 DGAI'")
+    assert available_balance(page, PAYLOAD)["base_available"] == "1.9998"
     assert page.evaluate("window.submits") == 0
     assert page.locator("#limitAmount").input_value() == ""
 
@@ -180,3 +168,28 @@ def test_ambiguous_balance_or_modal_stops(page):
     with pytest.raises(ValueError, match="弹窗"):
         cancel_once(page, PAYLOAD)
     assert page.evaluate("window.submits") == 0
+
+
+def test_explicit_frozen_and_total_balances_include_locked_assets(page):
+    install_current_layout(page, status="部分成交")
+    page.locator("#cash").evaluate("e=>e.textContent='可用 50 USDT'")
+    page.locator("body").evaluate(
+        "e=>e.insertAdjacentHTML('beforeend','<p>冻结 20 USDT</p>')"
+    )
+    result = inspect_progress(page, PAYLOAD)
+    assert result["balances"]["quote_total"] == "70"
+    assert result["balances"]["base_total"] == "1"
+
+
+def test_absent_order_but_frozen_funds_not_settled(page):
+    page.locator("body").evaluate(
+        "e=>e.insertAdjacentHTML('beforeend','<p>冻结 20 USDT</p>')"
+    )
+    assert inspect_progress(page, PAYLOAD)["settling"]
+
+
+def test_unknown_frozen_is_explicit_not_zero(page):
+    install_current_layout(page, status="部分成交")
+    result = inspect_progress(page, PAYLOAD)
+    assert result["balances"]["quote_total"] is None
+    assert result["balances"]["base_total"] == "1"

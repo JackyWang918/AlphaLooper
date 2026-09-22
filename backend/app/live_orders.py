@@ -7,12 +7,9 @@ import time
 from decimal import Decimal, localcontext
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from sqlalchemy import Column, Integer, String, Table, Text, select
-from sqlalchemy.dialects.sqlite import insert
 
-from app import account_ledger
-from app.browser.live import matches
 from app.browser.schemas import FillForm
 from app.database import Base
 
@@ -30,6 +27,12 @@ class SubmitOrder(FillForm):
     book: str = Field(
         default="本机账户", min_length=1, max_length=80, pattern=r".*\S.*"
     )
+
+    @model_validator(mode="after")
+    def platform_sell_percentage(self):
+        if self.side == "sell":
+            self.sell_all = True
+        return self
 
 
 class LiveOrders:
@@ -56,7 +59,9 @@ class LiveOrders:
             try:
                 if self.automatic and self.automatic.get():
                     self.automatic.tick()
-                elif time.time() - last_check >= 60:
+                elif time.time() - last_check >= (
+                    5 if self.get() and self.get()["state"] == "settling" else 60
+                ):
                     last_check = time.time()
                     self.check()
             except Exception:
@@ -117,10 +122,13 @@ class LiveOrders:
                 raise ValueError("请先在本地控制台开启实盘单笔下单。")
             with localcontext() as context:
                 context.prec = 80
-                if body.side == "buy" and Decimal(body.price) * Decimal(
-                    body.quantity
-                ) * Decimal("1.0001") > Decimal(50):
-                    raise ValueError("本阶段单笔买入预算含估算手续费不得超过 50 U。")
+                total = (
+                    Decimal(body.quote_amount)
+                    if body.quote_amount
+                    else Decimal(body.price) * Decimal(body.quantity)
+                )
+                if body.side == "buy" and total > Decimal(50):
+                    raise ValueError("单笔计划买入金额不得超过 50 U。")
             record = {
                 "id": id,
                 "request": payload,
@@ -128,7 +136,8 @@ class LiveOrders:
                 "active": True,
                 "state": "preparing",
                 "message": "正在核对页面",
-                "baseline_id": None,
+                "accounting_version": 2,
+                "quote_amount": str(total) if body.side == "buy" else None,
                 "task_id": owner,
             }
             with self.engine.connect() as c:
@@ -151,7 +160,7 @@ class LiveOrders:
                 self.save(record)
                 return record
             record.update(
-                baseline_id=result["baseline_id"],
+                before_balances=result["balances"],
                 state="submission_unknown",
                 message="已记录提交意图，等待平台确认；不会自动重试。",
             )
@@ -183,7 +192,8 @@ class LiveOrders:
             return record
 
     def check(self):
-        with self.lock:
+        with self.lock, localcontext() as context:
+            context.prec = 80
             record = self.get()
             if not record:
                 return None
@@ -203,32 +213,47 @@ class LiveOrders:
                 )
                 record["checked_at"] = time.time()
                 record.pop("last_check_error", None)
-                if result["pending"]:
-                    record.update(state="waiting", message="当前委托仍在，继续等待。")
-                    if result.get("progress"):
-                        progress = result["progress"]
-                        previous = record.get(
-                            "progress", {"quantity": "0", "gross": "0"}
-                        )
-                        if any(
-                            Decimal(progress[k]) < Decimal(previous[k])
-                            for k in previous
-                        ):
-                            raise ValueError("当前委托累计成交倒退，停止自动处理。")
-                        if Decimal(progress["quantity"]) > 0:
-                            record.setdefault("first_fill_at", record["created_at"])
-                        record["progress"] = progress
+                if result.get("settling"):
+                    record.pop("settlement_candidate", None)
+                    record.update(
+                        state="settling",
+                        message="读取期间委托或冻结余额变化，等待余额稳定。",
+                    )
+                elif result["pending"]:
+                    record.pop("settlement_candidate", None)
+                    record.update(
+                        state="waiting",
+                        observed_pending=True,
+                        balances=result["balances"],
+                        current_order=result.get("current_order"),
+                        message="当前委托仍在，按余额跟踪。",
+                    )
                 else:
-                    order = result.get("order")
-                    if not matches(order, record["request"], record["baseline_id"]):
+                    if record.get("accounting_version") != 2:
                         raise ValueError(
-                            "最新历史委托尚未匹配本次订单，继续保留待核实状态。"
+                            "旧订单没有买入前余额基准，不能转换为新口径。请核对后结束旧任务。"
                         )
-                    if order["status"] not in {"已成交", "已取消", "已撤销", "已过期"}:
-                        raise ValueError("平台订单尚未结束。")
-                    self.finish(record, order)
-                    return record
+                    balances = result["balances"]
+                    if not record.get("observed_pending") and balances == record.get(
+                        "before_balances"
+                    ):
+                        raise ValueError(
+                            "无挂单且余额未变化，提交结果仍未知；不会自动重发。"
+                        )
+                    previous = record.get("settlement_candidate")
+                    if not previous or previous["balances"] != balances:
+                        record["settlement_candidate"] = {
+                            "balances": balances,
+                            "at": time.time(),
+                        }
+                        record.update(
+                            state="settling", message="当前无委托，等待下一次余额核对。"
+                        )
+                    elif time.time() - previous["at"] >= 2:
+                        self.finish(record, balances)
+                        return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
+                record.pop("settlement_candidate", None)
                 record.update(last_check_error=str(exc), checked_at=time.time())
                 if (
                     record.get("submission_error")
@@ -248,64 +273,50 @@ class LiveOrders:
             result = self.call("live_unsubmitted", record["request"])
             if result["pending"]:
                 raise ValueError("平台仍有挂单，不能标记为未提交。")
-            order = result.get("order")
-            latest_id = order["order_id"] if order else None
-            if latest_id != record["baseline_id"]:
-                raise ValueError(
-                    "平台历史订单已变化，请先核对实际订单结果，不能解除等待。"
-                )
+            if result.get("settling") or result.get("balances") != record.get(
+                "before_balances"
+            ):
+                raise ValueError("余额尚未稳定或已变化，不能标记为未提交。")
             record.update(
                 active=False,
                 state="not_submitted",
                 resolved_at=time.time(),
                 resolution="user_confirmed_not_submitted",
-                message="用户确认未完成平台二次确认；核对无挂单且历史未变化，已结束本地等待。未重新提交。",
+                message="用户确认未完成平台二次确认；核对无挂单且余额未变化，已结束本地等待。未重新提交。",
             )
             self.save(record)
             return record
 
-    def finish(self, record, order):
-        previous = record.get("progress", {"quantity": "0", "gross": "0"})
-        if any(Decimal(order[k]) < Decimal(previous[k]) for k in previous):
-            raise ValueError("最终成交结果小于已观察成交，保留待核实。")
-        # Final result + accounting are committed together; never double-count on restart.
-        finished = dict(
-            record,
+    def finish(self, record, balances):
+        before = record["before_balances"]
+        cash_delta = Decimal(balances["quote_available"]) - Decimal(
+            before["quote_available"]
+        )
+        token_delta = Decimal(balances["base_available"]) - Decimal(
+            before["base_available"]
+        )
+        side = record["request"]["side"]
+        if (side == "buy" and (cash_delta > 0 or token_delta < 0)) or (
+            side == "sell" and (cash_delta < 0 or token_delta > 0)
+        ):
+            raise ValueError("余额变化与订单方向不符，等待核对。")
+        result = {
+            "balances": balances,
+            "before_balances": before,
+            "cash_delta": str(cash_delta),
+            "token_delta": str(token_delta),
+            "gross": str(abs(cash_delta)),
+            "quantity": str(abs(token_delta)),
+            "status": "余额已核对",
+            "local_order_id": record["id"],
+        }
+        record.update(
             active=False,
             state="completed",
-            result=order,
-            message="平台最终结果已确认，账本已更新。",
+            result=result,
+            message="当前无委托且余额稳定，已记录实际资金变化。",
         )
-        book = record["request"]["book"]
-        with self.engine.connect() as c:
-            c.exec_driver_sql("BEGIN IMMEDIATE")
-            previous = c.execute(
-                select(account_ledger.orders.c.payload).where(
-                    account_ledger.orders.c.book == book,
-                    account_ledger.orders.c.order_id == order["order_id"],
-                )
-            ).scalar_one_or_none()
-            if previous:
-                old = json.loads(previous)
-                if any(
-                    old[k] != order[k]
-                    for k in ("symbol", "quote", "side", "quantity", "gross")
-                ):
-                    c.rollback()
-                    raise ValueError("账本已有同编号但结果不同的订单，请人工核对。")
-            statement = insert(account_ledger.orders).values(
-                book=book, order_id=order["order_id"], payload=json.dumps(order)
-            )
-            c.execute(
-                statement.on_conflict_do_nothing(index_elements=["book", "order_id"])
-            )
-            c.execute(
-                intents.update()
-                .where(intents.c.id == record["id"])
-                .values(active=None, payload=json.dumps(finished))
-            )
-            c.commit()
-        record.update(finished)
+        self.save(record)
 
     def cancel(self):
         with self.lock:
