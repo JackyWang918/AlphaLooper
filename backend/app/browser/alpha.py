@@ -1,5 +1,6 @@
 """Read and fill observed Alpha controls. No submit or confirmation selectors."""
 
+import re
 import time
 from decimal import Decimal, InvalidOperation, localcontext
 
@@ -8,6 +9,40 @@ from playwright.sync_api import Page, expect
 from app.browser.schemas import FillForm, token_identity
 
 TABS = {"buy": "买入", "sell": "卖出"}
+
+
+def total_inputs(page: Page):
+    """Use the field's meaning as well as the legacy id; never input order."""
+    label = re.compile(r"^成交额(?:\s*[（(]?(?:USDT|USDC)[）)]?)?$")
+    grouped = page.locator(
+        "xpath=//*[count(.//input)=1 and "
+        ".//*[not(*) and normalize-space(.)='成交额']]//input"
+    )
+    return (
+        page.locator("input#limitTotal")
+        .or_(page.get_by_label(label))
+        .or_(page.get_by_placeholder(label))
+        .or_(grouped)
+        .and_(page.locator("input:visible"))
+    )
+
+
+def wait_total_input(page: Page):
+    deadline = time.monotonic() + 5
+    while True:
+        total = total_inputs(page)
+        count = total.count()
+        if count > 1:
+            raise ValueError(f"成交额输入框识别到 {count} 个可见候选，无法唯一定位。")
+        if count == 1 and total.is_editable():
+            return total
+        if time.monotonic() >= deadline:
+            reason = "没有可见候选" if count == 0 else "输入框只读或禁用"
+            raise ValueError(
+                f"成交额输入框等待 5 秒后仍不可填写：{reason}"
+                "（按成交额标签及 #limitTotal 定位）。"
+            )
+        time.sleep(0.1)
 
 
 def inspect_form(page: Page):
@@ -24,6 +59,7 @@ def inspect_form(page: Page):
         return result
     result.update(chain=chain, address=address)
     price, amount = page.locator("#limitPrice"), page.locator("#limitAmount")
+    total = total_inputs(page)
     if price.count() != 1 or amount.count() != 1:
         return result
     if not price.is_visible() or not amount.is_visible():
@@ -48,6 +84,9 @@ def inspect_form(page: Page):
         side=active[0],
         price_step=price.get_attribute("step"),
         quantity_step=amount.get_attribute("step"),
+        total_supported=total.count() == 1
+        and total.is_visible()
+        and total.is_editable(),
         fill_supported=price.is_editable() and amount.is_editable(),
         reason="表单已识别；仅填写，不提交。",
     )
@@ -99,31 +138,24 @@ def fill_form(page: Page, payload: dict):
     check_step(command.price, state["price_step"])
     check_step(command.quantity, state["quantity_step"])
     price, amount = page.locator("#limitPrice"), page.locator("#limitAmount")
+    # Resolve all required fields before changing the order price.
+    total = wait_total_input(page) if command.side == "buy" else None
     price.click(trial=True, timeout=3000)
     price.fill(command.price)
-    price.press("Tab")
-    verify_identity(page, command)
-    expect(tab).to_have_attribute("aria-selected", "true")
-    amount.click(trial=True, timeout=3000)
-    amount.fill(command.quantity)
-    amount.press("Tab")
-    # Recheck after blur because controlled inputs may normalize trailing zeroes.
-    # Compare Decimal values: "47.82000000" and "47.82" are the same order size.
-    actual_price = price.input_value()
-    actual_quantity = amount.input_value()
-    try:
-        price_matches = Decimal(actual_price) == Decimal(command.price)
-        quantity_matches = Decimal(actual_quantity) == Decimal(command.quantity)
-    except InvalidOperation as exc:
-        raise ValueError(
-            f"页面回读值不是有效数字：价格 {actual_price!r}，数量 {actual_quantity!r}。"
-        ) from exc
-    if not price_matches or not quantity_matches:
-        raise ValueError(
-            "页面回读值与计划不一致："
-            f"计划价格 {command.price}、页面价格 {actual_price}；"
-            f"计划数量 {command.quantity}、页面数量 {actual_quantity}。"
-        )
+    if command.side == "buy":
+        with localcontext() as context:
+            context.prec = 80
+            quote_amount = format(
+                Decimal(command.price) * Decimal(command.quantity), "f"
+            )
+        total.click(trial=True, timeout=3000)
+        total.fill(quote_amount)
+        total.press("Tab")
+    else:
+        amount.click(trial=True, timeout=3000)
+        amount.fill(command.quantity)
+        amount.press("Tab")
+        quote_amount = None
     state = verify_identity(page, command)
     if state["side"] != command.side:
         raise ValueError("填表过程中买卖方向发生变化，请人工检查。")
@@ -131,7 +163,8 @@ def fill_form(page: Page, payload: dict):
         "side": state["side"],
         "symbol": state["symbol"],
         "quote": state["quote"],
-        "price": actual_price,
-        "quantity": actual_quantity,
+        "price": command.price,
+        "quantity": command.quantity,
+        "quote_amount": quote_amount,
         "submitted": False,
     }

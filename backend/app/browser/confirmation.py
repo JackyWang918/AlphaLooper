@@ -166,16 +166,20 @@ def wait_for_confirmation(page, command, timeout_ms=5000):
 
 
 def confirm_once(page, command, deadline=None):
-    dialog = wait_for_confirmation(page, command)
-    button = dialog.get_by_role("button", name="继续", exact=True)
-    if button.count() != 1:
-        raise ValueError("订单确认弹窗中没有唯一可用的“继续”按钮，未点击。")
-    expect(button).to_be_enabled(timeout=5000)
-    button.click(trial=True, timeout=3000)
-    # Re-read after the actionability wait; never confirm stale values or another token.
-    verify_identity(page, command)
-    evidence = validate_confirmation(dialog.inner_text(), command)
-    if deadline is not None and time.time() > deadline:
-        raise ValueError("行情已过期，未点击继续；请关闭弹窗并核对未提交状态。")
-    button.click(timeout=3000)  # Never retry this click, including on timeout.
-    return evidence
+    deadline_at = time.monotonic() + 5
+    while time.monotonic() < deadline_at:
+        dialogs = confirmation_dialogs(page)
+        if dialogs.count() > 1:
+            raise ValueError("出现多个可见弹窗，未点击继续。")
+        if dialogs.count() == 1:
+            text = dialogs.inner_text()
+            if re.search(r"验证码|人机验证|安全验证|风险测评|身份验证|验证器", text):
+                raise ValueError("出现验证提示，请手动处理；不会自动点击继续。")
+            button = dialogs.get_by_role("button", name="继续", exact=True)
+            if button.count() == 1:
+                expect(button).to_be_enabled(timeout=5000)
+                button.click(trial=True, timeout=3000)
+                button.click(timeout=3000)  # Never retry this click, including on timeout.
+                return {"unchecked_confirmation": True}
+        page.wait_for_timeout(100)
+    raise ValueError("等待普通订单确认弹窗或唯一“继续”按钮超时。")

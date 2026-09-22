@@ -58,6 +58,7 @@ def page(browser):
       <div role="tab" aria-selected="false" onclick="select(this)">卖出</div>
       <div><input id="limitPrice" step="1e-8"><span class="bn-textField-suffix">USDT</span></div>
       <div><input id="limitAmount" step="0.01"><span class="bn-textField-suffix">DGAI</span></div>
+      <div><input id="limitTotal" step="1e-8"><span class="bn-textField-suffix">USDT</span></div>
       <button onclick="window.submits++">买入 DGAI</button>
       <script>
         window.submits=0;
@@ -78,6 +79,7 @@ def test_fill_both_directions_without_submission(page, side):
     assert result["side"] == side
     assert result["price"] == "0.9"
     assert result["quantity"] == "1"
+    assert result["quote_amount"] == ("0.9" if side == "buy" else None)
     assert result["submitted"] is False
     assert page.evaluate("window.submits") == 0
 
@@ -87,7 +89,8 @@ def test_fill_accepts_equivalent_value_with_trimmed_trailing_zeroes(page):
         "e=>e.addEventListener('blur',()=>e.value=String(Number(e.value)))"
     )
     result = fill_form(page, {**PAYLOAD, "quantity": "47.82000000"})
-    assert result["quantity"] == "47.82"
+    assert result["quantity"] == "47.82000000"
+    assert page.locator("#limitTotal").input_value() == "43.038000000"
     assert page.evaluate("window.submits") == 0
 
 
@@ -105,12 +108,73 @@ def test_worker_adopts_unique_matching_trade_tab():
     assert select_target_page(context, other, URL) is target
 
 
-def test_fill_reports_actual_normalized_mismatch(page):
-    page.locator("#limitAmount").evaluate(
-        "e=>e.addEventListener('blur',()=>e.value='47.81')"
+def test_buy_fills_strategy_price_and_quote_amount_not_token_quantity(page):
+    result = fill_form(page, {**PAYLOAD, "price": "1.04718870", "quantity": "47.74"})
+    assert result["price"] == "1.04718870"
+    assert page.locator("#limitPrice").input_value() == "1.04718870"
+    assert page.locator("#limitTotal").input_value() == "49.9927885380"
+    assert page.locator("#limitAmount").input_value() == ""
+    assert page.evaluate("window.submits") == 0
+
+
+@pytest.mark.parametrize("label_kind", ["label", "group", "placeholder"])
+def test_buy_total_is_located_by_meaning_without_legacy_id(page, label_kind):
+    page.locator("#limitTotal").evaluate(
+        """(el, kind) => {
+      el.id='quoteValue';
+      if (kind==='placeholder') el.placeholder='成交额';
+      else {
+        const label=document.createElement(kind==='label'?'label':'div');
+        label.textContent='成交额';
+        if (kind==='label') label.htmlFor=el.id;
+        el.parentElement.prepend(label);
+      }
+    }""",
+        label_kind,
     )
-    with pytest.raises(ValueError, match="计划数量 47.82000000、页面数量 47.81"):
-        fill_form(page, {**PAYLOAD, "quantity": "47.82000000"})
+    fill_form(page, PAYLOAD)
+    assert page.locator("#quoteValue").input_value() == "0.9"
+    assert page.locator("#limitAmount").input_value() == ""
+    assert page.evaluate("window.submits") == 0
+
+
+def test_buy_total_ignores_hidden_responsive_copy(page):
+    page.locator("#limitTotal").evaluate("""el => {
+      const copy=el.cloneNode(); copy.hidden=true;
+      document.body.appendChild(copy);
+    }""")
+    fill_form(page, PAYLOAD)
+    assert page.locator("#limitTotal:visible").input_value() == "0.9"
+
+
+def test_buy_waits_for_total_after_switching_from_sell(page):
+    page.get_by_role("tab", name="卖出", exact=True).click()
+    page.locator("#limitTotal").evaluate("el => el.disabled=true")
+    page.get_by_role("tab", name="买入", exact=True).evaluate("""el => {
+      el.addEventListener('click', () => setTimeout(() => {
+        document.querySelector('#limitTotal').disabled=false;
+      }, 250));
+    }""")
+    fill_form(page, PAYLOAD)
+    assert page.locator("#limitTotal").input_value() == "0.9"
+
+
+def test_ambiguous_total_stops_before_price_write(page):
+    page.locator("#limitTotal").evaluate(
+        "el => document.body.appendChild(el.cloneNode())"
+    )
+    with pytest.raises(ValueError, match="2 个可见候选"):
+        fill_form(page, PAYLOAD)
+    assert page.locator("#limitPrice").input_value() == ""
+    assert page.evaluate("window.submits") == 0
+
+
+def test_missing_total_does_not_fall_back_to_quantity(page):
+    page.locator("#limitTotal").evaluate("el => el.remove()")
+    with pytest.raises(ValueError, match="没有可见候选"):
+        fill_form(page, PAYLOAD)
+    assert page.locator("#limitPrice").input_value() == ""
+    assert page.locator("#limitAmount").input_value() == ""
     assert page.evaluate("window.submits") == 0
 
 
@@ -139,7 +203,7 @@ def test_duplicate_input_is_rejected(page):
 
 
 def test_direction_changes_during_fill_is_rejected(page):
-    page.locator("#limitAmount").evaluate(
+    page.locator("#limitTotal").evaluate(
         "e=>e.oninput=()=>select(document.querySelectorAll('[role=tab]')[1])"
     )
     with pytest.raises(ValueError, match="方向"):

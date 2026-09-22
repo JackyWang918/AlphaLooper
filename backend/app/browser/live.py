@@ -143,7 +143,7 @@ def order_readiness(page, payload):
 
 def preflight(page, payload):
     result = order_readiness(page, payload)
-    with stage("提交前填表与回读"):
+    with stage("提交前填写表单"):
         fill_form(page, payload)
     with stage("检查提交按钮可点击性（未点击）"):
         command = FillForm(**payload)

@@ -25,6 +25,7 @@ def page():
         <div role="tab" aria-selected="false" onclick="side(this)">卖出</div>
         <div><input id="limitPrice" step="0.00001"><span class="bn-textField-suffix">USDT</span></div>
         <div><input id="limitAmount" step="0.01"><span class="bn-textField-suffix">DGAI</span></div>
+        <div><input id="limitTotal" step="0.00001"><span class="bn-textField-suffix">USDT</span></div>
         <button onclick="submitOrder()">买入 DGAI</button><button onclick="submitOrder()">卖出 DGAI</button>
         <div role="tab" aria-selected="true" aria-controls="current" onclick="panel(this)">当前委托</div>
         <div role="tab" aria-selected="false" aria-controls="history" onclick="panel(this)">历史委托</div>
@@ -211,14 +212,13 @@ def test_sell_direction_and_duplicate_button_stop(page):
 def test_confirm_both_directions_exactly_once(page, side):
     result = submit_once(page, {**PAYLOAD, "side": side})
     assert result["confirmation_clicked"]
-    assert result["confirmation"]["fee_currency"] == "DGAI"
+    assert result["confirmation"] == {"unchecked_confirmation": True}
     assert page.evaluate("[window.submits,window.confirmations]") == [1, 1]
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        "dialog.innerHTML=dialog.innerHTML.replace('1.00 DGAI','2.00 DGAI')",
         "dialog.insertAdjacentHTML('beforeend','<button>继续</button>')",
         "dialog.insertAdjacentHTML('beforeend','<p>安全验证</p>')",
         "dialog.after(dialog.cloneNode(true))",
@@ -241,7 +241,7 @@ def test_confirmation_failures_never_click_continue(page, mutation):
     assert page.evaluate("[window.submits,window.confirmations]") == [1, 0]
 
 
-def test_modal_values_rechecked_after_trial_click(page):
+def test_confirmation_content_is_not_checked(page):
     page.evaluate("""() => {
       const show=window.submitOrder;
       window.submitOrder=()=>{show();const dialog=document.querySelector('#confirmation');
@@ -251,9 +251,8 @@ def test_modal_values_rechecked_after_trial_click(page):
         },{once:true});
       };
     }""")
-    with pytest.raises(ValueError, match="数量"):
-        submit_once(page, PAYLOAD)
-    assert page.evaluate("window.confirmations") == 0
+    assert submit_once(page, PAYLOAD)["confirmation_clicked"]
+    assert page.evaluate("window.confirmations") == 1
 
 
 def test_confirmation_nested_wrappers_and_unrelated_continue(page):

@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[]}>()
-type Task = {id:string; active:boolean; phase:string; message:string; request:{expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{exit_net:string|null; loss:string|null}|null}
+type Task = {id:string; active:boolean; phase:string; message:string; request:{expected_symbol:string; expected_quote:string; config:{target_points:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{exit_net:string|null; loss:string|null}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -117,7 +117,7 @@ onUnmounted(()=>clearInterval(timer))
     <p>已结束轮次预计盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U · 估算手续费 {{current.fees}} U</p>
     <p v-if="current.risk">按最新已收盘 K 线估算退出净收入：{{current.risk.exit_net??'未知'}} U；本轮预计损耗：{{current.risk.loss??'未知'}} U。</p>
     <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（汇总订单无法提供首笔成交精确时间，保守使用买单提交时间）。</p>
-    <p v-if="current.pending">当前计划：{{current.pending.side==='buy'?'买入':'卖出'}} {{current.pending.quantity}} @ {{current.pending.price}}</p>
+    <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 卖出 {{current.pending.quantity}} {{current.request.expected_symbol}}</template></p>
     <div v-if="current.pending_order?.state==='submission_unknown'" class="notice error">
       <p>这笔订单没有完成二次确认，程序正在等待你核对。首次错误：{{current.pending_order.submission_error||current.pending_order.message}}</p>
       <p>请关闭仍然显示的订单确认弹窗，并确认币安“当前委托”中没有这笔订单。程序还会核对当前无挂单且历史订单没有变化。</p>

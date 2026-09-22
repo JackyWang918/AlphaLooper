@@ -610,8 +610,11 @@ class Automatic:
             price=format(price, "f"),
             quantity=format(quantity, "f"),
         )
+        pending = body.model_dump(mode="json")
+        if side == "buy":
+            pending["quote_amount"] = format(price * quantity, "f")
         t.update(
-            pending=body.model_dump(mode="json"),
+            pending=pending,
             pending_exit=t["exiting"],
             message=f"自动{side}：{body.quantity} @ {body.price}",
         )
@@ -622,6 +625,7 @@ class Automatic:
             {
                 "price": body.price,
                 "quantity": body.quantity,
+                "quote_amount": pending.get("quote_amount"),
                 "request_id": str(body.request_id),
             },
         )
