@@ -89,3 +89,17 @@ def test_grouped_numbers_and_sell_are_supported():
     validate_confirmation(
         text, FillForm(**{**PAYLOAD, "side": "sell", "quantity": "1000"})
     )
+
+
+def test_display_rounded_gross_is_accepted_but_material_mismatch_is_not():
+    command = FillForm(
+        **{**PAYLOAD, "price": "1.04752748", "quantity": "47.72"}
+    )
+    text = (
+        TEXT.replace("0.90000000 USDT", "1.04752748 USDT", 1)
+        .replace("1.00 DGAI", "47.72 DGAI")
+        .replace("0.90000000 USDT", "49.98801135 USDT", 1)
+    )
+    assert validate_confirmation(text, command)["gross"] == "49.98801135"
+    with pytest.raises(ValueError, match="成交额"):
+        validate_confirmation(text.replace("49.98801135", "49.98811135"), command)

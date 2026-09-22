@@ -2,7 +2,7 @@
 
 import re
 import time
-from decimal import Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, localcontext
 
 from playwright.sync_api import expect
 
@@ -58,7 +58,13 @@ def validate_confirmation(text, command):
         context.prec = 100
         if price != Decimal(command.price) or quantity != Decimal(command.quantity):
             raise ValueError("确认弹窗的委托价或数量与本次指令不一致，未点击继续。")
-        if gross != price * quantity:
+        expected_gross = price * quantity
+        display_unit = Decimal(1).scaleb(gross.as_tuple().exponent)
+        displayed_candidates = {
+            expected_gross.quantize(display_unit, rounding=ROUND_HALF_UP),
+            expected_gross.quantize(display_unit, rounding=ROUND_DOWN),
+        }
+        if gross not in displayed_candidates:
             raise ValueError("确认弹窗的成交额与委托价、数量不一致，未点击继续。")
         # Alpha may show fees in the purchased token rather than the quote currency.
         fee_labels = [

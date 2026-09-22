@@ -215,6 +215,19 @@ def automatic_control(body: TaskControl):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class ResolveAutomaticUnsubmitted(BaseModel):
+    task_id: UUID
+    confirmed_not_submitted: Literal[True]
+
+
+@app.post("/api/automatic/resolve-unsubmitted")
+def automatic_resolve_unsubmitted(body: ResolveAutomaticUnsubmitted):
+    try:
+        return app.state.automatic.resolve_unsubmitted(body.task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 DecisionKind = Literal[
     "control",
     "buy_wait",

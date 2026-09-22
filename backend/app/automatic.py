@@ -114,6 +114,15 @@ class Automatic:
             ]
             records.sort(key=lambda t: t["created_at"], reverse=True)
             current = next((t for t in records if t["active"]), None)
+            if current and current.get("pending"):
+                record = self.live.get(current["pending"]["request_id"])
+                if record:
+                    current = dict(current)
+                    current["pending_order"] = {
+                        "state": record["state"],
+                        "message": record["message"],
+                        "submission_error": record.get("submission_error"),
+                    }
             return {"running": self.running, "current": current, "recent": records[:10]}
 
     def create(self, body: StartTask):
@@ -207,6 +216,45 @@ class Automatic:
             else:
                 raise ValueError("不支持的任务操作。")
             self.save(t, "control")
+            return t
+
+    def resolve_unsubmitted(self, id):
+        """Verify a non-confirmed intent and release its automatic task."""
+        with self.live.lock:
+            self.evidence = {}
+            t = self.get()
+            if not t or t["id"] != str(id):
+                raise ValueError("当前任务已变化，请刷新。")
+            if not t.get("pending"):
+                raise ValueError("当前任务没有待核实订单。")
+            record = self.live.get(t["pending"]["request_id"])
+            if not record or record["state"] != "submission_unknown":
+                raise ValueError("当前订单不是二次确认未完成状态，不能按未提交结束。")
+            resolved = self.live.resolve_unsubmitted(record["id"])
+            t.update(
+                pending=None,
+                last_order=resolved["id"],
+                stop_buying=True,
+                exiting=False,
+            )
+            self.running = False
+            if D(t["inventory"]) == 0:
+                t.update(
+                    active=False,
+                    phase="completed",
+                    message="已核对平台无本次订单；旧任务已结束，可以启动新任务。",
+                )
+            else:
+                t.update(
+                    phase="paused",
+                    message="已核对本次订单未提交；任务仍有持仓，请恢复后继续卖出。",
+                )
+            self.save(
+                t,
+                "control",
+                t["message"],
+                {"request_id": resolved["id"], "resolution": resolved["resolution"]},
+            )
             return t
 
     def pause(self, t, message):

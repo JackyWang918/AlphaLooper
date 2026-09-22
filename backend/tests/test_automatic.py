@@ -46,6 +46,12 @@ class Browser:
                 "progress": self.progress,
                 "order": self.latest,
             }
+        if action == "live_unsubmitted":
+            return {
+                "ok": True,
+                "pending": bool(self.pending),
+                "order": self.latest,
+            }
         if action == "live_cancel":
             if self.cancel_fails:
                 raise TimeoutError("撤单超时")
@@ -195,6 +201,29 @@ def test_start_retry_does_not_resume_and_manual_submit_is_blocked(rig):
         r.live.submit(
             SubmitOrder(**r.auto.probe(r.body.model_dump()), request_id=uuid4())
         )
+
+
+def test_resolve_unconfirmed_order_ends_empty_task_and_allows_new_task(rig):
+    r = rig
+    task = tick(r)
+    record = r.live.get(task["pending"]["request_id"])
+    r.browser.pending = None
+    record.update(
+        state="submission_unknown",
+        message="提交结果待核实：确认弹窗成交额显示精度不同，未点击继续。",
+        submission_error="确认弹窗成交额显示精度不同，未点击继续。",
+    )
+    r.live.save(record)
+    status = r.auto.status()["current"]
+    assert status["pending_order"]["state"] == "submission_unknown"
+
+    finished = r.auto.resolve_unsubmitted(r.body.request_id)
+    assert not finished["active"] and finished["pending"] is None
+    assert r.auto.get() is None and r.live.get() is None
+    assert r.browser.calls.count("live_submit") == 1
+
+    replacement = r.body.model_copy(update={"request_id": uuid4()})
+    assert r.auto.create(replacement)["active"]
 
 
 def test_target_stops_buying_exits_and_completes(rig):
