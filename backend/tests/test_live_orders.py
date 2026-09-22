@@ -52,6 +52,7 @@ def observe(service, balance=None, pending=False):
         "ok": True,
         "pending": pending,
         "balances": balance or wallet(),
+        "page_refreshed": True,
     }
     return service.check()
 
@@ -145,6 +146,52 @@ def test_wrong_direction_delta_does_not_complete(service):
     service.now[0] += 5
     result = observe(service, wallet("101", "1"))
     assert result["active"] and "方向" in result["last_check_error"]
+
+
+def test_confirmed_cancel_waits_then_refreshes_before_check(service):
+    submitted(service)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "confirmation_clicked": True,
+        "cancel_all": True,
+    }
+    record = service.get()
+    record["task_id"] = "task"
+    record["observed_pending"] = True
+    service.save(record)
+    canceled = service.cancel()
+    assert canceled["cancel_state"] == "confirmed"
+    service.browser.execute.reset_mock()
+
+    assert service.check()["state"] == "waiting"
+    service.browser.execute.assert_not_called()
+    service.now[0] += 10
+    service.browser.execute.return_value = {
+        "ok": True,
+        "pending": False,
+        "balances": wallet(),
+        "page_refreshed": True,
+    }
+    checked = service.check()
+    assert checked["state"] == "settling"
+    payload = service.browser.execute.call_args.kwargs["payload"]
+    assert payload["refresh_before_check"] is True
+    assert checked["cancel_refresh_pending"] is False
+
+
+def test_cancel_confirmation_missing_remains_unknown_and_never_retries(service):
+    submitted(service)
+    record = service.get()
+    record["task_id"] = "task"
+    service.save(record)
+    service.browser.execute.return_value = {"ok": True, "cancel_clicked": True}
+    canceled = service.cancel()
+    assert canceled["cancel_state"] == "unknown"
+    assert "确认按钮" in canceled["cancel_error"]
+    assert service.cancel()["cancel_state"] == "unknown"
+    assert [call.args[0] for call in service.browser.execute.call_args_list].count(
+        "live_cancel"
+    ) == 1
 
 
 def test_api_guard_and_history_endpoints_removed(tmp_path, monkeypatch):

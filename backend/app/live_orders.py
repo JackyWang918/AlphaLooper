@@ -206,11 +206,20 @@ class LiveOrders:
                 )
                 self.save(record)
                 return record
+            if time.time() < record.get("cancel_check_after", 0):
+                record["message"] = "已确认取消全部订单，等待平台状态和余额更新。"
+                self.save(record)
+                return record
             try:
+                refresh_before_check = bool(record.get("cancel_refresh_pending"))
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",
-                    record["request"],
+                    record["request"]
+                    | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
+                if refresh_before_check and result.get("page_refreshed"):
+                    record["cancel_refresh_pending"] = False
+                    record["cancel_page_refreshed_at"] = time.time()
                 record["checked_at"] = time.time()
                 record.pop("last_check_error", None)
                 if result.get("settling"):
@@ -331,7 +340,18 @@ class LiveOrders:
             self.save(record)  # Before click; never replay after timeout/restart.
             try:
                 result = self.call("live_cancel", record["request"])
-                record.update(cancel_state="sent", cancel_result=result)
+                if result.get("confirmation_clicked") is not True:
+                    raise ValueError("执行器未确认已点击取消全部订单弹窗的确认按钮。")
+                confirmed_at = time.time()
+                record.update(
+                    cancel_state="confirmed",
+                    cancel_result=result,
+                    cancel_confirmed_at=confirmed_at,
+                    cancel_check_after=confirmed_at + 10,
+                    cancel_timeout_at=confirmed_at + 120,
+                    cancel_refresh_pending=True,
+                    message="已确认取消全部订单；等待后刷新页面并核对委托与余额。",
+                )
             except Exception as exc:  # noqa: BLE001
                 record.update(
                     cancel_error=str(exc), message="撤单结果待核实：" + str(exc)

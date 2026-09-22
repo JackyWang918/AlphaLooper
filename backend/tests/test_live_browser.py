@@ -1,6 +1,7 @@
 import pytest
 from playwright.sync_api import sync_playwright
 
+from app.browser.alpha import fill_form
 from app.browser.live import (
     inspect_order,
     inspect_unsubmitted,
@@ -27,7 +28,7 @@ def page():
         <div><input id="limitAmount" step="0.01"><span class="bn-textField-suffix">DGAI</span></div>
         <div><input id="limitTotal" step="0.00001"><span class="bn-textField-suffix">USDT</span></div>
         <p id="cash">可用 100 USDT</p><p id="coins">可用 1 DGAI</p>
-        <button id="percent" onclick="document.getElementById('limitAmount').value='0.99';window.percents=(window.percents||0)+1">100%</button>
+        <button id="percent">100%</button>
         <button onclick="submitOrder()">买入 DGAI</button><button onclick="submitOrder()">卖出 DGAI</button>
         <div role="tab" aria-selected="true" aria-controls="current" onclick="panel(this)">当前委托</div>
         <div role="tab" aria-selected="false" aria-controls="history" onclick="panel(this)">历史委托</div>
@@ -237,6 +238,8 @@ def test_confirmation_preview_never_clicks(page):
 def test_platform_sell_all_uses_percentage_control_not_quantity_fill(page):
     from app.browser.alpha import fill_form
 
+    page.locator("#percent").evaluate(r"""e=>e.outerHTML=
+      '<input id="percent" type="range" min="0" max="100" value="0" style="width:300px" oninput="document.getElementById(\'limitAmount\').value=\'0.99\';window.percents=(window.percents||0)+1">'""")
     page.locator("#limitAmount").evaluate(
         "e=>e.addEventListener('input',()=>window.quantityTyped=true)"
     )
@@ -244,7 +247,7 @@ def test_platform_sell_all_uses_percentage_control_not_quantity_fill(page):
         page, {**PAYLOAD, "side": "sell", "quantity": "1.000001", "sell_all": True}
     )
     assert not result["submitted"]
-    assert page.evaluate("window.percents") == 1
+    assert page.evaluate("window.percents") > 0
     assert page.evaluate("window.quantityTyped||false") is False
     assert page.locator("#limitAmount").input_value() == "0.99"
     assert page.locator("#limitPrice").input_value() == "0.9"
@@ -253,8 +256,44 @@ def test_platform_sell_all_uses_percentage_control_not_quantity_fill(page):
 
 def test_sell_all_does_not_fallback_to_typing_when_control_missing(page):
     page.locator("#percent").evaluate("e=>e.remove()")
-    with pytest.raises(ValueError, match="100%"):
+    with pytest.raises(ValueError, match="进度条"):
         submit_once(page, {**PAYLOAD, "side": "sell", "sell_all": True})
+    assert page.evaluate("window.submits") == 0
+
+
+def test_sell_all_drags_graphical_slider_without_percent_text(page):
+    page.locator("#percent").evaluate("e=>e.remove()")
+    page.locator("#limitAmount").evaluate(r"""amount=>{
+      const track=document.createElement('div');
+      track.className='bn-slider';
+      track.style='position:relative;width:300px;height:20px';
+      track.innerHTML='<div class="bn-slider-handle" role="slider" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="position:absolute;left:0;width:18px;height:18px"></div>';
+      amount.parentElement.after(track);
+      const handle=track.firstElementChild;
+      handle.addEventListener('mousedown',()=>{
+        const move=event=>{
+          const box=track.getBoundingClientRect();
+          const value=Math.max(0,Math.min(100,(event.clientX-box.left)/box.width*100));
+          handle.style.left=value+'%';handle.setAttribute('aria-valuenow',String(value));
+          if(value>99){amount.value='9.52';document.getElementById('limitPrice').value='1.01';}
+        };
+        const up=()=>{document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up)};
+        document.addEventListener('mousemove',move);document.addEventListener('mouseup',up);
+      });
+    }""")
+    result = fill_form(
+        page,
+        {
+            **PAYLOAD,
+            "side": "sell",
+            "price": "1.05",
+            "quantity": "999",
+            "sell_all": True,
+        },
+    )
+    assert result["quantity"] == "9.52"
+    assert page.locator("#limitAmount").input_value() == "9.52"
+    assert page.locator("#limitPrice").input_value() == "1.05"
     assert page.evaluate("window.submits") == 0
 
 

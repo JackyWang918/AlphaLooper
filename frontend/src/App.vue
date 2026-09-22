@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import ResearchPanel from './components/ResearchPanel.vue'
 import LiveOrder from './components/LiveOrder.vue'
 import AutomaticTrading from './components/AutomaticTrading.vue'
+import BrowserTests from './components/BrowserTests.vue'
 
 const tabs = [
   { id: 'browser', label: '浏览器连接', hint: '01 · 02' },
@@ -36,12 +37,9 @@ const message = ref('正在检查本地服务…')
 const failed = ref(false)
 const tradeUrl = ref(localStorage.getItem('alphalooper.trade-url') ?? 'https://www.binance.com/zh-CN/alpha/bsc/0x10d4183389e99233db3cc981c43443ebd28ebd5e')
 const filled = ref<Filled | null>(null)
-const side = ref('buy')
-const price = ref('')
-const quantity = ref('')
 const history = ref<{ time: string; message: string }[]>([])
 
-async function execute(action: 'status' | 'launch' | 'open' | 'fill') {
+async function execute(action: 'status' | 'launch' | 'open') {
   if (pending.value) return
   pending.value = true
   failed.value = false
@@ -52,7 +50,6 @@ async function execute(action: 'status' | 'launch' | 'open' | 'fill') {
       method: action === 'status' ? 'GET' : 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AlphaLooper-Client': 'local-ui' },
       ...(action === 'open' ? { body: JSON.stringify({ url: tradeUrl.value }) } : {}),
-      ...(action === 'fill' ? { body: JSON.stringify({ url: tradeUrl.value, side: side.value, price: price.value, quantity: quantity.value, expected_symbol: browser.value.symbol, expected_quote: browser.value.quote }) } : {}),
       signal: AbortSignal.timeout(55000),
     })
     const result = await response.json()
@@ -65,7 +62,6 @@ async function execute(action: 'status' | 'launch' | 'open' | 'fill') {
     message.value = result.connected
       ? 'Chrome 已连接。请在 Chrome 中手动登录和处理验证。'
       : 'Chrome 尚未启动，点击下方按钮开始。'
-    if (action === 'fill') message.value = '价格与数量已填写并回读核对，未提交订单。'
   } catch (error) {
     failed.value = true
     message.value = error instanceof Error ? error.message : '操作失败，请检查后端服务。'
@@ -116,18 +112,7 @@ onMounted(() => execute('status'))
       <AutomaticTrading :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" @open-task-page="openTaskPage" />
     </div>
     <div v-show="activeTab==='tools'" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools">
-    <section>
-      <h2>03 / 仅填表</h2>
-      <p class="muted">填写前核对链、合约地址、币种和计价币。此操作只填写，不点击下单按钮。弹窗或验证请在 Chrome 中手动处理。</p>
-      <p v-if="browser.fill_supported" class="muted">价格步长：{{ browser.price_step }}；数量步长：{{ browser.quantity_step }}。数量单位为 {{ browser.symbol }}。</p>
-      <div class="fields">
-        <label>方向<select v-model="side" :disabled="pending"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
-        <label>价格<input v-model="price" :disabled="pending" inputmode="decimal" placeholder="指定价格" /></label>
-        <label>数量<input v-model="quantity" :disabled="pending" inputmode="decimal" placeholder="指定数量" /></label>
-      </div>
-      <button :disabled="pending || !browser.fill_supported || !price.trim() || !quantity.trim()" @click="execute('fill')">仅填表并核对</button>
-      <p v-if="filled" class="notice">回读结果：{{ filled.side === 'buy' ? '买入' : '卖出' }} {{ filled.symbol }}，价格 {{ filled.price }} {{ filled.quote }}，数量 {{ filled.quantity }}。未提交订单。</p>
-    </section>
+    <BrowserTests :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" @refresh-browser="execute('status')" />
     <LiveOrder :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
     <ResearchPanel v-model:url="tradeUrl" />
     <section>

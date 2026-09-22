@@ -123,6 +123,79 @@ def check_step(value: str, step: str | None):
         raise ValueError("无法确认页面输入精度，已停止。") from exc
 
 
+def set_sell_slider_to_max(page: Page, amount):
+    """Drag the unique sell-form percentage slider to its maximum endpoint."""
+    total = wait_total_input(page)
+    scope = total.locator(
+        "xpath=ancestor::*[.//input[@id='limitAmount'] and .//input[@id='limitPrice']][1]"
+    )
+    track = scope.locator('.bn-slider, .rc-slider, input[type="range"]').filter(
+        visible=True
+    )
+    if track.count() != 1:
+        track = scope.get_by_role("slider").filter(visible=True)
+    if track.count() != 1:
+        raise ValueError("卖出表单中没有唯一可见的数量进度条，未设置卖出数量。")
+
+    handle = track.locator(
+        '.bn-slider-handle, .rc-slider-handle, [role="slider"]'
+    ).filter(visible=True)
+    if handle.count() > 1:
+        raise ValueError("卖出数量进度条存在多个滑块，未执行拖动。")
+    handle = handle if handle.count() == 1 else track
+    track_box, handle_box = track.bounding_box(), handle.bounding_box()
+    # A role=slider may identify only the thumb. Walk up to its visible track.
+    for _ in range(3):
+        if track_box and track_box["width"] >= 80:
+            break
+        track = track.locator("..")
+        track_box = track.bounding_box()
+    if not track_box or not handle_box or track_box["width"] < 80:
+        raise ValueError("无法确定卖出数量进度条的可拖动范围。")
+
+    handle.click(trial=True, timeout=3000)
+    page.mouse.move(
+        handle_box["x"] + handle_box["width"] / 2,
+        handle_box["y"] + handle_box["height"] / 2,
+    )
+    page.mouse.down()
+    try:
+        page.mouse.move(
+            track_box["x"] + track_box["width"] + 2,
+            track_box["y"] + track_box["height"] / 2,
+            steps=20,
+        )
+    finally:
+        page.mouse.up()
+    page.wait_for_timeout(100)
+
+    semantic, maximum = (
+        handle.get_attribute("aria-valuenow"),
+        handle.get_attribute("aria-valuemax"),
+    )
+    if handle.evaluate("e => e.matches('input[type=range]')"):
+        semantic = handle.input_value()
+        maximum = handle.get_attribute("max") or "100"
+    if (
+        semantic is not None
+        and maximum is not None
+        and Decimal(semantic) != Decimal(maximum)
+    ):
+        raise ValueError("卖出数量进度条没有到达最大值，未提交订单。")
+
+    deadline = time.monotonic() + 3
+    while True:
+        value = amount.input_value().replace(",", "")
+        try:
+            if value and Decimal(value) > 0:
+                return value
+        except InvalidOperation:
+            pass
+        if time.monotonic() >= deadline:
+            raise ValueError("进度条拉满后平台没有生成可卖数量，未提交订单。")
+        page.wait_for_timeout(100)
+
+
 def fill_form(page: Page, payload: dict):
     command = FillForm(**payload)
     initial = verify_identity(page, command)
@@ -154,12 +227,9 @@ def fill_form(page: Page, payload: dict):
         total.fill(quote_amount)
         total.press("Tab")
     elif command.sell_all:
-        percent = page.get_by_text(re.compile(r"^100\s*%$")).filter(visible=True)
-        if percent.count() != 1:
-            raise ValueError("未找到唯一可见的卖出 100% 控件，未填写数量。")
-        percent.click(timeout=3000)
+        actual_quantity = set_sell_slider_to_max(page, amount)
         quote_amount = None
-        # Percentage widgets can reset the limit price. Set the requested price last.
+        # Slider handlers can reset the limit price. Set the requested price last.
         price.fill(command.price)
     else:
         amount.click(trial=True, timeout=3000)
@@ -174,7 +244,7 @@ def fill_form(page: Page, payload: dict):
         "symbol": state["symbol"],
         "quote": state["quote"],
         "price": command.price,
-        "quantity": command.quantity,
+        "quantity": actual_quantity if command.sell_all else command.quantity,
         "quote_amount": quote_amount,
         "submitted": False,
     }

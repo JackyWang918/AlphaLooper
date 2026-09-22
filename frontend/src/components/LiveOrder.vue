@@ -100,7 +100,7 @@ onUnmounted(()=>clearInterval(timer))
     <label>账本<input v-model="book" :disabled="busy||!!current" /></label>
     <label>方向<select v-model="side" :disabled="busy||!!current"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
     <label>价格（{{quote||'计价币'}}）<input v-model="price" inputmode="decimal" :disabled="busy||!!current" /></label>
-    <label v-if="side==='buy'">买入总金额（{{quote||'USDT'}}）<input v-model="quantity" inputmode="decimal" :disabled="busy||!!current" /></label><p v-else>卖出使用平台 100%，包含已有零头。</p>
+    <label v-if="side==='buy'">买入总金额（{{quote||'USDT'}}）<input v-model="quantity" inputmode="decimal" :disabled="busy||!!current" /></label><p v-else>卖出只填写价格，并将平台数量滑杆拉到最右端；不向数量框输入数值。</p>
   </div>
   <p v-if="blockedReason" class="notice" role="status">暂不能提交：{{blockedReason}}</p>
   <p v-if="price&&quantity&&inputProblem&&blockedReason!==inputProblem" class="notice error">{{inputProblem}}</p>
@@ -123,7 +123,7 @@ onUnmounted(()=>clearInterval(timer))
     <p class="muted">程序会再次核对无挂单和余额未变化。此操作只结束本地记录，不撤单、不补点确认、不重新下单。</p>
   </div>
   <h3 v-if="recent.length">最近请求记录（保留历史结果）</h3>
-  <ul><li v-for="item in recent" :key="item.id">{{new Date(item.created_at*1000).toLocaleString()}} · {{item.request.side==='buy'?'买入':'卖出'}} {{item.request.expected_symbol}} · <template v-if="item.request.sell_all">平台 100%</template><template v-else-if="item.request.quote_amount">计划 {{item.request.quote_amount}} U</template><template v-else>{{item.request.quantity}}</template> @ {{item.request.price}} · {{states[item.state]||item.state}}：{{item.message}}<span v-if="item.result"> 代币变化 {{item.result.quantity}}，资金变化 {{item.result.gross}} U，{{item.result.status}}</span></li></ul>
+  <ul><li v-for="item in recent" :key="item.id">{{new Date(item.created_at*1000).toLocaleString()}} · {{item.request.side==='buy'?'买入':'卖出'}} {{item.request.expected_symbol}} · <template v-if="item.request.sell_all">数量滑杆最右端</template><template v-else-if="item.request.quote_amount">计划 {{item.request.quote_amount}} U</template><template v-else>{{item.request.quantity}}</template> @ {{item.request.price}} · {{states[item.state]||item.state}}：{{item.message}}<span v-if="item.result"> 代币变化 {{item.result.quantity}}，资金变化 {{item.result.gross}} U，{{item.result.status}}</span></li></ul>
 </section>
 </template>
 <style scoped>button{margin:8px 12px 8px 0}li{margin:12px 0;overflow-wrap:anywhere}</style>

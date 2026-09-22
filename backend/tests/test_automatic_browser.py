@@ -10,6 +10,20 @@ def isolated_page(request):
     return request.getfixturevalue("base_page")
 
 
+def install_cancel_flow(page):
+    page.evaluate("""() => {
+      window.cancelRequests=0;
+      window.cancelConfirmations=0;
+      window.requestCancelAll=()=>{
+        window.cancelRequests++;
+        document.body.insertAdjacentHTML('beforeend', `<div role="dialog" id="cancel-confirmation">
+          <p>确定取消全部订单？</p>
+          <button onclick="window.cancelConfirmations++;this.closest('[role=dialog]').remove()">确认</button>
+        </div>`);
+      };
+    }""")
+
+
 def install_order(page, *, price="0.9 USDT", quantity="1 DGAI", direction="买入"):
     headers = ["代币", "类型", "方向", "委托价格", "数量", "已成交", "成交额", "操作"]
     fields = [
@@ -23,6 +37,7 @@ def install_order(page, *, price="0.9 USDT", quantity="1 DGAI", direction="买�
         '<button onclick="window.cancels++">撤单</button>',
     ]
     html = (
+        '<button onclick="window.requestCancelAll()">全部取消</button>'
         "<table><thead><tr>"
         + "".join(f"<th>{v}</th>" for v in headers)
         + "</tr></thead><tbody><tr>"
@@ -30,6 +45,7 @@ def install_order(page, *, price="0.9 USDT", quantity="1 DGAI", direction="买�
         + "</tr></tbody></table>"
     )
     page.locator("#current").evaluate("(e,html)=>e.innerHTML=html", html)
+    install_cancel_flow(page)
     page.evaluate("window.cancels=0")
 
 
@@ -63,6 +79,7 @@ def install_current_layout(page, *, status="新订单", duplicate_blank_headers=
         '<button onclick="window.cancels++"><svg></svg></button>',
     ]
     html = (
+        '<button onclick="window.requestCancelAll()">全部取消</button>'
         "<table><thead><tr>"
         + "".join(f"<th>{value}</th>" for value in headers)
         + "</tr></thead><tbody><tr>"
@@ -70,6 +87,7 @@ def install_current_layout(page, *, status="新订单", duplicate_blank_headers=
         + "</tr></tbody></table>"
     )
     page.locator("#current").evaluate("(element,html)=>element.innerHTML=html", html)
+    install_cancel_flow(page)
     page.evaluate("window.cancels=0")
 
 
@@ -82,7 +100,9 @@ def test_partial_progress_and_single_scoped_cancel(page):
         "e=>e.insertAdjacentHTML('beforeend','<button onclick=\"window.wrong=true\">撤单</button>')"
     )
     assert cancel_once(page, PAYLOAD)["cancel_clicked"]
-    assert page.evaluate("window.cancels") == 1
+    assert page.evaluate("window.cancelRequests") == 1
+    assert page.evaluate("window.cancelConfirmations") == 1
+    assert page.evaluate("window.cancels") == 0
     assert page.evaluate("window.wrong||false") is False
 
 
@@ -90,7 +110,9 @@ def test_actual_current_layout_reports_zero_progress_for_new_order(page):
     install_current_layout(page)
     assert inspect_progress(page, PAYLOAD)["current_order"]["requested_quantity"] == "1"
     assert cancel_once(page, PAYLOAD)["cancel_clicked"]
-    assert page.evaluate("window.cancels") == 1
+    assert page.evaluate("window.cancelRequests") == 1
+    assert page.evaluate("window.cancelConfirmations") == 1
+    assert page.evaluate("window.cancels") == 0
 
 
 def test_split_header_and_body_tables_use_the_platform_header(page):
@@ -141,12 +163,17 @@ def test_named_header_cell_count_error_reports_observed_layout(page):
         inspect_progress(page, PAYLOAD)
 
 
-@pytest.mark.parametrize("changes", [{"price": "0.8 USDT"}, {"direction": "卖出"}])
-def test_cancel_rejects_wrong_order_without_click(page, changes):
-    install_order(page, **changes)
+def test_current_order_keeps_platform_price_without_requiring_exact_match(page):
+    install_order(page, price="0.899999 USDT")
+    result = inspect_progress(page, PAYLOAD)
+    assert result["current_order"]["price"] == "0.899999"
+
+
+def test_cancel_rejects_wrong_direction_without_click(page):
+    install_order(page, direction="卖出")
     with pytest.raises(ValueError):
         cancel_once(page, PAYLOAD)
-    assert page.evaluate("window.cancels") == 0
+    assert page.evaluate("window.cancelRequests") == 0
 
 
 def test_balance_read_switches_side_but_never_submits(page):
@@ -168,6 +195,26 @@ def test_ambiguous_balance_or_modal_stops(page):
     with pytest.raises(ValueError, match="弹窗"):
         cancel_once(page, PAYLOAD)
     assert page.evaluate("window.submits") == 0
+
+
+def test_cancel_all_requires_exactly_one_ordinary_confirmation(page):
+    install_order(page)
+    page.evaluate("""() => { window.requestCancelAll=()=>{
+      window.cancelRequests++;
+      document.body.insertAdjacentHTML('beforeend','<div role="dialog"><p>安全验证</p><button>确认</button></div>');
+    }; }""")
+    with pytest.raises(ValueError, match="验证"):
+        cancel_once(page, PAYLOAD)
+    assert page.evaluate("window.cancelRequests") == 1
+    assert page.evaluate("window.cancelConfirmations") == 0
+
+
+def test_first_post_cancel_inspection_refreshes_page(page):
+    loads = []
+    page.on("load", lambda: loads.append(page.url))
+    result = inspect_progress(page, {**PAYLOAD, "refresh_before_check": True})
+    assert result["page_refreshed"]
+    assert len(loads) == 1
 
 
 def test_explicit_frozen_and_total_balances_include_locked_assets(page):

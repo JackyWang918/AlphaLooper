@@ -65,12 +65,18 @@ class Browser:
                 "pending": self.pending is not None,
                 "balances": self.wallet(),
                 "current_order": self.pending,
+                "page_refreshed": bool(payload.get("refresh_before_check")),
             }
         if action == "live_cancel":
             if self.cancel_fails:
                 raise TimeoutError("撤单超时")
             self.pending = None
-            return {"ok": True, "cancel_clicked": True}
+            return {
+                "ok": True,
+                "cancel_clicked": True,
+                "cancel_all": True,
+                "confirmation_clicked": True,
+            }
         raise AssertionError(action)
 
     def partial(self, quantity):
@@ -359,6 +365,24 @@ def test_pause_never_cancels_finish_cancels_buy(rig):
     reconciled(r, 15)
     tick(r)
     assert r.auto.get() is None
+
+
+def test_force_restart_releases_local_task_but_never_touches_platform_order(rig):
+    r = rig
+    tick(r)
+    task = r.auto.get()
+    order_id = task["pending"]["request_id"]
+    calls = list(r.browser.calls)
+
+    result = r.auto.control(r.body.request_id, "force_restart")
+
+    assert result["active"] is False
+    assert result["phase"] == "restarted"
+    assert r.auto.get() is None
+    assert r.live.get() is None
+    assert r.live.get(order_id)["state"] == "abandoned_for_restart"
+    assert r.browser.calls == calls
+    assert r.browser.pending is not None
 
 
 def test_quote_expiry_stops_before_submission(rig):

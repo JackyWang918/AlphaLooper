@@ -203,7 +203,31 @@ class Automatic:
             t = self.get()
             if not t or t["id"] != str(id):
                 raise ValueError("当前任务已变化，请刷新。")
-            if action == "retire_legacy":
+            if action == "force_restart":
+                old_order = self.live.get()
+                if old_order:
+                    if old_order.get("task_id") != t["id"]:
+                        raise ValueError("存在不属于当前任务的实盘委托，不能强制重开。")
+                    old_order.update(
+                        active=False,
+                        state="abandoned_for_restart",
+                        message=(
+                            "用户强制重开自动任务；本地停止跟踪此委托。"
+                            "平台订单未自动撤销，新任务启动前仍会检查当前委托。"
+                        ),
+                    )
+                    self.live.save(old_order)
+                self.running = False
+                t.update(
+                    active=False,
+                    pending=None,
+                    phase="restarted",
+                    message=(
+                        "旧任务已强制结束，参数已解锁。"
+                        "请先确认平台没有旧挂单，再配置并启动新任务。"
+                    ),
+                )
+            elif action == "retire_legacy":
                 if t.get("accounting_version") == 2:
                     raise ValueError("新口径任务请使用停止买入、卖完结束。")
                 self.live.call("order_readiness", self.probe(t["request"]))
@@ -552,9 +576,8 @@ class Automatic:
         if record:
             if record.get("cancel_requested_at"):
                 self.save(t)
-                if (
-                    record.get("cancel_error")
-                    or now - record["cancel_requested_at"] >= 60
+                if record.get("cancel_error") or now >= record.get(
+                    "cancel_timeout_at", record["cancel_requested_at"] + 120
                 ):
                     raise ValueError("撤单尚未确认，不重复撤单或重挂；请核对平台。")
                 return
@@ -601,7 +624,9 @@ class Automatic:
                     raise ValueError(canceled["cancel_error"])
                 t["message"] = reason
                 self.save(
-                    t, "execution", "已请求一次撤单，等待当前委托消失及余额稳定。"
+                    t,
+                    "execution",
+                    "已确认取消全部订单；延迟后刷新页面，再等待当前委托消失及余额稳定。",
                 )
             return
         # Once all locked funds are released, use a fresh wallet for the next action.
@@ -653,7 +678,7 @@ class Automatic:
             quantity = D(wallet["base_available"])
             quote_amount = None
             side = "sell"
-            reason = "采用平台卖出 100%，包含已有零头。"
+            reason = "只填写卖价并将平台卖出数量滑杆拉满，包含已有零头。"
         if quantity <= 0 or quantity < m.min_qty or quantity * price < m.min_notional:
             raise ValueError("本次金额或数量低于平台最小委托，停止并检查策略。")
         validate_snapshot(m, int(self.clock() * 1000))

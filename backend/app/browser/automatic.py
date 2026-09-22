@@ -1,14 +1,16 @@
 """Strict current-order and available-balance adapter for automatic tasks.
 
-Unknown layouts fail closed. Cancellation is a single row-scoped click; its
-return value never establishes final fills or permits a replacement order.
+Unknown layouts fail closed. Cancellation uses the page's cancel-all action and
+confirms one ordinary cancel-all dialog. Its return value never establishes
+final fills or permits a replacement order.
 """
 
 import re
+import time
 from decimal import Decimal
 
 from app.browser.alpha import TABS, verify_identity
-from app.browser.confirmation import MODALS, NUMBER
+from app.browser.confirmation import MODALS, NUMBER, confirmation_dialogs
 from app.browser.live import current_order, select_panel
 from app.browser.schemas import FillForm
 
@@ -137,10 +139,9 @@ def current_detail(page, payload):
         unique_field(headers, values, ("代币", "币种")) != command.expected_symbol
         or unique_field(headers, values, ("方向",)) != TABS[command.side]
         or unique_field(headers, values, ("类型", "订单类型")) != "限价"
-        or price != Decimal(command.price)
         or quantity <= 0
     ):
-        raise ValueError("当前委托币种、方向或限价与系统记录不符。")
+        raise ValueError("当前委托币种、方向或订单类型与系统记录不符。")
     # Platform quantities are authoritative (quote buys and percentage sells).
     # Progress columns are optional; balances drive the ledger.
     detail = {
@@ -166,10 +167,18 @@ def current_detail(page, payload):
     return row, detail
 
 
-def cancel_button(row):
-    button = row.get_by_role("button", name=re.compile(r"^(撤单|撤销|取消)$"))
+def cancel_all_button(page, row):
+    panel = select_panel(page, "当前委托")
+    button = panel.get_by_role(
+        "button", name=re.compile(r"^(全部取消|取消全部|撤销全部)$")
+    ).filter(visible=True)
     if button.count() == 1:
         return button
+    if button.count() > 1:
+        raise ValueError("当前委托区域有多个“全部取消”按钮，未点击。")
+
+    # Some observed layouts expose the sole cancel-all control as an icon in
+    # the only order row. The task invariant still requires exactly one order.
     headers, _, cells = row_columns(row)
     action = [
         index for index, header in enumerate(headers) if header in {"操作", "全部取消"}
@@ -180,10 +189,39 @@ def cancel_button(row):
         )
         if candidate.count() == 1:
             return candidate
-    raise ValueError("未找到当前委托行内唯一撤单按钮，未点击。")
+    raise ValueError("未找到当前委托区域唯一的“全部取消”控件，未点击。")
+
+
+def confirm_cancel_all(page):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dialogs = confirmation_dialogs(page)
+        if dialogs.count() > 1:
+            raise ValueError("出现多个可见弹窗，未点击撤单确认。")
+        if dialogs.count() == 1:
+            text = dialogs.inner_text()
+            if re.search(r"验证码|人机验证|安全验证|风险测评|身份验证|验证器", text):
+                raise ValueError("撤单触发平台验证，请手动处理；未点击确认。")
+            if re.search(r"确定取消全部订单\s*[?？]?", text):
+                button = dialogs.get_by_role("button", name="确认", exact=True).filter(
+                    visible=True
+                )
+                if button.count() != 1 or not button.is_enabled():
+                    raise ValueError(
+                        "取消全部订单弹窗没有唯一可用的“确认”按钮，未点击。"
+                    )
+                button.click(trial=True, timeout=3000)
+                button.click(timeout=3000)
+                return {"cancel_all_confirmed": True}
+        page.wait_for_timeout(100)
+    raise ValueError("取消全部订单的确认弹窗未出现；撤单结果未知，未继续点击。")
 
 
 def inspect_progress(page, payload):
+    refreshed = False
+    if payload.get("refresh_before_check"):
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        refreshed = True
     _, detail = current_detail(page, payload)
     try:
         balances = wallet_snapshot(
@@ -191,15 +229,24 @@ def inspect_progress(page, payload):
         )
     except ValueError as exc:
         if "冻结余额尚未释放" in str(exc):
-            return {"pending": detail is not None, "settling": True}
+            return {
+                "pending": detail is not None,
+                "settling": True,
+                "page_refreshed": refreshed,
+            }
         raise
     _, after = current_detail(page, payload)
     if detail != after:
-        return {"pending": after is not None, "settling": True}
+        return {
+            "pending": after is not None,
+            "settling": True,
+            "page_refreshed": refreshed,
+        }
     return {
         "pending": detail is not None,
         "current_order": detail,
         "balances": balances,
+        "page_refreshed": refreshed,
     }
 
 
@@ -207,15 +254,21 @@ def cancel_once(page, payload):
     row, progress = current_detail(page, payload)
     if row is None:
         return {"cancel_clicked": False, "already_absent": True}
-    button = cancel_button(row)
+    button = cancel_all_button(page, row)
     button.click(trial=True, timeout=3000)
     row, _ = current_detail(page, payload)
     if row is None:
         return {"cancel_clicked": False, "already_absent": True}
-    button = cancel_button(row)
+    button = cancel_all_button(page, row)
     button.click(timeout=3000)
-    no_dialog(page)
-    return {"cancel_clicked": True, "progress": progress}
+    confirmation = confirm_cancel_all(page)
+    return {
+        "cancel_clicked": True,
+        "cancel_all": True,
+        "confirmation_clicked": True,
+        "progress": progress,
+        **confirmation,
+    }
 
 
 def side_balance(page, command, side):

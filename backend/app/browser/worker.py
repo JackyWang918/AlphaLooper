@@ -8,6 +8,7 @@ from playwright.sync_api import Error, sync_playwright
 from app.browser.alpha import fill_form, inspect_form
 from app.browser.automatic import available_balance, cancel_once, inspect_progress
 from app.browser.confirmation import confirmation_preview
+from app.browser.diagnostics import run_test
 from app.browser.live import (
     inspect_order,
     inspect_unsubmitted,
@@ -47,6 +48,7 @@ def run_worker(pipe: Connection, profile: str):
     with sync_playwright() as playwright:
         context = None
         page = None
+        test_cancellations = {}
         try:
             while True:
                 try:
@@ -86,10 +88,35 @@ def run_worker(pipe: Connection, profile: str):
                             command["url"], wait_until="domcontentloaded", timeout=30000
                         )
                         page.bring_to_front()
+                    elif action == "page_test":
+                        if context is None or not context.browser.is_connected():
+                            raise ValueError("请先打开交易页面。")
+                        payload = command["payload"]
+                        page = select_target_page(context, page, payload["url"])
+                        cancel_id = (
+                            payload["request_id"]
+                            if payload["action"] == "cancel_all"
+                            else None
+                        )
+                        if cancel_id and cancel_id in test_cancellations:
+                            pipe.send(test_cancellations[cancel_id])
+                            continue
+                        if cancel_id:
+                            test_cancellations[cancel_id] = {
+                                "ok": False,
+                                "message": "此撤单测试已执行或结果待核对，请读取当前委托；不会重复点击。",
+                            }
+                        result = {"ok": True, **run_test(page, payload)}
+                        if cancel_id:
+                            test_cancellations[cancel_id] = result
+                        pipe.send(result)
+                        continue
                     elif action == "fill":
                         if context is None or not context.browser.is_connected():
                             raise ValueError("请先打开交易页面。")
-                        page = select_target_page(context, page, command["payload"]["url"])
+                        page = select_target_page(
+                            context, page, command["payload"]["url"]
+                        )
                         filled = fill_form(page, command["payload"])
                     elif action in {
                         "live_prepare",
@@ -104,7 +131,9 @@ def run_worker(pipe: Connection, profile: str):
                     }:
                         if context is None or not context.browser.is_connected():
                             raise ValueError("请先打开交易页面。")
-                        page = select_target_page(context, page, command["payload"]["url"])
+                        page = select_target_page(
+                            context, page, command["payload"]["url"]
+                        )
                         operation = {
                             "live_prepare": preflight,
                             "live_submit": submit_once,

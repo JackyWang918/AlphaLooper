@@ -72,6 +72,16 @@ async function resolveUnsubmitted(){
     await refresh()
   }catch(e){error.value=e instanceof Error?e.message:'核对未提交状态失败'}finally{busy.value=false}
 }
+async function forceRestart(){
+  if(!current.value||busy.value)return
+  if(!window.confirm('确定强制结束当前本地任务吗？平台挂单不会自动撤销；启动新任务前仍需确认平台没有旧挂单。'))return
+  busy.value=true;error.value='';notice.value=''
+  try{
+    const task=await api('/control',{task_id:current.value.id,action:'force_restart'})
+    notice.value=task.message
+    await refresh()
+  }catch(e){error.value=e instanceof Error?e.message:'强制重新开始失败'}finally{busy.value=false}
+}
 onMounted(()=>{refresh();timer=setInterval(refresh,5000)})
 onUnmounted(()=>clearInterval(timer))
 </script>
@@ -123,7 +133,7 @@ onUnmounted(()=>clearInterval(timer))
     <p v-if="current.balances">最近已核对可用 USDT {{current.balances.quote_available}} · 上轮保留零头 {{current.dust??'0'}}。</p>
     <p v-if="current.risk">含冻结资产的 K 线估值：{{current.risk.equity??'待核对'}} U；预计损耗 {{current.risk.loss??'待核对'}} U / {{current.risk.loss_pct??'待核对'}}%。{{current.risk.reason}}</p>
     <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（观察到余额增加后，使用对应买单提交时间；重挂不重置）。</p>
-    <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 使用平台 100% 卖出（包含已有零头）</template></p>
+    <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 将平台卖出数量滑杆拉满（包含已有零头）</template></p>
     <div v-if="current.pending_order?.state==='submission_unknown'" class="notice error">
       <p>这笔订单的提交结果尚未确认，程序正在等待你核对。首次错误：{{current.pending_order.submission_error||current.pending_order.message}}</p>
       <p>请关闭仍然显示的订单确认弹窗，并确认币安“当前委托”中没有这笔订单。程序还会核对当前无挂单且余额与提交前一致。</p>
@@ -138,8 +148,10 @@ onUnmounted(()=>clearInterval(timer))
       <button class="secondary" :disabled="busy||!running" @click="control('pause')">暂停自动操作</button>
       <button :disabled="busy||running" @click="control('resume')">核对后恢复任务</button>
       <button class="secondary" :disabled="busy" @click="control('finish')">停止买入，卖完结束</button>
+      <button class="secondary" :disabled="busy" @click="forceRestart">强制重新开始任务</button>
     </div>
-    <p class="muted">暂停不撤挂单，只读巡检继续。后端重启后保持暂停，需点击恢复。卖出使用平台 100%，包含原有零头；无挂单且剩余价值不超过 2 U 即结束本轮。现金盈亏不计剩余代币估值。挂单期间若缺少冻结余额及剩余委托量，会先撤单释放资金再核算；页面异常或撤单结果未知时暂停。</p>
+    <p class="muted">强制重新开始只结束本地任务并解锁上方参数，不会自动撤销平台挂单。新任务启动前仍会检查当前委托，有旧挂单时不会提交新单。</p>
+    <p class="muted">暂停不撤挂单，只读巡检继续。后端重启后保持暂停，需点击恢复。自动撤单使用“全部取消”并确认一次普通撤单弹窗；确认后延迟，首次核对会刷新交易页，再等待委托消失和余额稳定。卖出只填写价格并将平台数量滑杆拉到最右端，平台生成实际卖出量，包含原有零头；无挂单且剩余价值不超过 2 U 即结束本轮。现金盈亏不计剩余代币估值。页面验证、撤单结果未知或余额未更新时暂停或继续等待，不重复点击撤单。</p>
   </div>
   <details v-if="recent.length"><summary>最近任务</summary><ul><li v-for="task in recent" :key="task.id">{{task.id.slice(0,8)}} · {{task.request.expected_symbol}} · {{task.message}} · 买入 {{task.buy_total}} U · 盈亏 {{task.realized_pnl}} U</li></ul></details>
   <DecisionLog :tasks="recent" :current-id="current?.id" />

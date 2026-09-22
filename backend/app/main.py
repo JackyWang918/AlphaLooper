@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from app import decision_log
 from app.automatic import Automatic, StartTask
+from app.browser.diagnostics import PageTest
 from app.browser.manager import BrowserBusy, BrowserManager
 from app.browser.schemas import FillForm, OpenPage, token_identity
 from app.database import make_engine
@@ -57,6 +58,22 @@ async def local_control(request: Request, call_next):
 def browser_action(action: str, url: str = "", payload: dict | None = None):
     try:
         with app.state.live.lock:
+            if action == "page_test":
+                automatic = app.state.live.automatic
+                if automatic and automatic.running:
+                    raise HTTPException(
+                        status_code=409, detail="请先暂停自动任务，再进行页面测试。"
+                    )
+                task = automatic.get() if automatic else None
+                order = app.state.live.get()
+                for owner in (task, order):
+                    if owner and token_identity(payload["url"]) != token_identity(
+                        owner["request"]["url"]
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="存在未结束任务或订单，只能测试其原币种页面。",
+                        )
             if action in {"open", "fill", "order_readiness"}:
                 order = app.state.live.get()
                 automatic = app.state.live.automatic
@@ -122,6 +139,11 @@ def health():
 @app.post("/api/browser/fill")
 def browser_fill(body: FillForm):
     return browser_action("fill", payload=body.model_dump())
+
+
+@app.post("/api/browser/page-test")
+def browser_page_test(body: PageTest):
+    return browser_action("page_test", payload=body.model_dump(mode="json"))
 
 
 @app.post("/api/browser/order-readiness")
@@ -199,7 +221,9 @@ def automatic_start(body: StartTask):
 
 class TaskControl(BaseModel):
     task_id: UUID
-    action: Literal["pause", "resume", "finish", "retire_legacy"]
+    action: Literal[
+        "pause", "resume", "finish", "retire_legacy", "force_restart"
+    ]
 
 
 @app.post("/api/automatic/control")
