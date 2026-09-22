@@ -14,7 +14,6 @@ URL = (
 )
 
 
-
 def event(kind="tick", advance_seconds=0, **kwargs):
     return Event(
         id=str(uuid4()),
@@ -63,10 +62,21 @@ def test_bad_candles_and_stale_book(market, config):
         estimate(market, config)
 
 
-def test_crossed_auction_book_blocks_new_buy(market, config):
+@pytest.mark.parametrize("bid", ["10.1", "10.2"])
+def test_crossed_or_locked_book_allows_model_buy_below_ask(market, config, bid):
+    market.bids = [(D(bid), D(100))]
+    result = estimate(market, config)
+    assert result["buy_allowed"] and result["buy_blockers"] == []
+    assert not any(
+        "交叉" in warning or "锁定" in warning for warning in result["warnings"]
+    )
+    assert advance(State(), event(), market, config).order.side == "buy"
+
+
+def test_model_buy_ignores_low_ask(market, config):
     market.asks = [(D("9.9"), D(100))]
-    assert not estimate(market, config)["buy_allowed"]
-    assert advance(State(), event(), market, config).order is None
+    assert estimate(market, config)["buy_allowed"]
+    assert advance(State(), event(), market, config).order.side == "buy"
 
 
 def test_timeout_cancel_ack_and_late_partial_fill(market, config):
@@ -95,31 +105,31 @@ def test_empty_buy_reprices_after_confirm(market, config):
 
 def test_minute_only_stop_and_sticky_exit(market, config):
     s = held(market)
-    market.bids = [(D("9.7") - D("0.01") * i, D(100)) for i in range(6)]
+    market.candles[-1].close = D("9.7")
     s = advance(s, event(advance_seconds=59), market, config)
     assert not s.exiting
     s = advance(s, event(advance_seconds=1), market, config)
     assert s.exiting and s.order.cancel_requested
     s = advance(s, event("cancel_confirm"), market, config)
-    assert s.order.price == D("9.65")
-    market.bids = [(D("10.2") - D("0.01") * i, D(100)) for i in range(6)]
+    assert s.order.price == D("9.7")
+    market.candles[-1].close = D("10.2")
     s = advance(s, event(advance_seconds=15), market, config)
     assert s.exiting and s.order.cancel_requested
     s = advance(s, event("cancel_confirm"), market, config)
-    assert s.order.price == D("10.15")
+    assert s.order.price == D("10.2")
 
 
-def test_break_even_uses_ask_and_includes_fees(market, config):
+def test_normal_sell_uses_model_and_valuation_includes_fees(market, config):
     s = held(market)
     s.cost = D(49)
     s.order = None
     result = advance(s, event(), market, config)
-    assert result.order.price == D("10.1")
+    assert result.order.price == D("10.05")
     s.cost = D(50)
-    assert exposure(s, market, config)["loss"] == D("0.050")
+    assert exposure(s, market, config)["loss"] == D("0.5495")
     s.proceeds = D(20)
     s.inventory = D(3)
-    assert exposure(s, market, config)["loss"] == D("0.030")
+    assert exposure(s, market, config)["loss"] == D("0.3297")
 
 
 def test_budget_with_unrealized_loss_cancels_and_exits(market, config):
@@ -133,13 +143,60 @@ def test_budget_with_unrealized_loss_cancels_and_exits(market, config):
     assert result.budget_stopped and result.order is None
 
 
-def test_shallow_book_is_unknown_not_zero(market, config):
+def test_empty_book_does_not_affect_valuation(market, config):
     s = held(market)
-    market.bids = [(D("9.9"), D("0.1"))]
-    assert exposure(s, market, config)["loss"] is None
-    s = advance(s, event(advance_seconds=60), market, config)
-    s = advance(s, event("cancel_confirm"), market, config)
-    assert s.exiting and s.order.price == D("9.9")
+    expected = exposure(s, market, config)
+    market.bids = market.asks = []
+    assert exposure(s, market, config) == expected
+    assert expected["reference_price"] == D("9.9")
+    assert expected["loss"] == D("0.5495")
+    assert advance(State(), event(), market, config).order.side == "buy"
+
+
+def test_market_client_never_requests_depth(market, monkeypatch):
+    from app import market as source
+
+    client = source.MarketClient()
+    client.metadata = ([], {})
+    client.metadata_time = time.monotonic()
+    pair = {
+        "symbol": market.symbol,
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"},
+            {"filterType": "MIN_NOTIONAL", "minNotional": "0.1"},
+        ],
+    }
+    monkeypatch.setattr(
+        source,
+        "resolve_pair",
+        lambda *args: ({"symbol": market.token}, pair, market.chain, market.address),
+    )
+    calls = []
+
+    def fetch(path, params):
+        calls.append(path.rsplit("/", 1)[-1])
+        if path.endswith("klines"):
+            return [
+                [
+                    r.time,
+                    str(r.open),
+                    str(r.high),
+                    str(r.low),
+                    str(r.close),
+                    str(r.volume),
+                    r.close_time,
+                    str(r.quote_volume),
+                ]
+                for r in market.candles
+            ]
+        assert path.endswith("ticker"), "Unexpected market endpoint"
+        return {"symbol": market.symbol}
+
+    monkeypatch.setattr(source, "public_get", fetch)
+    result = client.snapshot(URL, "USDT", 3)
+    assert sorted(calls) == ["klines", "ticker"]
+    assert result.bids == result.asks == []
 
 
 def test_duplicate_and_invalid_fills(market, config):
@@ -193,7 +250,7 @@ def test_pair_mapping_uses_chain_and_contract():
 
 
 def test_api_rejects_stale_snapshot_without_touching_browser(market, config):
-    market.book_time = 1
+    market.fetched_at = 1
     with TestClient(app) as client:
         result = client.post(
             "/api/research/simulate",

@@ -85,7 +85,7 @@ onUnmounted(()=>clearInterval(timer))
       <label>买入波动偏移系数<input v-model="buyOffset" inputmode="decimal" /></label>
       <label>卖出波动偏移系数<input v-model="sellOffset" inputmode="decimal" /></label>
       <label>等待买入时的估价间隔（秒）<input v-model.number="buyCheckSeconds" type="number" min="5" max="300" step="5" /></label>
-    </div><p class="muted">默认 15 根 K 线、偏移各 0.5。主动退出参考买盘第 6 档，不足六档取最深可见档，每 15 秒尝试撤单核对后重估。参数效果尚未验证。</p></details>
+    </div><p class="muted">默认 15 根 K 线、偏移各 0.5。主动退出采用最新已收盘一分钟 K 线收盘价，每 15 秒尝试撤单核对后重估。参数效果尚未验证。</p></details>
     <p class="muted">估价间隔可设为 5–300 秒（5 秒的倍数），60 表示约一分钟；仅用于空仓等待买入，不改变每分钟订单巡检、损耗检查或退出规则。网络和页面处理会增加实际间隔。启动后参数固定。</p>
     <button :disabled="!!blockedReason" :title="blockedReason" @click="start">{{busy?'正在处理…':'启动自动实盘买卖'}}</button>
   </fieldset>
@@ -97,7 +97,7 @@ onUnmounted(()=>clearInterval(timer))
     <p class="notice" role="status">{{current.request.expected_symbol}} / {{current.request.expected_quote}}：{{current.message}}</p>
     <p>本任务等待买入估价间隔：{{current.request.config.buy_check_seconds??5}} 秒。<span v-if="current.market_at">最近行情：{{new Date(current.market_at).toLocaleTimeString()}}。</span></p>
     <div v-if="current.estimate&&!current.pending&&current.inventory==='0'">
-      <p>上次买入评估：建议买价 {{current.estimate.buy}}<span v-if="current.estimate.best_bid"> · 买一 {{current.estimate.best_bid}} · 卖一 {{current.estimate.best_ask}}</span></p>
+      <p>上次买入评估：建议买价 {{current.estimate.buy}}</p>
       <ul><li v-for="reason in (current.estimate.buy_blockers??current.estimate.warnings?.filter(w=>w.includes('暂停模拟新买入')||w.includes('历史买价已触及卖一'))??[])" :key="reason">{{reason}}</li></ul>
     </div>
     <p v-if="!running" class="muted">当前不会自动提交或撤单。处理提示后点击“核对后恢复任务”；后端重启也需要手动恢复。</p>

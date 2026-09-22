@@ -146,19 +146,8 @@ def resolve_pair(tokens, exchange, url, quote):
 
 
 def validate_snapshot(m: Snapshot, now_ms: int, max_age=15000):
-    if (
-        not -5000 <= now_ms - m.book_time <= max_age
-        or not -5000 <= now_ms - m.fetched_at <= max_age
-    ):
-        raise MarketError("盘口已过期或时间异常，请刷新行情后试算。")
-    for rows, reverse in [(m.bids, True), (m.asks, False)]:
-        if not rows or any(
-            p <= 0 or q <= 0 or not p.is_finite() or not q.is_finite() for p, q in rows
-        ):
-            raise MarketError("盘口为空或存在非法档位。")
-        prices = [p for p, _ in rows]
-        if prices != sorted(set(prices), reverse=reverse):
-            raise MarketError("盘口顺序或档位重复异常。")
+    if not -5000 <= now_ms - m.fetched_at <= max_age:
+        raise MarketError("行情已过期或时间异常，请刷新行情后试算。")
 
 
 class MarketClient:
@@ -190,15 +179,14 @@ class MarketClient:
                             "limit": max(60, window + 2),
                         },
                     ),
-                    ("fullDepth", {"symbol": symbol, "limit": 100}),
                     ("ticker", {"symbol": symbol}),
                 ]
             ]
-            rows, book, ticker = [f.result() for f in futures]
+            rows, ticker = [f.result() for f in futures]
         now = int(time.time() * 1000)
         try:
             filters = {f["filterType"]: f for f in pair["filters"]}
-            if book.get("symbol") != symbol or ticker.get("symbol") != symbol:
+            if ticker.get("symbol") != symbol:
                 raise MarketError("行情返回的交易对与请求不符。")
             pf, lot = filters["PRICE_FILTER"], filters["LOT_SIZE"]
             nf = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
@@ -222,15 +210,15 @@ class MarketClient:
                 address=address,
                 quote=quote,
                 fetched_at=now,
-                book_time=int(book.get("E", book.get("T", 0))),
+                book_time=now,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 tick=pf["tickSize"],
                 step=lot["stepSize"],
                 min_qty=lot["minQty"],
                 min_notional=nf["minNotional"],
                 candles=candles,
-                bids=book["bids"],
-                asks=book["asks"],
+                bids=[],
+                asks=[],
                 ticker=ticker,
             )
             validate_snapshot(result, now)

@@ -6,9 +6,9 @@ import LiveOrder from './components/LiveOrder.vue'
 import AutomaticTrading from './components/AutomaticTrading.vue'
 
 const tabs = [
-  { id: 'browser', label: '浏览器连接', hint: '01' },
+  { id: 'browser', label: '浏览器连接', hint: '01 · 02' },
   { id: 'automatic', label: '自动实盘交易', hint: '05' },
-  { id: 'tools', label: '其他操作', hint: '02 · 03 · 04' },
+  { id: 'tools', label: '其他操作', hint: '03 · 04' },
 ] as const
 type TabId = typeof tabs[number]['id']
 const savedTab = localStorage.getItem('alphalooper.active-tab')
@@ -102,17 +102,17 @@ onMounted(() => execute('status'))
       </div>
       <div v-if="browser.connected" class="page-info"><strong>{{ browser.title || '空白页面' }}</strong><p>{{ browser.url }}</p><p v-if="browser.symbol">已识别：{{ browser.symbol }} / {{ browser.quote }}</p><p>{{ browser.reason }}</p></div>
     </section>
-    </div>
-    <div v-show="activeTab==='automatic'" id="panel-automatic" role="tabpanel" aria-labelledby="tab-automatic">
-      <AutomaticTrading :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
-    </div>
-    <div v-show="activeTab==='tools'" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools">
     <section>
       <h2>02 / 打开交易页面</h2>
       <label for="trade-url">币安 Alpha 交易链接</label>
       <input id="trade-url" v-model="tradeUrl" type="url" placeholder="粘贴你的币安 Alpha 网页交易链接" :disabled="pending" />
       <button :disabled="pending || !browser.connected || !tradeUrl.trim()" @click="execute('open')">打开页面</button>
     </section>
+    </div>
+    <div v-show="activeTab==='automatic'" id="panel-automatic" role="tabpanel" aria-labelledby="tab-automatic">
+      <AutomaticTrading :url="tradeUrl" :connected="browser.connected" :symbol="browser.symbol" :quote="browser.quote" :fill-supported="browser.fill_supported" :browser-busy="pending" :browser-reason="browser.reason" @refresh-browser="execute('status')" />
+    </div>
+    <div v-show="activeTab==='tools'" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools">
     <section>
       <h2>03 / 仅填表</h2>
       <p class="muted">填写前核对链、合约地址、币种和计价币。此操作只填写，不点击下单按钮。弹窗或验证请在 Chrome 中手动处理。</p>

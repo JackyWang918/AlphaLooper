@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
@@ -5,6 +7,7 @@ from pydantic import ValidationError
 
 from app.browser.alpha import check_step, fill_form
 from app.browser.schemas import FillForm, token_identity
+from app.browser.worker import select_target_page
 
 URL = (
     "https://www.binance.com/zh-CN/alpha/bsc/0x10d4183389e99233db3cc981c43443ebd28ebd5e"
@@ -76,6 +79,38 @@ def test_fill_both_directions_without_submission(page, side):
     assert result["price"] == "0.9"
     assert result["quantity"] == "1"
     assert result["submitted"] is False
+    assert page.evaluate("window.submits") == 0
+
+
+def test_fill_accepts_equivalent_value_with_trimmed_trailing_zeroes(page):
+    page.locator("#limitAmount").evaluate(
+        "e=>e.addEventListener('blur',()=>e.value=String(Number(e.value)))"
+    )
+    result = fill_form(page, {**PAYLOAD, "quantity": "47.82000000"})
+    assert result["quantity"] == "47.82"
+    assert page.evaluate("window.submits") == 0
+
+
+def test_worker_adopts_unique_matching_trade_tab():
+    class Candidate:
+        def __init__(self, url):
+            self.url = url
+
+        def is_closed(self):
+            return False
+
+    target = Candidate(URL)
+    other = Candidate("about:blank")
+    context = SimpleNamespace(pages=[other, target])
+    assert select_target_page(context, other, URL) is target
+
+
+def test_fill_reports_actual_normalized_mismatch(page):
+    page.locator("#limitAmount").evaluate(
+        "e=>e.addEventListener('blur',()=>e.value='47.81')"
+    )
+    with pytest.raises(ValueError, match="计划数量 47.82000000、页面数量 47.81"):
+        fill_form(page, {**PAYLOAD, "quantity": "47.82000000"})
     assert page.evaluate("window.submits") == 0
 
 

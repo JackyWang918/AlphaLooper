@@ -6,8 +6,8 @@ import pytest
 from sqlalchemy import create_engine
 
 from app import account_ledger
-from app.decision_log import decisions
 from app.automatic import Automatic, StartTask, tasks
+from app.decision_log import decisions
 from app.live_orders import LiveOrders, SubmitOrder, intents
 
 
@@ -206,7 +206,7 @@ def test_target_stops_buying_exits_and_completes(rig):
     r.browser.finish()
     t = tick(r, 60)
     assert t["stop_buying"] and t["exiting"] and t["pending"]["side"] == "sell"
-    assert D(t["pending"]["price"]) == D("9.95")
+    assert D(t["pending"]["price"]) == D("9.9")
     r.browser.finish()
     tick(r, 15)
     assert r.auto.get() is None and not r.auto.running
@@ -236,7 +236,7 @@ def test_hold_timeout_keeps_first_buy_time_across_rehang(rig):
     assert t["exiting"] and r.browser.calls.count("live_cancel") == 1
     t = tick(r, 15)
     assert t["first_buy_at"] == start and t["pending_exit"]
-    assert D(t["pending"]["price"]) == D("9.95")
+    assert D(t["pending"]["price"]) == D("9.9")
 
 
 def test_minute_stop_loss_and_budget_stop_new_buys(rig):
@@ -244,7 +244,7 @@ def test_minute_stop_loss_and_budget_stop_new_buys(rig):
     tick(r)
     r.browser.finish()
     t = tick(r, 60)
-    r.market.bids = [(D("9.5"), D(100))]
+    r.market.candles[-1].close = D("9.5")
     t = r.auto.get()
     t["session_loss"] = "9"
     r.auto.save(t)
@@ -374,42 +374,40 @@ def test_no_new_buy_when_budget_reserve_exhausted(rig):
     assert "live_submit" not in r.browser.calls
 
 
-def test_depth_insufficient_enters_exit_on_minute(rig):
+def test_no_book_does_not_trigger_exit(rig):
     r = rig
     tick(r)
     r.browser.finish()
     tick(r, 60)
-    r.market.bids = [(D("10"), D("0.01"))]
+    r.market.bids = r.market.asks = []
     t = tick(r, 60)
-    assert t["exiting"] and t["risk"]["loss"] is None
+    assert not t["exiting"]
+    assert t["risk"]["basis"] == "latest_closed_1m_candle"
 
 
-def test_configured_buy_interval_and_specific_blockers(rig):
+def test_low_ask_does_not_block_model_buy(rig):
     r = rig
-    t = r.auto.get()
-    t["request"]["config"]["buy_check_seconds"] = 60
-    r.auto.save(t)
-    r.market.asks = [(D("9.9"), D(100))]
+    r.market.asks = [(D("0.8"), D(100))]
     t = tick(r)
-    assert len(t["estimate"]["buy_blockers"]) == 2
-    assert "买一" in t["message"] and "建议买价" in t["message"]
-    assert "60 秒" in t["message"]
-    sampled = t["market_at"]
-    r.market.asks = [(D("10.1"), D(100))]
-    t = tick(r, 55)
-    assert t["market_at"] == sampled and "live_submit" not in r.browser.calls
-    t = tick(r, 5)
+    assert t["estimate"]["buy_blockers"] == []
     assert t["pending"]["side"] == "buy"
+    assert r.browser.calls.count("live_submit") == 1
 
 
-def test_finish_is_not_delayed_by_buy_interval(rig):
+def test_finish_before_first_tick_does_not_submit(rig):
     r = rig
-    r.market.asks = [(D("9.9"), D(100))]
-    tick(r)
     r.auto.control(r.body.request_id, "finish")
     tick(r)
     assert r.auto.get() is None
     assert "live_submit" not in r.browser.calls
+
+
+def test_live_task_crossed_book_does_not_block_buy(rig):
+    r = rig
+    r.market.bids = [(D("10.2"), D(100))]
+    t = tick(r)
+    assert t["pending"]["side"] == "buy"
+    assert r.browser.calls.count("live_submit") == 1
 
 
 def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
@@ -456,9 +454,12 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
         assert older["items"][0]["id"] != page["items"][0]["id"]
         exported = client.get(log_url + "/export", params={"kind": "control"})
         import json
+
         lines = [json.loads(line) for line in exported.text.splitlines()]
         assert exported.status_code == 200 and lines[0]["type"] == "task"
-        assert len(lines) == 3  # task metadata, start, pause; duplicate start logs nothing
+        assert (
+            len(lines) == 3
+        )  # task metadata, start, pause; duplicate start logs nothing
         assert client.get(log_url, params={"limit": 10000}).status_code == 422
         assert client.get(f"/api/automatic/{uuid4()}/decisions").status_code == 404
         assert browser.calls == ["order_readiness", "live_balance"]

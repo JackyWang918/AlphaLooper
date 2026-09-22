@@ -69,24 +69,7 @@ def estimate(m: Snapshot, c: Config):
             raise MarketError("计算买价非正数，请调整试验参数。")
         quantity = align(c.amount / (buy * (1 + c.fee_bps / 10000)), m.step)
         warnings = ["参数为试验值，成交和损耗未获验证；手续费按手动假设计算。"]
-        crossed = m.bids[0][0] >= m.asks[0][0]
         buy_blockers = []
-        if crossed:
-            buy_blockers.append(
-                f"盘口交叉/锁定：买一 {m.bids[0][0]:f} ≥ 卖一 {m.asks[0][0]:f}。"
-            )
-            warnings.append(
-                "竞价盘口交叉/锁定；暂停模拟新买入，深度估值不是保证成交报价。"
-            )
-        if buy >= m.asks[0][0]:
-            buy_blockers.append(
-                f"建议买价 {buy:f} ≥ 卖一 {m.asks[0][0]:f}，不满足当前低于卖一挂买单的规则。"
-            )
-            warnings.append(
-                "历史买价已触及卖一，可能主动成交；模拟器暂停新买单，需调整参数。"
-            )
-        if sell <= m.bids[0][0]:
-            warnings.append("历史卖价低于或等于买一，可能主动成交。")
         if quantity < m.min_qty or buy * quantity < m.min_notional:
             raise MarketError("按步长取整后不足最低下单量/金额。")
         return {
@@ -98,9 +81,7 @@ def estimate(m: Snapshot, c: Config):
             "window": c.window,
             "last_closed": rows[-1].close_time,
             "warnings": warnings,
-            "buy_allowed": not crossed and buy < m.asks[0][0],
-            "best_bid": m.bids[0][0],
-            "best_ask": m.asks[0][0],
+            "buy_allowed": True,
             "buy_blockers": buy_blockers,
         }
 
@@ -145,20 +126,24 @@ class Event(BaseModel):
     price: Decimal = Field(default=D(0), ge=0)
 
 
+def reference_price(m: Snapshot):
+    rows = [r for r in m.candles if r.close_time < m.fetched_at]
+    if not rows:
+        raise MarketError("没有已收盘的一分钟 K 线。")
+    row = max(rows, key=lambda r: r.close_time)
+    if m.fetched_at - row.close_time > 90000:
+        raise MarketError("最近已收盘 K 线过期。")
+    return row.close
+
+
 def exposure(s: State, m: Snapshot, c: Config):
-    remaining, gross = s.inventory, D(0)
-    for price, size in m.bids:
-        taken = min(remaining, size)
-        gross += taken * price
-        remaining -= taken
-        if remaining == 0:
-            break
-    if remaining > 0:
-        return {"covered": False, "loss": None, "loss_pct": None, "exit_net": None}
+    gross = s.inventory * reference_price(m)
     net = gross * (1 - c.fee_bps / 10000)
     loss = max(D(0), s.cost - s.proceeds - net)
     return {
         "covered": True,
+        "basis": "latest_closed_1m_candle",
+        "reference_price": reference_price(m),
         "loss": loss,
         "loss_pct": loss / s.cost * 100 if s.cost else D(0),
         "exit_net": net,
@@ -237,10 +222,7 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
     # Mark-to-exit losses are checked only on a crossed natural-minute boundary.
     if s.clock // 60 > s.last_check_minute:
         s.last_check_minute = s.clock // 60
-        if s.inventory and not risk["covered"]:
-            s.exiting = True
-            s.message = "买盘深度不足，亏损未知；进入主动退出，不视为零亏损。"
-        elif s.inventory and risk["loss_pct"] >= c.stop_pct:
+        if s.inventory and risk["loss_pct"] >= c.stop_pct:
             s.exiting = True
         if s.session_loss + (risk["loss"] or D(0)) >= c.budget:
             s.budget_stopped = True
@@ -265,12 +247,10 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
         return s
     if s.inventory:
         if s.exiting:
-            price = m.bids[min(c.exit_level, len(m.bids)) - 1][0]
-            reason = "主动退出（不足目标档位时使用最深可见买档），不保证全部成交。"
-        elif risk["covered"] and risk["loss"] == 0:
-            price, reason = m.asks[0][0], "预计可回本，参考卖一。"
+            price = align(reference_price(m), m.tick)
+            reason = "主动退出，采用最新已收盘一分钟 K 线收盘价；不保证成交。"
         else:
-            price, reason = estimate(m, c)["sell"], "尚未回本，按历史模型挂卖价。"
+            price, reason = estimate(m, c)["sell"], "按 K 线模型挂卖价。"
         quantity = align(s.inventory, m.step)
         if quantity <= 0 or quantity < m.min_qty or quantity * price < m.min_notional:
             s.message = "剩余数量不足最小委托要求，需要人工处理；不算作已清仓。"
@@ -289,11 +269,6 @@ def advance(state: State, event: Event, m: Snapshot, c: Config):
             s.message = "停止新买入：损耗预算或退出预留不足。"
             return s
         e = estimate(m, c)
-        if not e["buy_allowed"]:
-            s.message = (
-                "盘口交叉/锁定或历史买价已触及卖一，暂停新买单；等待新行情或调整参数。"
-            )
-            return s
         remaining = c.target_points / c.points_per_u - s.buy_total
         # Smallest valid final order, still capped by the per-round budget.
         quantity = min(

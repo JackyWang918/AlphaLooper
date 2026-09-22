@@ -20,7 +20,7 @@ from app.browser.schemas import ReadRecords, token_identity
 from app.database import Base
 from app.live_orders import SubmitOrder
 from app.market import MarketClient, validate_snapshot
-from app.strategy import Config, State, align, estimate, exposure
+from app.strategy import Config, State, align, estimate, exposure, reference_price
 
 tasks = Table(
     "auto_tasks",
@@ -397,14 +397,12 @@ class Automatic:
             self.evidence = {
                 "config": c.model_dump(mode="json"),
                 "market_time": m.fetched_at,
-                "book_time": m.book_time,
                 "symbol": m.symbol,
                 "tick": m.tick,
                 "step": m.step,
                 "min_qty": m.min_qty,
                 "min_notional": m.min_notional,
-                "bids": m.bids,
-                "asks": m.asks[:6],
+                "valuation_basis": "latest_closed_1m_candle",
                 "candles": [
                     row.model_dump(mode="json")
                     for row in sorted(
@@ -416,7 +414,6 @@ class Automatic:
                 "risk": risk,
                 "checks": {
                     "minute_check_due": minute_due,
-                    "depth_covered": risk["covered"],
                     "loss_threshold_pct": c.stop_pct,
                     "loss_threshold_hit": risk["loss_pct"] is not None
                     and risk["loss_pct"] >= c.stop_pct,
@@ -436,9 +433,7 @@ class Automatic:
             t["market_at"] = m.fetched_at
             if minute_due:
                 t["last_minute"] = int(now) // 60
-                if held.inventory and (
-                    not risk["covered"] or risk["loss_pct"] >= c.stop_pct
-                ):
+                if held.inventory and (risk["loss_pct"] >= c.stop_pct):
                     t["exiting"] = True
                 if D(t["session_loss"]) + (risk["loss"] or D(0)) >= c.budget:
                     t.update(stop_buying=True, exiting=True)
@@ -524,21 +519,16 @@ class Automatic:
                 ),
             )
             side = "buy"
-            decision_reason = "买入条件通过：盘口未交叉，建议买价低于卖一；按预算、目标和步长计算数量。"
+            decision_reason = "采用 K 线模型买价；按预算、目标和步长计算数量。"
         else:
             if t["exiting"]:
-                price = m.bids[min(c.exit_level, len(m.bids)) - 1][0]
-                decision_reason = (
-                    f"主动退出：采用可见买盘第 {min(c.exit_level, len(m.bids))} 档。"
-                )
-            elif t["risk"]["covered"] and D(t["risk"]["loss"]) == 0:
-                price = m.asks[0][0]
-                decision_reason = "预计可回本：参考卖一挂卖单。"
+                price = align(reference_price(m), m.tick)
+                decision_reason = "主动退出：采用最新已收盘一分钟 K 线收盘价。"
             else:
                 e = estimate(m, c)
                 self.evidence["estimate"] = e
                 price = e["sell"]
-                decision_reason = "尚未回本且未触发退出：采用历史模型卖价。"
+                decision_reason = "普通卖出：采用 K 线模型卖价。"
             available = D(
                 self.live.call("live_balance", self.probe(t["request"]))["available"]
             )
@@ -590,7 +580,7 @@ class Automatic:
         record = self.live.submit(
             body,
             owner=t["id"],
-            quote_valid_until=min(m.book_time, m.fetched_at) / 1000 + 15,
+            quote_valid_until=m.fetched_at / 1000 + 15,
         )
         self.last_poll = 0
         self.save(

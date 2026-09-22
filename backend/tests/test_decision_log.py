@@ -1,44 +1,33 @@
 import json
 
+import pytest
+
 from app import decision_log
 from app.automatic import Automatic
-from tests.test_automatic import rig, tick  # noqa: F401
+from tests.test_automatic import rig as base_rig  # noqa: F401
+from tests.test_automatic import tick
 
 
-def test_every_actual_evaluation_persists_complete_evidence_but_timer_does_not(rig):
+@pytest.fixture(name="rig")
+def decision_rig(request):
+    return request.getfixturevalue("base_rig")
+
+
+def test_model_buy_persists_candles_without_book_and_does_not_resubmit(rig):
     r = rig
-    from decimal import Decimal as D
-
-    r.market.asks = [(D("9.9"), D(100))]
+    r.market.bids = r.market.asks = []
     tick(r)
-    first = decision_log.read(r.auto.engine, str(r.body.request_id), kind="buy_wait")[
+    entries = decision_log.read(r.auto.engine, str(r.body.request_id), kind="buy")[
         "items"
     ]
-    assert len(first) == 1
-    entry = first[0]
-    assert len(entry["evidence"]["candles"]) == 3
-    assert len(entry["evidence"]["estimate"]["buy_blockers"]) == 2
-    assert entry["evidence"]["estimate"]["buy"] == "9.95"
-    assert entry["evidence"]["config"]["buy_offset"] == "0.5"
-    tick(r, 1)
-    assert (
-        len(
-            decision_log.read(r.auto.engine, str(r.body.request_id), kind="buy_wait")[
-                "items"
-            ]
-        )
-        == 1
-    )
-    tick(r, 4)
-    assert (
-        len(
-            decision_log.read(r.auto.engine, str(r.body.request_id), kind="buy_wait")[
-                "items"
-            ]
-        )
-        == 2
-    )
-    assert "live_submit" not in r.browser.calls
+    assert len(entries) == 1
+    evidence = entries[0]["evidence"]
+    assert len(evidence["candles"]) == 3
+    assert evidence["estimate"]["buy_blockers"] == []
+    assert evidence["estimate"]["buy"] == "9.95"
+    assert "asks" not in evidence and "bids" not in evidence
+    tick(r, 5)
+    assert r.browser.calls.count("live_submit") == 1
 
 
 def test_fill_log_dedup_and_restart_reads_without_browser(rig):

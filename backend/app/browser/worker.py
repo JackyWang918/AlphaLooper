@@ -16,6 +16,32 @@ from app.browser.live import (
     submit_once,
 )
 from app.browser.records import read_records
+from app.browser.schemas import token_identity
+
+
+def select_target_page(context, current, url):
+    """Prefer the tracked page, otherwise adopt one uniquely matching the token URL."""
+    expected = token_identity(url)
+    if current is not None and not current.is_closed():
+        try:
+            if token_identity(current.url) == expected:
+                return current
+        except ValueError:
+            pass
+    matches = []
+    for candidate in context.pages:
+        if candidate.is_closed():
+            continue
+        try:
+            if token_identity(candidate.url) == expected:
+                matches.append(candidate)
+        except ValueError:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("检测到多个相同币种的 Alpha 页面，请只保留一个交易标签页。")
+    raise ValueError("受控 Chrome 中未找到指定币种的中文 Alpha 交易页面。")
 
 
 def run_worker(pipe: Connection, profile: str):
@@ -62,8 +88,9 @@ def run_worker(pipe: Connection, profile: str):
                         )
                         page.bring_to_front()
                     elif action == "fill":
-                        if page is None or page.is_closed():
+                        if context is None or not context.browser.is_connected():
                             raise ValueError("请先打开交易页面。")
+                        page = select_target_page(context, page, command["payload"]["url"])
                         filled = fill_form(page, command["payload"])
                     elif action in {
                         "live_prepare",
@@ -76,8 +103,9 @@ def run_worker(pipe: Connection, profile: str):
                         "live_cancel",
                         "live_balance",
                     }:
-                        if page is None or page.is_closed():
+                        if context is None or not context.browser.is_connected():
                             raise ValueError("请先打开交易页面。")
+                        page = select_target_page(context, page, command["payload"]["url"])
                         operation = {
                             "live_prepare": preflight,
                             "live_submit": submit_once,
@@ -93,8 +121,9 @@ def run_worker(pipe: Connection, profile: str):
                         pipe.send({"ok": True, **result})
                         continue
                     elif action == "read_records":
-                        if page is None or page.is_closed():
+                        if context is None or not context.browser.is_connected():
                             raise ValueError("请先打开交易页面。")
+                        page = select_target_page(context, page, command["url"])
                         observation = read_records(page, command["url"])
                         pipe.send({"ok": True, "observation": observation})
                         continue

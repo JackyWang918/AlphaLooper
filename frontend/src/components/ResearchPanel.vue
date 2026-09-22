@@ -39,7 +39,7 @@ const taskList = ref<{id:string; created_at:number; symbol:string; completed:boo
 const selectedTask = ref('')
 const newTaskId = ref(crypto.randomUUID())
 const pendingEvent = ref<{ expected_version:number; event:{id:string; kind:string; advance_seconds:number; quantity:string; price:string}; snapshot:Snapshot } | null>(null)
-const valuationCurrent = computed(() => !!task.value && now.value-task.value.snapshot.book_time<=15000)
+const valuationCurrent = computed(() => !!task.value && now.value-task.value.snapshot.fetched_at<=15000)
 const statusLabel: Record<string,string> = {open:'挂单中',partial:'部分成交',cancel_requested:'待撤单确认',filled:'全部成交',cancelled:'已撤单'}
 const now = ref(Date.now())
 const autoRefresh = ref(false)
@@ -50,7 +50,7 @@ const timer = setInterval(() => {
 },1000)
 onBeforeUnmount(() => clearInterval(timer))
 const key = computed(() => JSON.stringify([props.url, quote.value, config.value]))
-const outdated = computed(() => !snapshot.value || fingerprint.value !== key.value || now.value-snapshot.value.book_time>15000)
+const outdated = computed(() => !snapshot.value || fingerprint.value !== key.value || now.value-snapshot.value.fetched_at>15000)
 const candles = computed(() => (snapshot.value?.candles ?? []).filter(c=>c.close_time<(snapshot.value?.fetched_at ?? 0)))
 const chart = computed(() => {
   const rows=candles.value.slice(-60)
@@ -165,7 +165,7 @@ async function simulate(kind:string, advance=0) {
         <label>退出预留（试验值）<input v-model="config.reserve" inputmode="decimal" /></label>
         <label>普通挂单超时（秒）<input v-model.number="config.wait_seconds" type="number" /></label>
         <label>主动退出重挂间隔（秒，试验值）<input v-model.number="config.exit_seconds" type="number" /></label>
-        <label>主动退出买盘档位<input v-model.number="config.exit_level" type="number" /></label>
+        <p>主动退出采用最新已收盘一分钟 K 线收盘价。</p>
       <label>持仓退出时限（秒）<input v-model.number="config.max_hold_seconds" type="number" /></label>
         <label>目标预计积分<input v-model="config.target_points" inputmode="decimal" /></label>
         <label>每 U 买入积分<input v-model="config.points_per_u" inputmode="decimal" /></label>
@@ -214,7 +214,7 @@ async function simulate(kind:string, advance=0) {
       <p class="muted">委托记录：尚未载入任务 · 成交记录：尚未载入任务。上方“新建模拟任务”用于准备一轮新的模拟，首次评估时才会保存任务。</p>
     </template>
     <template v-if="snapshot && estimate">
-      <p :class="['notice',{error:outdated}]">{{snapshot.token}} / {{snapshot.quote}} · {{snapshot.symbol}} · 请求 {{snapshot.latency_ms}} ms · 盘口距今 {{Math.max(0,Math.floor((now-snapshot.book_time)/1000))}} 秒。{{outdated?'数据过期或参数已变化，请刷新。':'可用于本次试算。'}}</p>
+      <p :class="['notice',{error:outdated}]">{{snapshot.token}} / {{snapshot.quote}} · {{snapshot.symbol}} · 请求 {{snapshot.latency_ms}} ms · 行情距今 {{Math.max(0,Math.floor((now-snapshot.fetched_at)/1000))}} 秒。{{outdated?'数据过期或参数已变化，请刷新。':'可用于本次试算。'}}</p>
       <div class="metrics"><div><small>成交量加权均价</small><strong>{{fmt(estimate.center)}}</strong></div><div><small>收盘价标准差</small><strong>{{fmt(estimate.volatility)}}</strong></div><div><small>建议买价</small><strong>{{fmt(estimate.buy)}}</strong></div><div><small>历史模型卖价</small><strong>{{fmt(estimate.sell)}}</strong></div></div>
       <p class="muted">建议买入数量 {{fmt(estimate.quantity)}} {{snapshot.token}}；24h 成交量 {{fmt(snapshot.ticker.volume)}} {{snapshot.token}}，成交额 {{fmt(snapshot.ticker.quoteVolume)}} {{snapshot.quote}}。</p>
       <p v-for="warning in estimate.warnings" :key="warning" class="muted">{{warning}}</p>
@@ -224,9 +224,8 @@ async function simulate(kind:string, advance=0) {
         <g v-for="r in chart" :key="r.time"><title>{{new Date(r.time).toLocaleTimeString()}} 开 {{r.open}} 高 {{r.high}} 低 {{r.low}} 收 {{r.close}} 量 {{r.volume}}</title><line :x1="r.x" :x2="r.x" :y1="r.highY" :y2="r.lowY" :stroke="r.color"/><rect :x="r.x-r.width/2" :y="r.top" :width="r.width" :height="r.height" :fill="r.color"/><rect :x="r.x-r.width/2" :y="230-r.volHeight" :width="r.width" :height="r.volHeight" :fill="r.color" opacity=".6"/></g>
       </svg>
       <p class="muted">{{candles[0]?new Date(candles[0].time).toLocaleString():''}} → {{candles.length?new Date(candles[candles.length-1]!.time).toLocaleString():''}}。悬停查看单根数据；图表使用数值近似，策略计算使用 Decimal。</p>
-      <div class="book"><div v-for="(rows,side) in {bids:snapshot.bids,asks:snapshot.asks}" :key="side"><h3>{{side==='bids'?'买盘':'卖盘'}}</h3><table><thead><tr><th>档</th><th>价格</th><th>数量</th></tr></thead><tbody><tr v-for="(row,i) in rows.slice(0,6)" :key="i"><td>{{i+1}}</td><td>{{fmt(row[0])}}</td><td>{{fmt(row[1])}}</td></tr></tbody></table></div></div>
       <h3>订单流程沙盒</h3>
-      <p class="muted">时间按钮推进虚拟时钟，复用当前盘口快照；不是历史回测。成交由你手动输入，触价不会自动成交。亏损在虚拟自然分钟结束检查。任务、委托和成交记录保存在本机，刷新后可恢复。按任务累计，不自动跨日清零。</p>
+      <p class="muted">时间按钮推进虚拟时钟，复用当前 K 线快照；不是历史回测。成交由你手动输入，触价不会自动成交。亏损在虚拟自然分钟结束检查。任务、委托和成交记录保存在本机，刷新后可恢复。按任务累计，不自动跨日清零。</p>
       <p>状态：{{state.message ?? '未开始'}}<br/>剩余持仓 {{fmt(state.inventory)}} · 本轮成本 {{fmt(state.cost)}} · 已卖出净收入 {{fmt(state.proceeds)}} · 累计损耗 {{fmt(state.session_loss)}}</p>
       <p v-if="state.first_buy_at != null">本轮已持仓 {{Math.floor(((state.clock ?? state.first_buy_at)-state.first_buy_at)/60)}} 分钟；{{config.max_hold_seconds/60}} 分钟后转主动退出。当前主动退出：{{state.exiting?'是':'否'}}。</p>
       <p v-if="state.order">模拟{{state.order.side==='buy'?'买':'卖'}}单：{{state.order.price}} × {{state.order.quantity}}；已成交 {{state.order.filled}}；{{state.order.cancel_requested?'等待撤单确认':'挂单等待'}}</p>

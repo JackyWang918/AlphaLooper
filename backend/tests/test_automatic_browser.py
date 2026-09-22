@@ -2,7 +2,12 @@ import pytest
 
 from app.browser.automatic import available_balance, cancel_once, inspect_progress
 from tests.test_alpha import PAYLOAD
-from tests.test_live_browser import page  # noqa: F401 -- isolated routed browser fixture
+from tests.test_live_browser import page as base_page  # noqa: F401
+
+
+@pytest.fixture(name="page")
+def isolated_page(request):
+    return request.getfixturevalue("base_page")
 
 
 def install_order(page, *, price="0.9 USDT", quantity="1 DGAI", direction="买入"):

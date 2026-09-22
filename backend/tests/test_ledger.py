@@ -156,7 +156,7 @@ def test_identity_and_stale_valuation(client, market, config):
     with app.state.engine.begin() as connection:
         row = ledger.get_task(connection, task["id"])
         m = Snapshot.model_validate_json(row["snapshot"])
-        m.book_time = 1
+        m.fetched_at = 1
         connection.execute(
             ledger.tasks.update()
             .where(ledger.tasks.c.id == task["id"])
@@ -185,7 +185,7 @@ def test_hold_timeout_survives_partial_fill_and_cancel(market, config):
     )
     assert s.first_buy_at == first and s.exiting and s.order.cancel_requested
     s = advance(s, event("cancel_confirm"), market, config)
-    assert s.order.side == "sell" and s.order.price == market.bids[5][0]
+    assert s.order.side == "sell" and s.order.price == market.candles[-1].close
     assert s.first_buy_at == first
 
 

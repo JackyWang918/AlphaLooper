@@ -1,5 +1,6 @@
 """Read and fill observed Alpha controls. No submit or confirmation selectors."""
 
+import time
 from decimal import Decimal, InvalidOperation, localcontext
 
 from playwright.sync_api import Page, expect
@@ -56,9 +57,14 @@ def inspect_form(page: Page):
 def verify_identity(page: Page, command: FillForm):
     if token_identity(page.url) != token_identity(command.url):
         raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
-    state = inspect_form(page)
-    if not state["fill_supported"]:
-        raise ValueError(state["reason"])
+    deadline = time.monotonic() + 5
+    while True:
+        state = inspect_form(page)
+        if state["fill_supported"]:
+            break
+        if time.monotonic() >= deadline:
+            raise ValueError(state["reason"])
+        time.sleep(0.1)
     if (
         state["symbol"] != command.expected_symbol
         or state["quote"] != command.expected_quote
@@ -101,9 +107,23 @@ def fill_form(page: Page, payload: dict):
     amount.click(trial=True, timeout=3000)
     amount.fill(command.quantity)
     amount.press("Tab")
-    # Recheck after blur because controlled inputs may normalize or reject values.
-    expect(price).to_have_value(command.price)
-    expect(amount).to_have_value(command.quantity)
+    # Recheck after blur because controlled inputs may normalize trailing zeroes.
+    # Compare Decimal values: "47.82000000" and "47.82" are the same order size.
+    actual_price = price.input_value()
+    actual_quantity = amount.input_value()
+    try:
+        price_matches = Decimal(actual_price) == Decimal(command.price)
+        quantity_matches = Decimal(actual_quantity) == Decimal(command.quantity)
+    except InvalidOperation as exc:
+        raise ValueError(
+            f"页面回读值不是有效数字：价格 {actual_price!r}，数量 {actual_quantity!r}。"
+        ) from exc
+    if not price_matches or not quantity_matches:
+        raise ValueError(
+            "页面回读值与计划不一致："
+            f"计划价格 {command.price}、页面价格 {actual_price}；"
+            f"计划数量 {command.quantity}、页面数量 {actual_quantity}。"
+        )
     state = verify_identity(page, command)
     if state["side"] != command.side:
         raise ValueError("填表过程中买卖方向发生变化，请人工检查。")
@@ -111,7 +131,7 @@ def fill_form(page: Page, payload: dict):
         "side": state["side"],
         "symbol": state["symbol"],
         "quote": state["quote"],
-        "price": price.input_value(),
-        "quantity": amount.input_value(),
+        "price": actual_price,
+        "quantity": actual_quantity,
         "submitted": False,
     }

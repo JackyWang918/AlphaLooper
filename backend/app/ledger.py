@@ -107,11 +107,12 @@ def statistics(records, state, snapshot, config):
                 inventory -= quantity
                 sold += gross
         fresh = True
+        mark = {"exit_net": None, "covered": False}
         try:
             validate_snapshot(snapshot, int(time.time() * 1000))
+            mark = exposure(state, snapshot, config)
         except ValueError:
             fresh = False
-        mark = exposure(state, snapshot, config)
         unrealized = (
             D(0)
             if inventory == 0
