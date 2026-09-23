@@ -249,6 +249,27 @@ def test_loaded_unsupported_quote_is_not_retryable(page):
         inspect_progress(page, PAYLOAD)
 
 
+def test_missing_current_order_tab_while_loading_is_retryable(page):
+    page.get_by_role("tab", name="当前委托", exact=True).evaluate(
+        "element=>element.remove()"
+    )
+
+    result = inspect_progress(page, PAYLOAD)
+
+    assert result["settling"] is True
+    assert result["page_loading"] is True
+    assert "仍在加载" in result["message"]
+
+
+def test_duplicate_current_order_tabs_remain_a_hard_error(page):
+    page.get_by_role("tab", name="当前委托", exact=True).evaluate(
+        "element=>element.parentElement.appendChild(element.cloneNode(true))"
+    )
+
+    with pytest.raises(ValueError, match="无法唯一识别当前委托标签"):
+        inspect_progress(page, PAYLOAD)
+
+
 def test_explicit_frozen_and_total_balances_include_locked_assets(page):
     install_current_layout(page, status="部分成交")
     page.locator("#cash").evaluate("e=>e.textContent='可用 50 USDT'")

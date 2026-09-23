@@ -321,13 +321,13 @@ class Automatic:
             )
             return t
 
-    def pause(self, t, message):
+    def pause(self, t, message, *, log_event=True):
         repeated = (
             not self.running and t["phase"] == "attention" and t["message"] == message
         )
         self.running = False
         t.update(phase="attention", message=message)
-        self.save(t, None if repeated else "error")
+        self.save(t, "error" if log_event and not repeated else None)
 
     def snapshot(self, t, c):
         r = t["request"]
@@ -339,7 +339,7 @@ class Automatic:
             raise ValueError("行情与任务币种不匹配。")
         return m
 
-    def consume(self, t, record):
+    def consume(self, t, record, *, log_event=True):
         """Consume a local order exactly once together with the cleared pointer."""
         result = record["result"]
         wallet = result["balances"]
@@ -358,7 +358,7 @@ class Automatic:
         t.update(last_order=record["id"], pending=None)
         self.save(
             t,
-            "fill",
+            "fill" if log_event else None,
             "当前委托已结束，按余额差记录实际资金变化。",
             {"request_id": record["id"], "result": result},
         )
@@ -409,10 +409,11 @@ class Automatic:
             if not t:
                 self.running = False
                 return
+            was_running = self.running
             try:
                 self._tick(t)
             except Exception as exc:  # noqa: BLE001
-                self.pause(t, str(exc))
+                self.pause(t, str(exc), log_event=was_running)
 
     def risk(self, t, wallet, price):
         if wallet.get("quote_total") is None or wallet.get("base_total") is None:
@@ -460,34 +461,12 @@ class Automatic:
                 )
             )
             if now - self.last_poll >= interval or (self.running and minute_due):
-                before_check = {
-                    key: record.get(key)
-                    for key in (
-                        "active",
-                        "state",
-                        "message",
-                        "balances",
-                        "current_order",
-                        "last_check_error",
-                        "result",
-                    )
-                }
-                record = self.live.check()
+                record = self.live.check(allow_refresh=self.running)
                 polled = True
                 self.last_poll = now
-                after_check = {
-                    key: record.get(key)
-                    for key in before_check
-                }
-                # A paused task keeps a read-only reconciliation watch, but
-                # unchanged polling is operational status rather than a new
-                # strategy decision. State/balance changes remain auditable.
-                changed_while_paused = (
-                    before_check != after_check
-                    and record["active"]
-                    and not record.get("last_check_error")
-                )
-                if self.running or changed_while_paused:
+                # Paused reconciliation is operational state, not a strategy
+                # decision. Resume restores both actions and decision logs.
+                if self.running:
                     self.save(
                         t,
                         "order_check",
@@ -503,11 +482,15 @@ class Automatic:
                 raise ValueError("订单核对失败：" + record["last_check_error"])
         if record and not record["active"]:
             if record["state"] == "completed":
-                self.consume(t, record)
+                self.consume(t, record, log_event=self.running)
                 record = None
             else:
                 t.update(pending=None, last_order=record["id"])
-                self.pause(t, "上一笔未提交：" + record["message"] + "；检查后可恢复。")
+                self.pause(
+                    t,
+                    "上一笔未提交：" + record["message"] + "；检查后可恢复。",
+                    log_event=self.running,
+                )
                 return
         if not self.running:
             self.save(t)
@@ -592,7 +575,6 @@ class Automatic:
                 t["exiting"] = True
         else:
             wallet = t["balances"]
-        reconcile = False
         if t["round_start_quote"] is not None and (
             minute_due or (not record and t.get("risk_reconcile"))
         ):
@@ -601,9 +583,9 @@ class Automatic:
             self.evidence.update(balances=wallet, risk=risk)
             t["last_minute"] = int(now) // 60
             if risk["loss_pct"] is None:
-                # Never label frozen funds as loss. Release this single order once
-                # to obtain a usable valuation; do not guess account equity.
-                reconcile = bool(record)
+                # Never label frozen funds as loss or churn an otherwise valid
+                # order merely to obtain a valuation. Normal timeout and
+                # explicit exit conditions still release the order.
                 t["risk_reconcile"] = True
             else:
                 t["risk_reconcile"] = False
@@ -645,17 +627,12 @@ class Automatic:
             )
             if (
                 now - record["created_at"] >= timeout
-                or reconcile
                 or enough_bought
                 or sell_dust
                 or (t["exiting"] and not t.get("pending_exit"))
                 or retry_cancel
             ):
-                reason = (
-                    "页面缺少冻结余额，撤单释放后核算资产。"
-                    if reconcile
-                    else "挂单超时或进入主动退出，先撤单核对余额。"
-                )
+                reason = "挂单超时或进入主动退出，先撤单核对余额。"
                 if enough_bought:
                     reason = "累计买入超过计划金额 50%，撤销剩余买单后转卖。"
                 elif sell_dust:

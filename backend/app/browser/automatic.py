@@ -9,7 +9,7 @@ import re
 import time
 from decimal import Decimal
 
-from app.browser.alpha import TABS, FormNotReady, verify_identity
+from app.browser.alpha import TABS, PageNotReady, verify_identity
 from app.browser.confirmation import MODALS, NUMBER, confirmation_dialogs
 from app.browser.live import current_order, select_panel
 from app.browser.schemas import FillForm
@@ -242,7 +242,7 @@ def inspect_progress(page, payload):
             page, payload, pending=detail is not None, detail=detail
         )
         _, after = current_detail(page, payload)
-    except FormNotReady as exc:
+    except PageNotReady as exc:
         return {
             "pending": None,
             "settling": True,

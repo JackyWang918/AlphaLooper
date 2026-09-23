@@ -189,6 +189,32 @@ def test_confirmed_cancel_waits_then_refreshes_before_check(service):
     assert checked["cancel_refresh_pending"] is False
 
 
+def test_paused_reconciliation_does_not_refresh_page(service):
+    submitted(service)
+    record = service.get()
+    record.update(
+        task_id="task",
+        observed_pending=True,
+        cancel_refresh_pending=True,
+        cancel_check_after=0,
+    )
+    service.save(record)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "pending": True,
+        "balances": wallet(),
+        "current_order": {"side": "buy"},
+        "page_refreshed": False,
+    }
+
+    checked = service.check(allow_refresh=False)
+
+    assert checked["cancel_refresh_pending"] is True
+    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
+        "payload"
+    ]
+
+
 def test_page_loading_retries_without_error_then_times_out(service):
     submitted(service)
     service.browser.execute.return_value = {

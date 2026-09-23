@@ -198,7 +198,7 @@ class LiveOrders:
             self.save(record)
             return record
 
-    def check(self):
+    def check(self, *, allow_refresh=True):
         with self.lock, localcontext() as context:
             context.prec = 80
             record = self.get()
@@ -234,8 +234,11 @@ class LiveOrders:
                 return record
             try:
                 refresh_before_check = bool(
-                    record.get("cancel_refresh_pending")
-                    or record.get("absence_refresh_pending")
+                    allow_refresh
+                    and (
+                        record.get("cancel_refresh_pending")
+                        or record.get("absence_refresh_pending")
+                    )
                 )
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",

@@ -261,14 +261,16 @@ def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
     assert D(t["pending"]["price"]) == 8
 
 
-def test_missing_frozen_is_not_false_loss_releases_for_reconciliation(rig):
+def test_missing_frozen_is_not_false_loss_or_early_cancel(rig):
     r = rig
     tick(r)
     r.browser.hide_frozen = True
     t = tick(r, 60)
     assert t["risk"]["loss"] is None and not t["exiting"]
-    assert r.browser.calls.count("live_cancel") == 1
+    assert r.browser.calls.count("live_cancel") == 0
     assert r.browser.calls.count("live_submit") == 1
+    tick(r, 240)
+    assert r.browser.calls.count("live_cancel") == 1
 
 
 def test_dust_at_two_is_finished_cash_difference_not_asset_pnl(rig):
@@ -356,13 +358,12 @@ def test_restart_reconciles_but_never_submits_without_resume(rig):
     restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
     r.auto = restarted
     reconciled(r)
-    assert not restarted.running and D(restarted.get()["cost"]) > 0
-    bought = restarted.get()["buy_total"]
+    assert not restarted.running and D(restarted.get()["cost"]) == 0
     tick(r)
-    assert restarted.get()["buy_total"] == bought
     assert r.browser.calls.count("live_submit") == 1
     restarted.control(r.body.request_id, "resume")
-    tick(r)
+    reconciled(r, 5)
+    assert D(restarted.get()["cost"]) > 0
     assert r.auto.get()["pending"]["side"] == "sell"
 
 
@@ -600,6 +601,8 @@ def test_reconcile_missing_frozen_rechecks_loss_before_any_rebuy(rig):
     r.market.candles[-1].close = D(7)
     t = tick(r, 60)
     assert t["risk_reconcile"] and not t["exiting"]
+    assert r.browser.calls.count("live_cancel") == 0
+    tick(r, 240)
     t = reconciled(r, 15)
     assert t["exiting"] and t["pending"]["side"] == "sell"
     assert r.browser.calls.count("live_submit") == 2

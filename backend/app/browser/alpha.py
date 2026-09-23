@@ -12,7 +12,11 @@ TABS = {"buy": "买入", "sell": "卖出"}
 FORM_READY_TIMEOUT = 5
 
 
-class FormNotReady(ValueError):
+class PageNotReady(ValueError):
+    """The expected trade page is open, but required UI is still rendering."""
+
+
+class FormNotReady(PageNotReady):
     """The expected trade page is open, but its form is still rendering."""
 
 

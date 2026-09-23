@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 from playwright.sync_api import Error, expect
 
-from app.browser.alpha import TABS, fill_form, verify_identity
+from app.browser.alpha import TABS, PageNotReady, fill_form, verify_identity
 from app.browser.confirmation import confirm_once
 from app.browser.schemas import FillForm, token_identity
 
@@ -23,18 +23,30 @@ def stage(name):
 
 def select_panel(page, name):
     tab = page.get_by_role("tab", name=name, exact=True)
-    if tab.count() != 1:
+    if tab.count() == 0:
+        raise PageNotReady(f"{name}标签仍在加载。")
+    if tab.count() > 1:
         raise ValueError(f"无法唯一识别{name}标签，请人工检查页面。")
-    tab.click(timeout=3000)
-    expect(tab).to_have_attribute("aria-selected", "true")
+    try:
+        tab.click(timeout=3000)
+        expect(tab).to_have_attribute("aria-selected", "true", timeout=3000)
+    except (Error, AssertionError) as exc:
+        raise PageNotReady(f"{name}标签尚未就绪。") from exc
     panel_id = tab.get_attribute("aria-controls")
     if not panel_id or not re.fullmatch(r"[A-Za-z0-9_:-]+", panel_id):
         raise ValueError("委托区域缺少可核对的面板关联，当前页面尚不支持自动执行。")
     panel = page.locator('[role="tabpanel"]').filter(visible=True)
     panel = panel.and_(page.locator(f'[id="{panel_id}"]'))
-    expect(panel).to_be_visible(timeout=5000)
+    if panel.count() == 0:
+        raise PageNotReady(f"{name}区域仍在加载。")
+    if panel.count() > 1:
+        raise ValueError(f"{name}区域出现多个可见候选，请人工检查页面。")
+    try:
+        expect(panel).to_be_visible(timeout=3000)
+    except (Error, AssertionError) as exc:
+        raise PageNotReady(f"{name}区域仍在加载。") from exc
     if panel.get_attribute("aria-busy") == "true":
-        raise ValueError("委托区域正在加载，请稍后检查。")
+        raise PageNotReady("委托区域正在加载。")
     return panel
 
 
