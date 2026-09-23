@@ -49,7 +49,7 @@ onUnmounted(()=>{clearInterval(timer);version++})
     <p><time>{{new Date(entry.time).toLocaleString()}}</time> · <strong>{{labels[entry.kind]||entry.kind}}</strong> · #{{entry.id}}</p>
     <p>{{entry.reason}}</p>
     <p v-if="entry.evidence.market_time" class="muted">行情时间 {{new Date(entry.evidence.market_time).toLocaleTimeString()}}</p>
-    <p v-if="entry.evidence.estimate">价格中心 {{entry.evidence.estimate.center}} · 波动 {{entry.evidence.estimate.volatility}} · 建议买价 {{entry.evidence.estimate.buy}} · 模型卖价 {{entry.evidence.estimate.sell}}</p>
+    <p v-if="entry.evidence.estimate">价格中心 {{entry.evidence.estimate.center}} · 收盘标准差 {{entry.evidence.estimate.close_volatility??entry.evidence.estimate.volatility}} · 典型振幅 {{entry.evidence.estimate.median_range??'旧记录无此字段'}} × {{entry.evidence.estimate.range_weight??'—'}} · 最终波动 {{entry.evidence.estimate.volatility}} · 建议买价 {{entry.evidence.estimate.buy}} · 模型卖价 {{entry.evidence.estimate.sell}}</p>
     <p v-if="entry.evidence.risk">评估持仓 {{entry.evidence.position_including_partial?.inventory}} · 预计损耗 {{entry.evidence.risk.loss??'未知'}} U（{{entry.evidence.risk.loss_pct??'未知'}}%） · {{entry.evidence.risk.basis === 'latest_closed_1m_candle' ? '按最新已收盘 K 线估值，不代表实际成交收入' : '历史策略记录'}}</p>
     <p v-if="entry.details?.price">计划委托：{{entry.details.quantity}} @ {{entry.details.price}}</p>
     <details><summary>查看完整判断依据（参数阈值、K 线、状态及订单关联）</summary><pre>{{JSON.stringify(entry,null,2)}}</pre></details>

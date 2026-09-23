@@ -4,6 +4,7 @@ import re
 import time
 from decimal import Decimal, InvalidOperation, localcontext
 
+from playwright.sync_api import Error as BrowserError
 from playwright.sync_api import Page, expect
 
 from app.browser.schemas import FillForm, token_identity
@@ -138,6 +139,50 @@ def check_step(value: str, step: str | None):
         raise ValueError("无法确认页面输入精度，已停止。") from exc
 
 
+def slider_semantics(handle):
+    """Return the current and maximum values exposed by a slider thumb."""
+    semantic, maximum = (
+        handle.get_attribute("aria-valuenow"),
+        handle.get_attribute("aria-valuemax"),
+    )
+    if handle.evaluate("e => e.matches('input[type=range]')"):
+        semantic = handle.input_value()
+        maximum = handle.get_attribute("max") or "100"
+    return semantic, maximum
+
+
+def confirm_slider_at_max(page: Page, handle):
+    """Wait for slider state, then try the standard keyboard endpoint once."""
+    last = (None, None)
+    for attempt in range(2):
+        deadline = time.monotonic() + 1
+        while True:
+            last = slider_semantics(handle)
+            semantic, maximum = last
+            if semantic is None or maximum is None:
+                return last
+            try:
+                if Decimal(semantic) == Decimal(maximum):
+                    return last
+            except InvalidOperation as exc:
+                raise ValueError(
+                    "卖出数量进度条返回了无法识别的状态，未提交订单。"
+                ) from exc
+            if time.monotonic() >= deadline:
+                break
+            page.wait_for_timeout(100)
+        if attempt == 0:
+            try:
+                handle.press("End", timeout=1000)
+            except BrowserError:
+                break
+    semantic, maximum = last
+    raise ValueError(
+        "卖出数量进度条没有到达最大值，未提交订单。"
+        f"当前值：{semantic or '未知'}；最大值：{maximum or '未知'}。"
+    )
+
+
 def set_sell_slider_to_max(page: Page, amount):
     """Drag the unique sell-form percentage slider to its maximum endpoint."""
     total = wait_total_input(page)
@@ -182,21 +227,7 @@ def set_sell_slider_to_max(page: Page, amount):
         )
     finally:
         page.mouse.up()
-    page.wait_for_timeout(100)
-
-    semantic, maximum = (
-        handle.get_attribute("aria-valuenow"),
-        handle.get_attribute("aria-valuemax"),
-    )
-    if handle.evaluate("e => e.matches('input[type=range]')"):
-        semantic = handle.input_value()
-        maximum = handle.get_attribute("max") or "100"
-    if (
-        semantic is not None
-        and maximum is not None
-        and Decimal(semantic) != Decimal(maximum)
-    ):
-        raise ValueError("卖出数量进度条没有到达最大值，未提交订单。")
+    confirm_slider_at_max(page, handle)
 
     deadline = time.monotonic() + 3
     while True:

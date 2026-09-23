@@ -24,7 +24,10 @@ def test_model_buy_persists_candles_without_book_and_does_not_resubmit(rig):
     evidence = entries[0]["evidence"]
     assert len(evidence["candles"]) == 3
     assert evidence["estimate"]["buy_blockers"] == []
-    assert evidence["estimate"]["buy"] == "9.95"
+    assert evidence["estimate"]["buy"] == "9.90"
+    assert evidence["estimate"]["close_volatility"]
+    assert evidence["estimate"]["median_range"] == "0.4"
+    assert evidence["estimate"]["range_volatility"] == "0.20"
     assert "asks" not in evidence and "bids" not in evidence
     tick(r, 5)
     assert r.browser.calls.count("live_submit") == 1

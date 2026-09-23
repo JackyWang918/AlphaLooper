@@ -32,7 +32,7 @@ const blockedReason=computed(()=>{
   if(amountProblem.value)return amountProblem.value
   return ''
 })
-const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),buyCheckSeconds=ref(20)
+const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),rangeWeight=ref('0.5'),buyCheckSeconds=ref(20)
 const requiredPoints=computed(()=>{
   const goal=Number(target.value),existing=Number(currentPoints.value)
   return Number.isFinite(goal)&&Number.isFinite(existing)&&existing<=goal?goal-existing:null
@@ -55,7 +55,7 @@ async function api(path:string,body?:unknown){
   if(!res.ok){
     if(typeof value?.detail==='string')throw new Error(value.detail)
     if(Array.isArray(value?.detail)){
-      const labels:Record<string,string>={amount:'每轮计划买入金额',target_points:'本任务目标积分',current_points:'启动时已有积分',window:'K 线窗口',buy_offset:'买入波动偏移系数',sell_offset:'卖出波动偏移系数',buy_check_seconds:'空仓再次评估等待',book:'账本',url:'交易链接',expected_symbol:'交易币种',expected_quote:'计价币'}
+      const labels:Record<string,string>={amount:'每轮计划买入金额',target_points:'本任务目标积分',current_points:'启动时已有积分',window:'K 线窗口',buy_offset:'买入波动偏移系数',sell_offset:'卖出波动偏移系数',range_weight:'典型振幅权重',buy_check_seconds:'空仓再次评估等待',book:'账本',url:'交易链接',expected_symbol:'交易币种',expected_quote:'计价币'}
       const messages=value.detail.map((item:{loc?:unknown[];type?:string;msg?:string;ctx?:Record<string,unknown>})=>{
         const field=String(item.loc?.at(-1)??'请求参数'),label=labels[field]??field,ctx=item.ctx??{}
         if(item.type==='less_than_equal')return `${label}不能超过 ${ctx.le}。`
@@ -92,7 +92,7 @@ async function start(){
   try{
     await refresh()
     if(!statusReady.value||current.value)return
-    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,current_points:currentPoints.value,window:windowSize.value,buy_offset:buyOffset.value,sell_offset:sellOffset.value,buy_check_seconds:buyCheckSeconds.value}})
+    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,current_points:currentPoints.value,window:windowSize.value,buy_offset:buyOffset.value,sell_offset:sellOffset.value,range_weight:rangeWeight.value,buy_check_seconds:buyCheckSeconds.value}})
     // Rotate only after a definite response. A lost response retries the same ID.
     requestId=crypto.randomUUID();localStorage.setItem('automatic-request-id',requestId)
     if(task.active)current.value=task
@@ -151,8 +151,9 @@ onUnmounted(()=>clearInterval(timer))
       <label>1 分钟 K 线窗口<input v-model.number="windowSize" type="number" min="3" max="240" /></label>
       <label>买入波动偏移系数<input v-model="buyOffset" inputmode="decimal" /></label>
       <label>卖出波动偏移系数<input v-model="sellOffset" inputmode="decimal" /></label>
+      <label>典型振幅权重<input v-model="rangeWeight" inputmode="decimal" /></label>
       <label>空仓再次评估等待（秒）<input v-model.number="buyCheckSeconds" type="number" min="5" max="300" step="5" /></label>
-    </div><p class="muted">默认 15 根 K 线、偏移各 0.5。空仓等待默认 20 秒；主动退出使用最新已收盘一分钟 K 线收盘价。参数效果尚未验证。</p></details>
+    </div><p class="muted">最终波动尺度取“收盘价总体标准差”和“分钟高低振幅中位数 × 权重”中的较大值；振幅权重默认 0.5，可降低单根异常长影线的影响。默认 15 根 K 线、买卖偏移各 0.5。参数效果尚未验证。</p></details>
     <p class="muted">空仓等待可设为 5–300 秒（5 秒的倍数），用于一轮结束后或策略明确暂不买入后的下一次评估。首次启动仍立即评估；它不改变订单巡检、损耗检查或退出规则。</p>
     <button :disabled="!!blockedReason" :title="blockedReason" @click="start">{{busy?'正在处理…':'启动自动实盘买卖'}}</button>
   </fieldset>

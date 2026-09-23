@@ -18,6 +18,7 @@ class Config(BaseModel):
     window: int = Field(default=15, ge=3, le=240)
     buy_offset: Decimal = Field(default=D("0.5"), ge=0, le=5)
     sell_offset: Decimal = Field(default=D("0.5"), ge=0, le=5)
+    range_weight: Decimal = Field(default=D("0.5"), ge=0, le=2)
     fee_bps: Decimal = Field(
         ge=0, le=100
     )  # Required assumption, never inferred from market data.
@@ -60,9 +61,18 @@ def estimate(m: Snapshot, c: Config):
         ctx.prec = 40
         center = sum((r.quote_volume for r in rows), D(0)) / volume
         mean = sum((r.close for r in rows), D(0)) / len(rows)
-        volatility = (
+        close_volatility = (
             sum(((r.close - mean) ** 2 for r in rows), D(0)) / len(rows)
         ).sqrt()
+        ranges = sorted(r.high - r.low for r in rows)
+        middle = len(ranges) // 2
+        median_range = (
+            ranges[middle]
+            if len(ranges) % 2
+            else (ranges[middle - 1] + ranges[middle]) / 2
+        )
+        range_volatility = median_range * c.range_weight
+        volatility = max(close_volatility, range_volatility)
         buy = align(center - volatility * c.buy_offset, m.tick)
         sell = align(center + volatility * c.sell_offset, m.tick, True)
         if buy <= 0:
@@ -75,6 +85,11 @@ def estimate(m: Snapshot, c: Config):
         return {
             "center": center,
             "volatility": volatility,
+            "close_volatility": close_volatility,
+            "median_range": median_range,
+            "range_weight": c.range_weight,
+            "range_volatility": range_volatility,
+            "volatility_method": "max_close_stddev_and_weighted_median_range",
             "buy": buy,
             "sell": sell,
             "quantity": quantity,

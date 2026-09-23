@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 type Candle = { time: number; close_time: number; open: string; high: string; low: string; close: string; volume: string; quote_volume: string }
 type Snapshot = { symbol: string; token: string; quote: string; fetched_at: number; book_time: number; latency_ms: number; candles: Candle[]; bids: [string,string][]; asks: [string,string][]; ticker: Record<string,string> }
-type Estimate = { center: string; volatility: string; buy: string; sell: string; quantity: string; warnings: string[] }
+type Estimate = { center: string; volatility: string; close_volatility: string; median_range: string; range_weight: string; range_volatility: string; buy: string; sell: string; quantity: string; warnings: string[] }
 type Order = { side: string; price: string; quantity: string; filled: string; placed_at: number; cancel_requested: boolean }
 type State = { symbol?: string; clock?: number; inventory?: string; cost?: string; proceeds?: string; session_loss?: string; exiting?: boolean; budget_stopped?: boolean; first_buy_at?: number | null; completed?: boolean; target_reached?: boolean; message?: string; order?: Order | null }
 type LedgerOrder = Order & { id: string; status: string }
@@ -12,7 +12,7 @@ type Task = { id: string; url: string; version: number; created_at: number; conf
 const props = defineProps<{ url: string }>()
 const emit = defineEmits<{ 'update:url': [value: string] }>()
 const quote = ref('USDT')
-const config = ref({ amount:'50', window:15, buy_offset:'0.5', sell_offset:'0.5', fee_bps:'1', stop_pct:'2', budget:'10', reserve:'2', wait_seconds:300, exit_seconds:15, exit_level:6, max_hold_seconds:1800, target_points:'32768', points_per_u:'4' })
+const config = ref({ amount:'50', window:15, buy_offset:'0.5', sell_offset:'0.5', range_weight:'0.5', fee_bps:'1', stop_pct:'2', budget:'10', reserve:'2', wait_seconds:300, exit_seconds:15, exit_level:6, max_hold_seconds:1800, target_points:'32768', points_per_u:'4' })
 const feePercent = computed(() => {
   const value = config.value.fee_bps.trim()
   if (!/^\d+(?:\.\d+)?$/.test(value)) return '—'
@@ -157,6 +157,7 @@ async function simulate(kind:string, advance=0) {
         <label>观察窗口（分钟）<input v-model.number="config.window" type="number" min="3" max="240" /></label>
         <label>买入偏移系数<input v-model="config.buy_offset" inputmode="decimal" /></label>
         <label>卖出偏移系数<input v-model="config.sell_offset" inputmode="decimal" /></label>
+        <label>典型振幅权重<input v-model="config.range_weight" inputmode="decimal" /></label>
         <label>每侧手续费假设（基点）<input v-model="config.fee_bps" inputmode="decimal" @input="feeConfirmed=false" /></label>
       </div>
       <details><summary>退出与预算参数</summary><div class="fields research-fields">
@@ -215,7 +216,7 @@ async function simulate(kind:string, advance=0) {
     </template>
     <template v-if="snapshot && estimate">
       <p :class="['notice',{error:outdated}]">{{snapshot.token}} / {{snapshot.quote}} · {{snapshot.symbol}} · 请求 {{snapshot.latency_ms}} ms · 行情距今 {{Math.max(0,Math.floor((now-snapshot.fetched_at)/1000))}} 秒。{{outdated?'数据过期或参数已变化，请刷新。':'可用于本次试算。'}}</p>
-      <div class="metrics"><div><small>成交量加权均价</small><strong>{{fmt(estimate.center)}}</strong></div><div><small>收盘价标准差</small><strong>{{fmt(estimate.volatility)}}</strong></div><div><small>建议买价</small><strong>{{fmt(estimate.buy)}}</strong></div><div><small>历史模型卖价</small><strong>{{fmt(estimate.sell)}}</strong></div></div>
+      <div class="metrics"><div><small>成交量加权均价</small><strong>{{fmt(estimate.center)}}</strong></div><div><small>收盘价标准差</small><strong>{{fmt(estimate.close_volatility)}}</strong></div><div><small>分钟振幅中位数</small><strong>{{fmt(estimate.median_range)}}</strong></div><div><small>加权典型振幅</small><strong>{{fmt(estimate.range_volatility)}}</strong></div><div><small>最终波动尺度</small><strong>{{fmt(estimate.volatility)}}</strong></div><div><small>建议买价</small><strong>{{fmt(estimate.buy)}}</strong></div><div><small>历史模型卖价</small><strong>{{fmt(estimate.sell)}}</strong></div></div>
       <p class="muted">建议买入数量 {{fmt(estimate.quantity)}} {{snapshot.token}}；24h 成交量 {{fmt(snapshot.ticker.volume)}} {{snapshot.token}}，成交额 {{fmt(snapshot.ticker.quoteVolume)}} {{snapshot.quote}}。</p>
       <p v-for="warning in estimate.warnings" :key="warning" class="muted">{{warning}}</p>
       <h3>1 分钟 K 线与成交量（仅已收盘，最多 60 根）</h3>

@@ -297,6 +297,34 @@ def test_sell_all_drags_graphical_slider_without_percent_text(page):
     assert page.evaluate("window.submits") == 0
 
 
+def test_sell_all_uses_end_key_when_drag_stops_before_max(page):
+    page.locator("#percent").evaluate("e=>e.remove()")
+    page.locator("#limitAmount").evaluate(r"""amount=>{
+      const track=document.createElement('div');
+      track.className='bn-slider';track.style='position:relative;width:300px;height:20px';
+      track.innerHTML='<div class="bn-slider-handle" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="position:absolute;left:0;width:18px;height:18px"></div>';
+      amount.parentElement.after(track);
+      const handle=track.firstElementChild;
+      handle.addEventListener('mousedown',()=>{
+        const move=()=>handle.setAttribute('aria-valuenow','75');
+        const up=()=>{document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up)};
+        document.addEventListener('mousemove',move);document.addEventListener('mouseup',up);
+      });
+      handle.addEventListener('keydown',event=>{
+        if(event.key==='End'){
+          handle.setAttribute('aria-valuenow','100');handle.style.left='100%';amount.value='9.52';
+        }
+      });
+    }""")
+    result = fill_form(
+        page,
+        {**PAYLOAD, "side": "sell", "price": "1.05", "quantity": "999", "sell_all": True},
+    )
+    assert result["quantity"] == "9.52"
+    assert page.get_by_role("slider").get_attribute("aria-valuenow") == "100"
+    assert page.evaluate("window.submits") == 0
+
+
 def test_explicit_quote_amount_preserves_fifty_usdt(page):
     from app.browser.alpha import fill_form
 

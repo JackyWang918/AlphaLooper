@@ -6,6 +6,16 @@
 
 # AlphaLooper 技术方案
 
+## 2026-09-23 卖出 100% 滑条端点核对
+
+`set_sell_slider_to_max` 继续限定卖出表单中唯一可见滑条，不回退为直接填写数量。鼠标拖到轨道右端后，最多等待 1 秒读取 `aria-valuenow/aria-valuemax` 或原生 range 的 value/max；未到端点时对同一滑条发送一次 `End`，再等待并严格比较 Decimal 值。缺少语义属性时仍依赖平台生成的正数数量；语义值存在但未等于最大值时拒绝提交，并返回当前值/最大值。诊断页面复用同一 helper，隔离测试覆盖键盘端点恢复。
+
+## 2026-09-23 普通报价的稳健 K 线振幅
+
+`strategy.estimate` 在同一已收盘 K 线窗口内计算 `close_volatility`、`median_range` 与 `range_volatility`，其中 `median_range = median(high - low)`，`range_volatility = median_range × range_weight`，最终 `volatility = max(close_volatility, range_volatility)`。所有计算继续使用 Decimal；奇数窗口取中项，偶数窗口取中间两项平均。返回值保留分量、权重和方法名，供研究页面与决策日志解释报价。
+
+`Config.range_weight` 默认 0.5，范围 0–2，旧持久化任务缺失该字段时由 Pydantic 默认补齐。自动任务、无状态试算和持久化模拟任务共用 `estimate`；主动退出 `reference_price` 与余额风险估值不变。新增回归覆盖分钟内往返但收盘不动、单根极端长影线不支配中位数，以及收盘波动大于加权振幅时仍由收盘标准差主导。
+
 ## 2026-09-23 买入金额上限与校验反馈
 
 自动任务配置 `amount`、共享实盘单笔提交和普通确认弹窗统一使用 2,000 U 买入上限，默认任务金额仍为 50 U。上限由后端共享常量维护，避免任务创建、单笔服务和确认弹窗漂移。自动实盘前端在发请求前校验正十进制金额及上限，并把 FastAPI 参数错误转换为具体中文字段提示；无可读响应时显示 HTTP 状态和查看后端日志的操作建议。本次不改变损耗预算、退出阈值、目标积分或数据库结构。

@@ -8,7 +8,12 @@ from uuid import UUID
 from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import expect
 
-from app.browser.alpha import TABS, verify_identity, wait_total_input
+from app.browser.alpha import (
+    TABS,
+    confirm_slider_at_max,
+    verify_identity,
+    wait_total_input,
+)
 from app.browser.automatic import (
     amount,
     no_dialog,
@@ -234,17 +239,7 @@ def sell_slider(page, command):
     finally:
         page.mouse.up()
     # Native ranges/accessible thumbs expose the endpoint for direct verification.
-    semantic = handle.get_attribute("aria-valuenow")
-    maximum = handle.get_attribute("aria-valuemax")
-    native = handle.evaluate("e => e.matches('input[type=range]')")
-    if native:
-        semantic, maximum = handle.input_value(), handle.get_attribute("max") or "100"
-    if (
-        semantic is not None
-        and maximum is not None
-        and Decimal(semantic) != Decimal(maximum)
-    ):
-        raise ValueError("进度条未到最大值，请检查平台控件；未提交订单。")
+    semantic, maximum = confirm_slider_at_max(page, handle)
     # Restore the requested limit after the platform's slider-change handler.
     price.fill(command.price)
     price.press("Tab")

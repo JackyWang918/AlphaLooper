@@ -50,8 +50,41 @@ def test_estimate_closed_candles_and_rounding(market, config):
     )
     e = estimate(market, config)
     assert e["center"] == D(10)
-    assert e["buy"] == D("9.95") and e["sell"] == D("10.05")
+    assert e["median_range"] == D("0.4")
+    assert e["range_volatility"] == D("0.20")
+    assert e["volatility"] == D("0.20")
+    assert e["buy"] == D("9.90") and e["sell"] == D("10.10")
     assert e["quantity"] * e["buy"] * (1 + D("0.001")) <= 50
+
+
+def test_typical_range_catches_intrabar_moves_and_resists_one_wick(market, config):
+    for candle in market.candles:
+        candle.open = candle.close = D(10)
+        candle.high = D("10.2")
+        candle.low = D("9.8")
+    market.candles[0].high = D(20)  # One extreme wick must not own the model.
+
+    result = estimate(market, config)
+
+    assert result["close_volatility"] == 0
+    assert result["median_range"] == D("0.4")
+    assert result["range_volatility"] == D("0.20")
+    assert result["volatility"] == D("0.20")
+    assert result["buy"] == D("9.90")
+    assert result["sell"] == D("10.10")
+
+
+def test_close_volatility_wins_when_larger_than_weighted_range(market, config):
+    for index, candle in enumerate(market.candles):
+        candle.close = D(8 + index * 2)
+        candle.open = candle.close
+        candle.high = candle.close + D("0.01")
+        candle.low = candle.close - D("0.01")
+
+    result = estimate(market, config)
+
+    assert result["close_volatility"] > result["range_volatility"]
+    assert result["volatility"] == result["close_volatility"]
 
 
 def test_bad_candles_and_stale_book(market, config):
@@ -124,7 +157,7 @@ def test_normal_sell_uses_model_and_valuation_includes_fees(market, config):
     s.cost = D(49)
     s.order = None
     result = advance(s, event(), market, config)
-    assert result.order.price == D("10.05")
+    assert result.order.price == D("10.10")
     s.cost = D(50)
     assert exposure(s, market, config)["loss"] == D("0.5495")
     s.proceeds = D(20)
@@ -201,7 +234,7 @@ def test_market_client_never_requests_depth(market, monkeypatch):
 
 def test_duplicate_and_invalid_fills(market, config):
     s = advance(State(), event(), market, config)
-    fill = event("fill", quantity="1", price="9.95")
+    fill = event("fill", quantity="1", price=str(s.order.price))
     s = advance(s, fill, market, config)
     assert advance(s, fill, market, config) == s
     with pytest.raises(ValueError):
@@ -284,7 +317,9 @@ def test_api_prices_remain_decimal_strings(market, config, monkeypatch):
             },
         )
         assert result.status_code == 200
-        assert result.json()["estimate"]["buy"] == "9.95"
+        assert result.json()["estimate"]["buy"] == "9.90"
+        assert result.json()["estimate"]["median_range"] == "0.4"
+        assert result.json()["estimate"]["range_volatility"] == "0.20"
         result = client.post(
             "/api/research/simulate",
             headers=headers,
@@ -296,5 +331,5 @@ def test_api_prices_remain_decimal_strings(market, config, monkeypatch):
             },
         )
         assert result.status_code == 200
-        assert result.json()["state"]["order"]["price"] == "9.95"
+        assert result.json()["state"]["order"]["price"] == "9.90"
         assert app.state.browser._process is None

@@ -195,12 +195,12 @@ def test_small_partial_buys_accumulate_and_only_top_up_remaining(rig):
     assert r.browser.calls.count("live_cancel") == 1
     t = reconciled(r, 15)
     assert t["pending"]["side"] == "buy" and D(t["pending"]["quote_amount"]) == D(
-        "40.05"
+        "40.10"
     )
     assert t["buy_rehangs"] == 1 and t["round_start_quote"] == "100"
     r.browser.finish("2")
     t = reconciled(r)
-    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("29.85")
+    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("29.70")
     assert t["first_buy_at"] == first
 
 
@@ -240,12 +240,12 @@ def test_ten_rehangs_excludes_initial_and_is_bounded_after_resume(rig):
 def test_stop_denominator_is_start_cash_and_includes_locked_assets(rig):
     r = rig
     tick(r)
-    r.browser.partial("3")  # 29.85 bought, remainder locked
+    r.browser.partial("3")  # 29.70 bought, remainder locked
     t = tick(r, 60)
     assert not t["exiting"]
     assert t["risk"]["denominator"] == "100"
-    assert D(t["risk"]["equity"]) == D("99.85")
-    # 2 U exactly is 2% of the initial 100 U, regardless of the 29.85 invested.
+    assert D(t["risk"]["equity"]) == D("100.00")
+    # 2 U exactly is 2% of the initial 100 U, regardless of the 29.70 invested.
     risk = r.auto.risk(t, {"quote_total": "70", "base_total": "3"}, D(28) / 3)
     assert D(risk["loss_pct"]) == 2
 
