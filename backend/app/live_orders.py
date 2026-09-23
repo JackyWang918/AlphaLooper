@@ -12,6 +12,7 @@ from sqlalchemy import Column, Integer, String, Table, Text, select
 
 from app.browser.schemas import FillForm
 from app.database import Base
+from app.limits import MAX_BUY_QUOTE_AMOUNT
 
 intents = Table(
     "live_orders",
@@ -141,8 +142,10 @@ class LiveOrders:
                     if body.quote_amount
                     else Decimal(body.price) * Decimal(body.quantity)
                 )
-                if body.side == "buy" and total > Decimal(50):
-                    raise ValueError("单笔计划买入金额不得超过 50 U。")
+                if body.side == "buy" and total > MAX_BUY_QUOTE_AMOUNT:
+                    raise ValueError(
+                        f"单笔计划买入金额不得超过 {MAX_BUY_QUOTE_AMOUNT} U。"
+                    )
             record = {
                 "id": id,
                 "request": payload,

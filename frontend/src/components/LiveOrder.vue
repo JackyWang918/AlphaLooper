@@ -10,6 +10,7 @@ const confirmedNotSubmitted=ref(false)
 const current=ref<Intent|null>(null),recent=ref<Intent[]>([])
 watch(()=>current.value?.id,()=>{confirmedNotSubmitted.value=false})
 const side=ref('buy'),price=ref(''),quantity=ref('')
+const MAX_BUY_AMOUNT=2000n
 const book=ref(localStorage.getItem('account-book')||'本机账户')
 function decimalParts(value:string) {
   if(value.length>40||!/^\d+(?:\.\d+)?$/.test(value)) return null
@@ -21,8 +22,8 @@ const inputProblem=computed(()=>{
   const p=decimalParts(price.value),q=decimalParts(quantity.value)
   if(!p) return '请输入大于零的价格。'
   if(side.value==='buy'&&!q) return '请输入大于零的买入总金额。'
-  if(side.value==='buy'&&q&&q.units>50n*q.scale)
-    return '本笔计划买入金额超过 50 U 上限。'
+  if(side.value==='buy'&&q&&q.units>MAX_BUY_AMOUNT*q.scale)
+    return '本笔计划买入金额超过 2000 U 上限。'
   return ''
 })
 const blockedReason=computed(()=>{
@@ -89,7 +90,7 @@ onUnmounted(()=>clearInterval(timer))
 <template>
 <section>
   <div class="section-title"><h2>04 / 实盘单笔下单</h2><span class="badge">{{enabled?'已开启':'默认关闭'}}</span></div>
-  <p>此入口会真实提交一笔限价单。由你开启并点击提交后执行；程序填写后会核对平台订单确认单，并自动点击一次“继续”。计划买入金额上限 50 U。不会自动开启下一笔，也尚未接入自动撤单和策略循环。</p>
+  <p>此入口会真实提交一笔限价单。由你开启并点击提交后执行；程序填写后会核对平台订单确认单，并自动点击一次“继续”。计划买入金额上限 2000 U。不会自动开启下一笔，也尚未接入自动撤单和策略循环。</p>
   <button class="secondary" :disabled="busy" @click="toggle">{{enabled?'关闭新单提交':'开启实盘单笔下单'}}</button>
   <p class="muted">关闭仅阻止新单，不撤销平台挂单。已有委托由后端每 60 秒巡检，刷新控制台不会重复下单；后端重启后新单开关关闭，继续核对未结束记录。</p>
   <p role="status">受控浏览器：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported && symbol && quote">{{symbol}} / {{quote}}</span><span v-else>未识别</span></p>

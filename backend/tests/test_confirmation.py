@@ -76,9 +76,14 @@ def test_mismatched_or_ambiguous_confirmation_is_rejected(old, new):
 
 
 def test_buy_budget_uses_displayed_fee():
-    text = TEXT.replace("0.90000000", "49.99").replace("0.0001 DGAI", "0.02 USDT")
-    with pytest.raises(ValueError, match="50 U"):
-        validate_confirmation(text, FillForm(**{**PAYLOAD, "price": "49.99"}))
+    boundary = TEXT.replace("0.90000000", "1999.99").replace(
+        "0.0001 DGAI", "0.01 USDT"
+    )
+    command = FillForm(**{**PAYLOAD, "price": "1999.99"})
+    assert validate_confirmation(boundary, command)["gross"] == "1999.99"
+    text = boundary.replace("0.01 USDT", "0.02 USDT")
+    with pytest.raises(ValueError, match="2000 U"):
+        validate_confirmation(text, command)
 
 
 def test_grouped_numbers_and_sell_are_supported():

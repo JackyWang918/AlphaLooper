@@ -18,6 +18,7 @@ from sqlalchemy import Column, Integer, String, Table, Text, select
 from app import decision_log
 from app.browser.schemas import TradingAccount, token_identity
 from app.database import Base
+from app.limits import MAX_BUY_QUOTE_AMOUNT
 from app.live_orders import (
     BACKGROUND_TICK_SECONDS,
     CANCEL_CONFIRM_TIMEOUT_SECONDS,
@@ -39,7 +40,7 @@ tasks = Table(
 
 class LiveConfig(Config):
     buy_check_seconds: int = Field(default=20, ge=5, le=300, multiple_of=5)
-    amount: D = Field(default=D(50), gt=0, le=50)
+    amount: D = Field(default=D(50), gt=0, le=MAX_BUY_QUOTE_AMOUNT)
     budget: D = Field(default=D(10), gt=0, le=10)
     fee_bps: D = Field(default=D(1), ge=1, le=1)
     stop_pct: D = Field(default=D(2), ge=2, le=2)

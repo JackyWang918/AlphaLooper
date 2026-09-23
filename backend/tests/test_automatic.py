@@ -502,6 +502,17 @@ def test_new_task_buy_estimate_interval_defaults_to_twenty_seconds():
     assert body.config.buy_check_seconds == 20
 
 
+def test_live_task_accepts_2000_u_but_rejects_more():
+    payload = {
+        "request_id": uuid4(),
+        "url": "https://www.binance.com/zh-CN/alpha/bsc/0x1",
+        "expected_symbol": "TEST",
+    }
+    assert StartTask(**payload, config={"amount": "2000"}).config.amount == D(2000)
+    with pytest.raises(ValueError):
+        StartTask(**payload, config={"amount": "2000.01"})
+
+
 def test_status_explains_next_scheduler_action(rig):
     r = rig
     tick(r)
@@ -604,7 +615,11 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
         assert (
             client.post(
                 "/api/automatic/start",
-                json={**body, "request_id": str(uuid4()), "config": {"amount": "51"}},
+                json={
+                    **body,
+                    "request_id": str(uuid4()),
+                    "config": {"amount": "2000.01"},
+                },
                 headers=headers,
             ).status_code
             == 422

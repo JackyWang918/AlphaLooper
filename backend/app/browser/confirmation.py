@@ -7,6 +7,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, localcontext
 from playwright.sync_api import expect
 
 from app.browser.alpha import TABS, verify_identity
+from app.limits import MAX_BUY_QUOTE_AMOUNT
 
 MODALS = '[role="dialog"], [aria-modal="true"], .bn-modal'
 NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
@@ -84,8 +85,11 @@ def validate_confirmation(text, command):
         fee_value, fee_currency = fee_text.split()
         fee = Decimal(fee_value.replace(",", ""))
         quote_fee = fee if fee_currency == command.expected_quote else fee * price
-        if command.side == "buy" and gross + quote_fee > Decimal(50):
-            raise ValueError("确认弹窗金额含预计手续费超过 50 U，未点击继续。")
+        if command.side == "buy" and gross + quote_fee > MAX_BUY_QUOTE_AMOUNT:
+            raise ValueError(
+                "确认弹窗金额含预计手续费超过 "
+                f"{MAX_BUY_QUOTE_AMOUNT} U，未点击继续。"
+            )
     return {
         "price": str(price),
         "quantity": str(quantity),

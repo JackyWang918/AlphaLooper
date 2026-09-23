@@ -62,9 +62,23 @@ def test_disabled_and_budget_no_browser(service):
     with pytest.raises(ValueError, match="开启"):
         service.submit(request())
     service.enabled = True
-    with pytest.raises(ValueError, match="50"):
-        service.submit(SubmitOrder(**PAYLOAD, request_id=uuid4(), quote_amount="51"))
+    with pytest.raises(ValueError, match="2000"):
+        service.submit(
+            SubmitOrder(**PAYLOAD, request_id=uuid4(), quote_amount="2000.01")
+        )
     service.browser.execute.assert_not_called()
+
+
+def test_2000_u_buy_reaches_browser(service):
+    service.browser.execute.side_effect = [
+        {"ok": True, "balances": wallet("3000")},
+        {"ok": True, "confirmation_clicked": True},
+    ]
+    result = service.submit(
+        SubmitOrder(**PAYLOAD, request_id=uuid4(), quote_amount="2000")
+    )
+    assert result["state"] == "waiting"
+    assert result["quote_amount"] == "2000"
 
 
 def test_dedup_single_active_and_stable_balance_settlement(service):

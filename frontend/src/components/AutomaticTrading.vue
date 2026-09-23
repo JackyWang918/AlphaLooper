@@ -7,6 +7,19 @@ type Task = {accounting_version?:number;round_start_quote?:string|null;round_pla
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
+const MAX_BUY_AMOUNT=2000n
+function positiveDecimal(value:string){
+  if(value.length>40||!/^\d+(?:\.\d+)?$/.test(value))return null
+  const [whole,fraction='']=value.split('.')
+  const units=BigInt(whole+fraction)
+  return units>0n?{units,scale:10n**BigInt(fraction.length)}:null
+}
+const amountProblem=computed(()=>{
+  const parsed=positiveDecimal(amount.value)
+  if(!parsed)return '请输入大于 0 的每轮计划买入金额。'
+  if(parsed.units>MAX_BUY_AMOUNT*parsed.scale)return '每轮计划买入金额不能超过 2000 U。'
+  return ''
+})
 const blockedReason=computed(()=>{
   if(busy.value)return '正在处理，请稍候。'
   if(props.browserBusy)return '正在识别交易页面，请稍候。'
@@ -15,6 +28,8 @@ const blockedReason=computed(()=>{
   if(!props.connected)return '尚未连接受控 Chrome。请先在“01 / 浏览器连接”启动 Chrome，再点击这里的“重新识别交易页面”。'
   if(!props.fillSupported||!props.symbol||!props.quote)return '尚未识别交易表单。请在受控 Chrome 打开目标币种、完成登录和平台提示，再点击“重新识别交易页面”。'
   if(!props.url.trim())return '请先填写目标币种的交易链接。'
+  if(!book.value.trim())return '请填写账本名称。'
+  if(amountProblem.value)return amountProblem.value
   return ''
 })
 const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),buyCheckSeconds=ref(20)
@@ -36,8 +51,25 @@ let requestId=localStorage.getItem('automatic-request-id')||crypto.randomUUID()
 localStorage.setItem('automatic-request-id',requestId)
 async function api(path:string,body?:unknown){
   const res=await fetch(`/api/automatic${path}`,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json','X-AlphaLooper-Client':'local-ui'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(120000)})
-  const value=await res.json()
-  if(!res.ok)throw new Error(typeof value.detail==='string'?value.detail:'请检查参数及后端迁移。')
+  const value=await res.json().catch(()=>null)
+  if(!res.ok){
+    if(typeof value?.detail==='string')throw new Error(value.detail)
+    if(Array.isArray(value?.detail)){
+      const labels:Record<string,string>={amount:'每轮计划买入金额',target_points:'本任务目标积分',current_points:'启动时已有积分',window:'K 线窗口',buy_offset:'买入波动偏移系数',sell_offset:'卖出波动偏移系数',buy_check_seconds:'空仓再次评估等待',book:'账本',url:'交易链接',expected_symbol:'交易币种',expected_quote:'计价币'}
+      const messages=value.detail.map((item:{loc?:unknown[];type?:string;msg?:string;ctx?:Record<string,unknown>})=>{
+        const field=String(item.loc?.at(-1)??'请求参数'),label=labels[field]??field,ctx=item.ctx??{}
+        if(item.type==='less_than_equal')return `${label}不能超过 ${ctx.le}。`
+        if(item.type==='greater_than')return `${label}必须大于 ${ctx.gt}。`
+        if(item.type==='greater_than_equal')return `${label}不能小于 ${ctx.ge}。`
+        if(item.type==='multiple_of')return `${label}必须是 ${ctx.multiple_of} 的倍数。`
+        const original=(item.msg??'').replace(/^Value error,\s*/,'')
+        if(/[\u3400-\u9fff]/.test(original))return original
+        return `${label}格式或取值无效。`
+      })
+      throw new Error(messages.join(' '))
+    }
+    throw new Error(`请求失败（HTTP ${res.status}），后端没有返回可读的错误原因。请查看后端终端日志。`)
+  }
   return value
 }
 function refresh():Promise<void>{
@@ -110,7 +142,7 @@ onUnmounted(()=>clearInterval(timer))
   <fieldset :disabled="busy||!!current">
     <div class="fields">
       <label>账本<input v-model="book" /></label>
-      <label>每轮计划买入金额（最多 50 U）<input v-model="amount" inputmode="decimal" /></label>
+      <label>每轮计划买入金额（最多 2,000 U）<input v-model="amount" inputmode="decimal" /></label>
       <label>本任务目标积分（最多 32,768）<input v-model="target" inputmode="decimal" /></label>
       <label>启动时已有积分<input v-model="currentPoints" inputmode="decimal" /></label>
     </div>
