@@ -18,7 +18,13 @@ from sqlalchemy import Column, Integer, String, Table, Text, select
 from app import decision_log
 from app.browser.schemas import TradingAccount, token_identity
 from app.database import Base
-from app.live_orders import SubmitOrder
+from app.live_orders import (
+    BACKGROUND_TICK_SECONDS,
+    CANCEL_CONFIRM_TIMEOUT_SECONDS,
+    ORDER_POLL_SECONDS,
+    SETTLEMENT_POLL_SECONDS,
+    SubmitOrder,
+)
 from app.market import MarketClient, validate_snapshot
 from app.strategy import Config, align, estimate, reference_price
 
@@ -125,6 +131,7 @@ class Automatic:
             ]
             records.sort(key=lambda t: t["created_at"], reverse=True)
             current = next((t for t in records if t["active"]), None)
+            record = None
             if current and current.get("pending"):
                 record = self.live.get(current["pending"]["request_id"])
                 if record:
@@ -134,7 +141,118 @@ class Automatic:
                         "message": record["message"],
                         "submission_error": record.get("submission_error"),
                     }
+            if current:
+                current = dict(current)
+                current["schedule"] = self.next_action(current, record)
             return {"running": self.running, "current": current, "recent": records[:10]}
+
+    def next_action(self, task, record=None):
+        """Describe the next meaningful scheduler action for the control panel."""
+        now = self.clock()
+        if record is None and task.get("pending"):
+            record = self.live.get(task["pending"]["request_id"])
+        if not self.running:
+            if record and record.get("active"):
+                interval = (
+                    SETTLEMENT_POLL_SECONDS
+                    if record.get("state") == "settling"
+                    else (
+                        task["request"]["config"].get("exit_seconds", 15)
+                        if task.get("exiting")
+                        or record.get("cancel_requested_at")
+                        or record.get("cancel_retry_after")
+                        else ORDER_POLL_SECONDS
+                    )
+                )
+                checked_at = record.get("checked_at")
+                return {
+                    "kind": "read_only_check",
+                    "at": max(now, checked_at + interval) if checked_at else now,
+                    "reason": "任务已暂停；只读核对已有委托和余额，不撤单、不下单。",
+                }
+            return {
+                "kind": "manual",
+                "at": None,
+                "reason": "等待人工恢复任务；当前不会自动交易。",
+            }
+        if record and record.get("state") == "submission_unknown":
+            return {
+                "kind": "manual",
+                "at": None,
+                "reason": "订单提交结果未知，等待人工核对，不会自动重发。",
+            }
+        if record and record.get("active"):
+            if record.get("cancel_retry_after"):
+                return {
+                    "kind": "cancel_retry",
+                    "at": record["cancel_retry_after"],
+                    "reason": "重新识别撤单控件；此前已确认没有点击。",
+                }
+            if record.get("cancel_requested_at"):
+                return {
+                    "kind": "cancel_check",
+                    "at": max(
+                        now,
+                        record.get("cancel_check_after", now),
+                        record.get("checked_at", now)
+                        + task["request"]["config"].get("exit_seconds", 15),
+                    ),
+                    "reason": "核对撤单结果、当前委托和余额；两分钟不明确则暂停。",
+                }
+            if record.get("state") == "settling":
+                return {
+                    "kind": "settlement_check",
+                    "at": max(
+                        now,
+                        record.get("checked_at", now) + SETTLEMENT_POLL_SECONDS,
+                    ),
+                    "reason": "等待页面、委托状态和余额稳定。",
+                }
+            config = LiveConfig(**task["request"]["config"])
+            timeout = (
+                config.exit_seconds
+                if task.get("exiting") and record["request"]["side"] == "sell"
+                else config.wait_seconds
+            )
+            candidates = [
+                (
+                    record["created_at"] + timeout,
+                    "order_timeout",
+                    "主动退出卖单到时后撤单重估。"
+                    if timeout == config.exit_seconds
+                    else "普通挂单到达五分钟后撤单核对。",
+                )
+            ]
+            if task.get("round_start_quote") is not None:
+                candidates.append(
+                    (
+                        (task["last_minute"] + 1) * 60,
+                        "minute_check",
+                        "跨过下一分钟后巡检订单并检查资产损耗。",
+                    )
+                )
+            if task.get("first_buy_at") is not None:
+                candidates.append(
+                    (
+                        task["first_buy_at"] + config.max_hold_seconds,
+                        "hold_timeout",
+                        "持仓达到三十分钟后进入主动退出。",
+                    )
+                )
+            at, kind, reason = min(candidates, key=lambda item: item[0])
+            return {"kind": kind, "at": max(now, at), "reason": reason}
+        next_buy = task.get("next_buy_check_at", 0)
+        if next_buy > now:
+            return {
+                "kind": "empty_evaluation",
+                "at": next_buy,
+                "reason": "空仓等待结束后重新获取 K 线并评估买入。",
+            }
+        return {
+            "kind": "scheduler_tick",
+            "at": now + BACKGROUND_TICK_SECONDS,
+            "reason": "下一个后台心跳将核对状态并继续当前阶段。",
+        }
 
     def create(self, body: StartTask):
         with self.live.lock:
@@ -363,7 +481,7 @@ class Automatic:
             {"request_id": record["id"], "result": result},
         )
 
-    def settle(self, t, price):
+    def settle(self, t, price, next_buy_check_at):
         if t["round_stage"] != "sell" or t["pending"]:
             return False
         residual = D(t["balances"]["base_available"]) * price
@@ -392,6 +510,7 @@ class Automatic:
             buy_attempts=0,
             buy_rehangs=0,
             risk=None,
+            next_buy_check_at=next_buy_check_at,
         )
         self.save(
             t,
@@ -450,14 +569,14 @@ class Automatic:
         polled = False
         if record and record["active"]:
             interval = (
-                5
+                SETTLEMENT_POLL_SECONDS
                 if record["state"] == "settling"
                 else (
                     c.exit_seconds
                     if record.get("cancel_requested_at")
                     or record.get("cancel_retry_after")
                     or t["exiting"]
-                    else 60
+                    else ORDER_POLL_SECONDS
                 )
             )
             if now - self.last_poll >= interval or (self.running and minute_due):
@@ -601,7 +720,8 @@ class Automatic:
             if record.get("cancel_requested_at"):
                 self.save(t)
                 if record.get("cancel_error") or now >= record.get(
-                    "cancel_timeout_at", record["cancel_requested_at"] + 120
+                    "cancel_timeout_at",
+                    record["cancel_requested_at"] + CANCEL_CONFIRM_TIMEOUT_SECONDS,
                 ):
                     raise ValueError("撤单尚未确认，不重复撤单或重挂；请核对平台。")
                 return
@@ -665,7 +785,7 @@ class Automatic:
         if t["exiting"] and t["round_start_quote"] is not None:
             t["round_stage"] = "sell"
             t.setdefault("buy_end_quote", wallet["quote_available"])
-        if self.settle(t, price_ref):
+        if self.settle(t, price_ref, now + c.buy_check_seconds):
             # Do not place the next round in the same tick as settlement.
             return
         if t["round_stage"] in {"idle", "buy"}:
@@ -731,6 +851,7 @@ class Automatic:
         t.update(
             pending=pending,
             pending_exit=t["exiting"],
+            next_buy_check_at=0,
             message=f"自动{side}：{body.price}",
         )
         self.save(

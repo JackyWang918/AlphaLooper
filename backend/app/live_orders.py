@@ -21,9 +21,14 @@ intents = Table(
     Column("payload", Text, nullable=False),
 )
 
+BACKGROUND_TICK_SECONDS = 5
+ORDER_POLL_SECONDS = 60
+SETTLEMENT_POLL_SECONDS = 5
 PAGE_LOADING_TIMEOUT_SECONDS = 60
 MAX_CANCEL_DISCOVERY_ATTEMPTS = 10
 CANCEL_DISCOVERY_RETRY_SECONDS = 15
+CANCEL_POST_CONFIRM_DELAY_SECONDS = 10
+CANCEL_CONFIRM_TIMEOUT_SECONDS = 120
 LEGACY_SAFE_CANCEL_ERRORS = {
     "未找到当前委托区域唯一的“全部取消”控件，未点击。",
 }
@@ -62,12 +67,14 @@ class LiveOrders:
 
     def _loop(self):
         last_check = 0
-        while not self.stop.wait(5):
+        while not self.stop.wait(BACKGROUND_TICK_SECONDS):
             try:
                 if self.automatic and self.automatic.get():
                     self.automatic.tick()
                 elif time.time() - last_check >= (
-                    5 if self.get() and self.get()["state"] == "settling" else 60
+                    SETTLEMENT_POLL_SECONDS
+                    if self.get() and self.get()["state"] == "settling"
+                    else ORDER_POLL_SECONDS
                 ):
                     last_check = time.time()
                     self.check()
@@ -457,8 +464,9 @@ class LiveOrders:
                     cancel_state="confirmed",
                     cancel_result=result,
                     cancel_confirmed_at=confirmed_at,
-                    cancel_check_after=confirmed_at + 10,
-                    cancel_timeout_at=confirmed_at + 120,
+                    cancel_check_after=confirmed_at
+                    + CANCEL_POST_CONFIRM_DELAY_SECONDS,
+                    cancel_timeout_at=confirmed_at + CANCEL_CONFIRM_TIMEOUT_SECONDS,
                     cancel_refresh_pending=True,
                     message="已确认取消全部订单；等待后刷新页面并核对委托与余额。",
                 )

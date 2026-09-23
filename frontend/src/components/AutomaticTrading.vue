@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[];openTaskPage:[url:string]}>()
-type Task = {accounting_version?:number;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; current_points?:string; points_per_u?:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;best_bid?:string;best_ask?:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
+type Task = {accounting_version?:number;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; current_points?:string; points_per_u?:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; schedule?:{kind:string;at:number|null;reason:string}; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -23,6 +23,11 @@ const requiredPoints=computed(()=>{
   return Number.isFinite(goal)&&Number.isFinite(existing)&&existing<=goal?goal-existing:null
 })
 function fmtPoints(value:number){return Number.isFinite(value)?value.toLocaleString('zh-CN',{maximumFractionDigits:8}):'—'}
+function fmtNextAction(task:Task){
+  if(!task.schedule?.at)return '等待人工操作'
+  const seconds=Math.max(0,Math.ceil(task.schedule.at-Date.now()/1000))
+  return `${new Date(task.schedule.at*1000).toLocaleTimeString()}（约 ${seconds} 秒后）`
+}
 function earnedPoints(task:Task){return Number(task.buy_total)*Number(task.request.config.points_per_u??4)}
 function totalPoints(task:Task){return Number(task.request.config.current_points??0)+earnedPoints(task)}
 let timer:ReturnType<typeof setInterval>|undefined
@@ -114,9 +119,9 @@ onUnmounted(()=>clearInterval(timer))
       <label>1 分钟 K 线窗口<input v-model.number="windowSize" type="number" min="3" max="240" /></label>
       <label>买入波动偏移系数<input v-model="buyOffset" inputmode="decimal" /></label>
       <label>卖出波动偏移系数<input v-model="sellOffset" inputmode="decimal" /></label>
-      <label>等待买入时的估价间隔（秒）<input v-model.number="buyCheckSeconds" type="number" min="5" max="300" step="5" /></label>
-    </div><p class="muted">默认 15 根 K 线、偏移各 0.5。主动退出采用最新已收盘一分钟 K 线收盘价，每 15 秒尝试撤单核对后重估。参数效果尚未验证。</p></details>
-    <p class="muted">估价间隔可设为 5–300 秒（5 秒的倍数），60 表示约一分钟；仅用于空仓等待买入，不改变每分钟订单巡检、损耗检查或退出规则。网络和页面处理会增加实际间隔。启动后参数固定。</p>
+      <label>空仓再次评估等待（秒）<input v-model.number="buyCheckSeconds" type="number" min="5" max="300" step="5" /></label>
+    </div><p class="muted">默认 15 根 K 线、偏移各 0.5。空仓等待默认 20 秒；主动退出使用最新已收盘一分钟 K 线收盘价。参数效果尚未验证。</p></details>
+    <p class="muted">空仓等待可设为 5–300 秒（5 秒的倍数），用于一轮结束后或策略明确暂不买入后的下一次评估。首次启动仍立即评估；它不改变订单巡检、损耗检查或退出规则。</p>
     <button :disabled="!!blockedReason" :title="blockedReason" @click="start">{{busy?'正在处理…':'启动自动实盘买卖'}}</button>
   </fieldset>
   <p v-if="blockedReason" class="notice" role="status">暂不能启动：{{blockedReason}}</p>
@@ -125,10 +130,20 @@ onUnmounted(()=>clearInterval(timer))
   <p v-if="error" class="notice error" role="alert">{{error}}</p>
   <div v-if="current">
     <p class="notice" role="status">{{current.request.expected_symbol}} / {{current.request.expected_quote}}：{{current.message}}</p>
-    <p>本任务等待买入估价间隔：{{current.request.config.buy_check_seconds??5}} 秒。<span v-if="current.market_at">最近行情：{{new Date(current.market_at).toLocaleTimeString()}}。</span></p>
+    <div class="notice">
+      <strong>下一动作：{{fmtNextAction(current)}}</strong>
+      <p>{{current.schedule?.reason??'正在读取调度状态。'}}</p>
+    </div>
+    <details><summary>固定调度规则</summary><ul>
+      <li>后台每 5 秒检查一次是否有到期动作。</li>
+      <li>普通挂单最多 5 分钟；跨过每个自然分钟后巡检订单并检查资产损耗。</li>
+      <li>持仓满 30 分钟进入主动退出；主动退出卖单每 15 秒撤单核对后重估。</li>
+      <li>任务暂停时只读核对已有订单，不提交、不撤单。</li>
+    </ul></details>
+    <p>本任务空仓再次评估等待：{{current.request.config.buy_check_seconds??20}} 秒。<span v-if="current.market_at">最近行情：{{new Date(current.market_at).toLocaleTimeString()}}。</span></p>
     <div v-if="current.estimate&&!current.pending&&current.inventory==='0'">
       <p>上次买入评估：建议买价 {{current.estimate.buy}}</p>
-      <ul><li v-for="reason in (current.estimate.buy_blockers??current.estimate.warnings?.filter(w=>w.includes('暂停模拟新买入')||w.includes('历史买价已触及卖一'))??[])" :key="reason">{{reason}}</li></ul>
+      <ul><li v-for="reason in (current.estimate.buy_blockers??[])" :key="reason">{{reason}}</li></ul>
     </div>
     <p v-if="!running" class="muted">当前不会自动提交或撤单。处理提示后点击“核对后恢复任务”；后端重启也需要手动恢复。</p>
     <div v-if="!running" class="actions">

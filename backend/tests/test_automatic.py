@@ -175,9 +175,14 @@ def test_full_cash_cycle_and_no_double_count(rig):
     assert t["rounds"] == 1 and t["pending"] is None
     assert D(t["realized_pnl"]) == r.browser.cash - 100
     assert t["buy_total"] == bought
+    assert t["next_buy_check_at"] == r.now[0] + 20
     tick(r)
-    assert r.browser.calls.count("live_submit") == 3
+    assert r.browser.calls.count("live_submit") == 2
     tick(r, 5)
+    assert r.browser.calls.count("live_submit") == 2
+    tick(r, 14)
+    assert r.browser.calls.count("live_submit") == 2
+    tick(r, 1)
     assert r.browser.calls.count("live_submit") == 3
 
 
@@ -495,6 +500,19 @@ def test_new_task_buy_estimate_interval_defaults_to_twenty_seconds():
         expected_symbol="TEST",
     )
     assert body.config.buy_check_seconds == 20
+
+
+def test_status_explains_next_scheduler_action(rig):
+    r = rig
+    tick(r)
+    status = r.auto.status()
+    assert status["current"]["schedule"]["kind"] == "minute_check"
+    assert "损耗" in status["current"]["schedule"]["reason"]
+
+    r.auto.control(r.body.request_id, "pause")
+    status = r.auto.status()
+    assert status["current"]["schedule"]["kind"] == "read_only_check"
+    assert "不撤单、不下单" in status["current"]["schedule"]["reason"]
 
 
 def test_legacy_cannot_resume_but_can_retire_without_fake_balances(rig):
