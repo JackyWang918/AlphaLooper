@@ -144,6 +144,24 @@ class Automatic:
                     }
             if current:
                 current = dict(current)
+                if current.get("task_start_quote") is None:
+                    payload = c.execute(
+                        select(decision_log.decisions.c.payload)
+                        .where(
+                            decision_log.decisions.c.task_id == current["id"],
+                            decision_log.decisions.c.kind == "control",
+                        )
+                        .order_by(decision_log.decisions.c.id.asc())
+                        .limit(1)
+                    ).scalar_one_or_none()
+                    if payload:
+                        starting_balances = (
+                            json.loads(payload).get("state", {}).get("balances")
+                        )
+                        if starting_balances:
+                            current["task_start_quote"] = starting_balances.get(
+                                "quote_available"
+                            )
                 current["schedule"] = self.next_action(current, record)
             return {"running": self.running, "current": current, "recent": records[:10]}
 
@@ -278,6 +296,7 @@ class Automatic:
                 "message": "自动任务已启动，等待最新行情。",
                 "accounting_version": 2,
                 "balances": balances,
+                "task_start_quote": balances["quote_available"],
                 "round_start_quote": None,
                 "round_plan": "0",
                 "round_stage": "idle",

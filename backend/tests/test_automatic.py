@@ -515,8 +515,10 @@ def test_live_task_accepts_2000_u_but_rejects_more():
 
 def test_status_explains_next_scheduler_action(rig):
     r = rig
+    assert r.auto.get()["task_start_quote"] == "100"
     tick(r)
     status = r.auto.status()
+    assert status["current"]["task_start_quote"] == "100"
     assert status["current"]["schedule"]["kind"] == "minute_check"
     assert "损耗" in status["current"]["schedule"]["reason"]
 
@@ -524,6 +526,19 @@ def test_status_explains_next_scheduler_action(rig):
     status = r.auto.status()
     assert status["current"]["schedule"]["kind"] == "read_only_check"
     assert "不撤单、不下单" in status["current"]["schedule"]["reason"]
+
+
+def test_status_recovers_task_start_quote_from_initial_decision(rig):
+    r = rig
+    task = r.auto.get()
+    del task["task_start_quote"]
+    task["balances"]["quote_available"] = "75"
+    r.auto.save(task)
+
+    status = r.auto.status()
+
+    assert status["current"]["task_start_quote"] == "100"
+    assert status["current"]["balances"]["quote_available"] == "75"
 
 
 def test_legacy_cannot_resume_but_can_retire_without_fake_balances(rig):
