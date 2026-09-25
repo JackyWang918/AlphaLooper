@@ -143,7 +143,7 @@ onUnmounted(()=>clearInterval(timer))
     <div class="fields">
       <label>账本<input v-model="book" /></label>
       <label>每轮计划买入金额（最多 2,000 U）<input v-model="amount" inputmode="decimal" /></label>
-      <label>本任务目标积分（最多 32,768）<input v-model="target" inputmode="decimal" /></label>
+      <label>本任务目标积分<input v-model="target" inputmode="decimal" /></label>
       <label>启动时已有积分<input v-model="currentPoints" inputmode="decimal" /></label>
     </div>
     <p class="muted">本任务还需新增：{{requiredPoints===null?'请检查积分输入':fmtPoints(requiredPoints)}} 分。启动后已有积分固定，任务只累计实际买入金额 × 4；卖出不计分。</p>

@@ -46,8 +46,8 @@ class LiveConfig(Config):
     stop_pct: D = Field(default=D(2), ge=2, le=2)
     wait_seconds: int = Field(default=300, ge=300, le=300)
     max_hold_seconds: int = Field(default=1800, ge=1800, le=1800)
-    target_points: D = Field(default=D(32768), gt=0, le=32768)
-    current_points: D = Field(default=D(0), ge=0, le=32768)
+    target_points: D = Field(default=D(32768), gt=0)
+    current_points: D = Field(default=D(0), ge=0)
     points_per_u: D = Field(default=D(4), ge=4, le=4)
 
     @model_validator(mode="after")

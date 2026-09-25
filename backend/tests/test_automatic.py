@@ -493,6 +493,17 @@ def test_existing_points_cannot_exceed_target():
         )
 
 
+def test_target_and_existing_points_have_no_fixed_upper_limit():
+    body = StartTask(
+        request_id=uuid4(),
+        url="https://www.binance.com/zh-CN/alpha/bsc/0x1",
+        expected_symbol="TEST",
+        config={"target_points": "1000000", "current_points": "500000"},
+    )
+    assert body.config.target_points == D(1000000)
+    assert body.config.current_points == D(500000)
+
+
 def test_new_task_buy_estimate_interval_defaults_to_twenty_seconds():
     body = StartTask(
         request_id=uuid4(),
