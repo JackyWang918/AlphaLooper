@@ -16,6 +16,7 @@ from app.browser.schemas import FillForm, OpenPage, token_identity
 from app.database import make_engine
 from app.ledger_api import router as ledger_router
 from app.live_orders import LiveOrders, SubmitOrder
+from app.notifications import WeComNotifier
 from app.research_api import router as research_router
 
 
@@ -24,12 +25,22 @@ async def lifespan(app: FastAPI):
     app.state.engine = make_engine()
     app.state.browser = BrowserManager()
     app.state.live = LiveOrders(app.state.engine, app.state.browser)
-    app.state.automatic = Automatic(app.state.engine, app.state.live)
+    app.state.notifier = WeComNotifier.from_env()
+    app.state.automatic = Automatic(
+        app.state.engine, app.state.live, notifier=app.state.notifier
+    )
+    existing = app.state.automatic.get()
+    if existing:
+        app.state.notifier.enqueue_task_stopped(
+            existing,
+            "后端服务已重启；出于安全规则，自动任务保持暂停，等待人工核对后恢复。",
+        )
     app.state.live.start()
     try:
         yield
     finally:
         app.state.live.close()
+        app.state.notifier.close()
         app.state.browser.close()
         app.state.engine.dispose()
 

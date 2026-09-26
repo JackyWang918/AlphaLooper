@@ -132,6 +132,16 @@ uv run --env-file .env uvicorn app.main:app --host 127.0.0.1 --port 18760
 
 `.env` 不提交 Git。仅设置环境变量时，也可使用原有启动命令。行情接口为 `/api/research/preview`，模拟接口为 `/api/research/simulate`。
 
+### 企业微信停止通知
+
+如需在自动任务因异常停止、正常卖完结束或后端重启后保持暂停时收到企业微信机器人消息，在 `backend/.env` 设置机器人 webhook（不要提交真实 key）：
+
+```dotenv
+ALPHALOOPER_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+```
+
+消息包含停止原因、累计买入额、整体盈亏估值、已结束轮次现金盈亏及本地待处理委托状态。发送在独立线程中重试三次，不阻塞交易状态保存；失败只写后端日志，不会恢复或改变任务。用户主动暂停不会发送。进程硬崩溃、断电或完全断网时程序本身无法发出消息，需要外部进程守护才能覆盖。
+
 ## 技术栈
 
 | 部分 | 选型 |

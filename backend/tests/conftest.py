@@ -7,6 +7,12 @@ from app.market import Candle, Snapshot
 from app.strategy import Config
 
 
+@pytest.fixture(autouse=True)
+def disable_wecom_notifications(monkeypatch):
+    """Never let automated tests send messages to a real robot."""
+    monkeypatch.setenv("ALPHALOOPER_WECOM_WEBHOOK_URL", "")
+
+
 @pytest.fixture
 def market():
     now = (int(time.time() * 1000) // 60000) * 60000 + 1000

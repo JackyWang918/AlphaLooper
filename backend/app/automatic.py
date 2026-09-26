@@ -68,9 +68,10 @@ class StartTask(TradingAccount):
 
 
 class Automatic:
-    def __init__(self, engine, live, market=None, clock=time.time):
+    def __init__(self, engine, live, market=None, clock=time.time, notifier=None):
         self.engine, self.live = engine, live
         self.market, self.clock = market or MarketClient(), clock
+        self.notifier = notifier
         self.running = False  # Never restored from disk.
         self.last_poll = 0
         self.evidence = {}
@@ -493,6 +494,12 @@ class Automatic:
         self.running = False
         t.update(phase="attention", message=message)
         self.save(t, "error" if log_event and not repeated else None)
+        if log_event and not repeated:
+            self.notify_stopped(t, message)
+
+    def notify_stopped(self, task, reason):
+        if self.notifier:
+            self.notifier.enqueue_task_stopped(dict(task), reason)
 
     def snapshot(self, t, c):
         r = t["request"]
@@ -871,6 +878,7 @@ class Automatic:
                 )
                 self.running = False
                 self.save(t, "completed")
+                self.notify_stopped(t, t["message"])
                 return
             # Finishing before a new round still liquidates existing holdings.
             t.update(round_start_quote=wallet["quote_available"], round_stage="sell")

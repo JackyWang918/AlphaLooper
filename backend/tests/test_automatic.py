@@ -338,6 +338,29 @@ def test_cancel_timeout_never_replayed(rig):
     assert not r.auto.running and r.browser.calls.count("live_cancel") == 1
 
 
+def test_automatic_error_notifies_once_but_manual_pause_does_not(rig):
+    class Notifier:
+        def __init__(self):
+            self.messages = []
+
+        def enqueue_task_stopped(self, task, reason):
+            self.messages.append((task, reason))
+
+    notifier = Notifier()
+    rig.auto.notifier = notifier
+    task = rig.auto.get()
+
+    rig.auto.pause(task, "页面结构变化")
+    rig.auto.pause(task, "页面结构变化", log_event=False)
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0][1] == "页面结构变化"
+    assert notifier.messages[0][0]["buy_total"] == "0"
+
+    rig.auto.control(rig.body.request_id, "resume")
+    rig.auto.control(rig.body.request_id, "pause")
+    assert len(notifier.messages) == 1
+
+
 def test_cancel_control_not_clicked_is_retried_after_fifteen_seconds(rig):
     r = rig
     tick(r)
