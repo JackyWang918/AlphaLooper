@@ -35,9 +35,16 @@ const browser = ref<BrowserState>({ connected: false, url: '', title: '', fill_s
 const pending = ref(false)
 const message = ref('正在检查本地服务…')
 const failed = ref(false)
-const tradeUrl = ref(localStorage.getItem('alphalooper.trade-url') ?? 'https://www.binance.com/zh-CN/alpha/bsc/0x10d4183389e99233db3cc981c43443ebd28ebd5e')
+const tradeUrl = ref(localStorage.getItem('alphalooper.trade-url')?.trim() ?? '')
 const filled = ref<Filled | null>(null)
 const history = ref<{ time: string; message: string }[]>([])
+
+function rememberTradeUrl(url: string) {
+  const value = url.trim()
+  if (!value) return
+  tradeUrl.value = value
+  localStorage.setItem('alphalooper.trade-url', value)
+}
 
 async function execute(action: 'status' | 'launch' | 'open') {
   if (pending.value) return
@@ -58,7 +65,8 @@ async function execute(action: 'status' | 'launch' | 'open') {
     }
     browser.value = result
     filled.value = result.filled ?? null
-    if (action === 'open') localStorage.setItem('alphalooper.trade-url', tradeUrl.value)
+    if (action === 'open') rememberTradeUrl(tradeUrl.value)
+    else if (result.fill_supported && result.url) rememberTradeUrl(result.url)
     message.value = result.connected
       ? 'Chrome 已连接。请在 Chrome 中手动登录和处理验证。'
       : 'Chrome 尚未启动，点击下方按钮开始。'
@@ -72,7 +80,7 @@ async function execute(action: 'status' | 'launch' | 'open') {
   }
 }
 function openTaskPage(url: string) {
-  tradeUrl.value = url
+  rememberTradeUrl(url)
   void execute('open')
 }
 

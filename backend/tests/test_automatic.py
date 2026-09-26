@@ -237,17 +237,19 @@ def test_ten_rehangs_excludes_initial_and_is_bounded_after_resume(rig):
     assert r.auto.get() is None
 
 
-def test_stop_denominator_is_start_cash_and_includes_locked_assets(rig):
+def test_stop_denominator_is_coin_cost_and_includes_partial_buy(rig):
     r = rig
     tick(r)
     r.browser.partial("3")  # 29.70 bought, remainder locked
     t = tick(r, 60)
     assert not t["exiting"]
-    assert t["risk"]["denominator"] == "100"
+    assert D(t["risk"]["denominator"]) == D("29.70")
     assert D(t["risk"]["equity"]) == D("100.00")
-    # 2 U exactly is 2% of the initial 100 U, regardless of the 29.70 invested.
-    risk = r.auto.risk(t, {"quote_total": "70", "base_total": "3"}, D(28) / 3)
+    risk = r.auto.risk(
+        t, {"quote_total": "70.30", "base_total": "3"}, D("9.702"), r.live.get()
+    )
     assert D(risk["loss_pct"]) == 2
+    assert D(risk["session_loss"]) == D("0.594")
 
 
 def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
@@ -263,7 +265,7 @@ def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
     assert t["exiting"] and r.browser.calls.count("live_cancel") == 1
     t = reconciled(r, 15)
     assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
-    assert D(t["pending"]["price"]) == 8
+    assert D(t["pending"]["price"]) == D("7.60")
 
 
 def test_missing_frozen_is_not_false_loss_or_early_cancel(rig):
@@ -687,3 +689,169 @@ def test_partial_sell_dust_cancels_remaining_order_before_settlement(rig):
     assert r.browser.calls.count("live_cancel") == 1
     t = reconciled(r, 15)
     assert t["rounds"] == 1 and t["pending"] is None
+
+
+def test_large_round_does_not_reserve_future_loss(rig):
+    r = rig
+    task = r.auto.get()
+    task.update(task_start_equity="800", task_start_quote="800", session_loss="2.04")
+    task["request"]["config"]["amount"] = "450"
+    r.auto.save(task)
+    r.browser.cash = D("797.96")
+    task = tick(r)
+    assert r.auto.running and task["pending"]["side"] == "buy"
+    assert D(task["pending"]["quote_amount"]) == 450
+    assert D(task["risk"]["session_loss"]) == D("2.04")
+
+
+@pytest.mark.parametrize("loss,stops", [("10", False), ("10.00001", True)])
+def test_account_budget_strictly_exceeds_ten(rig, loss, stops):
+    r = rig
+    r.browser.cash = D(100) - D(loss)
+    tick(r)
+    task = r.auto.get(str(r.body.request_id))
+    assert task["stop_buying"] is stops
+    assert task["active"] is not stops
+    assert ("live_submit" in r.browser.calls) is not stops
+    if stops:
+        assert "超过 10 U" in task["message"]
+
+
+@pytest.mark.parametrize("price,exits", [("9.702", False), ("9.701", True)])
+def test_coin_stop_strictly_exceeds_two_percent(rig, price, exits):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.market.candles[-1].close = D(price)
+    task = tick(r, 60)
+    assert task["exiting"] is exits
+    assert task["stop_buying"] is False
+    assert (r.browser.calls.count("live_cancel") == 1) is exits
+    assert D(task["risk"]["session_loss"]) < 2
+
+
+def test_profit_offsets_losses_against_fixed_start_equity(rig):
+    r = rig
+    task = r.auto.get()
+    task.update(session_loss="50", realized_pnl="-20")
+    r.auto.save(task)
+    r.browser.cash = D(105)
+    task = tick(r)
+    assert D(task["session_loss"]) == -5 and not task["stop_buying"]
+    assert task["task_start_equity"] == "100"
+    assert task["pending"]["side"] == "buy"
+
+
+def test_partial_sell_profit_does_not_hide_coin_stop(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.browser.partial("1")
+    r.browser.cash += 20
+    r.market.candles[-1].close = D("9.60")
+    task = tick(r, 60)
+    assert D(task["risk"]["session_loss"]) < 0
+    assert D(task["risk"]["unit_cost"]) == D("9.9")
+    assert D(task["risk"]["loss_pct"]) > 2
+    assert task["exiting"] and not task["stop_buying"]
+
+
+def test_budget_exit_cancels_then_sells_and_survives_restart(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.market.candles[-1].close = D("7.50")
+    task = tick(r, 60)
+    assert task["stop_buying"] and task["active"]
+    assert r.browser.calls.count("live_cancel") == 1
+    assert r.browser.calls.count("live_submit") == 2
+    r.auto = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
+    tick(r, 15)
+    assert not r.auto.running and r.browser.calls.count("live_submit") == 2
+    r.auto.control(r.body.request_id, "resume")
+    task = reconciled(r, 5)
+    assert task["task_start_equity"] == "100"
+    assert task["pending"]["side"] == "sell"
+    assert D(task["pending"]["price"]) == D("7.12")
+    r.market.candles[-1].close = D(10)
+    r.browser.finish()
+    reconciled(r, 15)
+    tick(r, 5)
+    task = r.auto.get(str(r.body.request_id))
+    assert task["phase"] == "completed" and task["stop_buying"]
+    assert r.browser.pending is None
+    assert r.browser.calls.count("live_submit") == 3
+
+
+def test_budget_during_partial_buy_cancels_before_exit_sell(rig):
+    r = rig
+    tick(r)
+    r.browser.partial("1")
+    r.browser.cash -= D(9)
+    r.market.candles[-1].close = D(8)
+    task = tick(r, 60)
+    assert task["stop_buying"] and r.browser.pending is None
+    assert r.browser.calls.count("live_submit") == 1
+    task = reconciled(r, 15)
+    assert task["pending"]["side"] == "sell"
+    assert D(task["pending"]["price"]) == D("7.60")
+
+
+def test_exit_requotes_closed_candle_without_compounding_discount(rig):
+    r = rig
+    tick(r)
+    r.browser.finish()
+    reconciled(r)
+    r.auto.control(r.body.request_id, "finish")
+    tick(r)
+    task = reconciled(r, 15)
+    assert D(task["pending"]["price"]) == D("9.40")
+    r.market.candles[-1].close = D("10.13")
+    r.market.candles.append(
+        r.market.candles[-1].model_copy(
+            update={
+                "time": r.market.fetched_at,
+                "close_time": r.market.fetched_at + 59999,
+                "close": D(100),
+            }
+        )
+    )
+    tick(r, 15)
+    assert r.browser.pending is None
+    task = reconciled(r, 15)
+    assert D(task["pending"]["price"]) == D("9.62")
+    assert task["pending"]["sell_all"]
+
+
+def test_start_equity_includes_existing_tokens_and_never_resets(rig):
+    r = rig
+    r.auto.control(r.body.request_id, "force_restart")
+    r.browser.balance = D(2)
+    body = r.body.model_copy(update={"request_id": uuid4()})
+    task = r.auto.create(body)
+    assert D(task["task_start_equity"]) == D("119.8")
+    assert D(task["task_start_price"]) == D("9.9")
+    r.auto.control(body.request_id, "pause")
+    r.browser.cash = D(105)
+    r.auto.control(body.request_id, "resume")
+    task = tick(r)
+    assert D(task["task_start_equity"]) == D("119.8")
+    assert D(task["risk"]["session_loss"]) == -5
+
+
+def test_old_risk_policy_is_not_silently_converted(rig):
+    r = rig
+    task = r.auto.get()
+    del task["risk_policy_version"]
+    del task["task_start_equity"]
+    r.auto.save(task)
+    task = tick(r)
+    assert not r.auto.running and "旧任务" in task["message"]
+    assert "live_submit" not in r.browser.calls
+    with pytest.raises(ValueError, match="旧任务"):
+        r.auto.control(r.body.request_id, "resume")
+    r.auto.control(r.body.request_id, "retire_legacy")
+    assert r.auto.get() is None

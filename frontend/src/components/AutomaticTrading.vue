@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DecisionLog from './DecisionLog.vue'
 const props = defineProps<{url:string; connected:boolean; symbol?:string; quote?:string; fillSupported?:boolean; browserBusy?:boolean; browserReason?:string}>()
 const emit=defineEmits<{refreshBrowser:[];openTaskPage:[url:string]}>()
-type Task = {accounting_version?:number;task_start_quote?:string|null;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; current_points?:string; points_per_u?:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; schedule?:{kind:string;at:number|null;reason:string}; risk:{equity:string|null; loss:string|null;loss_pct:string|null;denominator?:string;reason?:string}|null}
+type Task = {accounting_version?:number;risk_policy_version?:number;task_start_equity?:string;task_start_quote?:string|null;round_start_quote?:string|null;round_plan?:string;buy_rehangs?:number;dust?:string;balances?:{quote_available:string;base_available:string};id:string; active:boolean; phase:string; message:string; request:{url:string;expected_symbol:string; expected_quote:string; config:{target_points:string; current_points?:string; points_per_u?:string; buy_check_seconds?:number}}; inventory:string; cost:string; proceeds:string; buy_total:string; fees:string; realized_pnl:string; session_loss:string; rounds:number; stop_buying:boolean; first_buy_at:number|null; pending:{request_id:string;side:string;price:string;quantity:string;quote_amount?:string}|null; pending_order?:{state:string;message:string;submission_error?:string}; estimate?:{buy:string;buy_blockers?:string[];warnings?:string[]}; market_at?:number; next_buy_check_at?:number; schedule?:{kind:string;at:number|null;reason:string}; risk:{equity:string|null; loss:string|null;loss_pct:string|null;session_loss?:string|null;unit_cost?:string|null;denominator?:string;reason?:string}|null}
 const current=ref<Task|null>(null),recent=ref<Task[]>([]),running=ref(false),busy=ref(false),error=ref('')
 const statusReady=ref(false),statusError=ref(''),notice=ref('')
 const confirmedNotSubmitted=ref(false)
@@ -134,7 +134,7 @@ onUnmounted(()=>clearInterval(timer))
 <section>
   <div class="section-title"><h2>05 / 自动实盘交易</h2><span class="badge">{{running?'自动运行中':current?'已暂停 / 待恢复':'未启动'}}</span></div>
   <p>启动后程序自动估价、买入、卖出并继续下一轮。请先在受控 Chrome 登录、打开目标币种，再刷新浏览器识别结果。</p>
-  <p class="muted">普通挂单等待 5 分钟，首次买入之外最多撤单重挂 10 次；累计投入超过本轮计划金额 50% 后转卖。每分钟检查资产损耗，2% 的分母为本轮买入前总 USDT；持仓满 30 分钟转主动退出。损耗预算 10 U，按任务累计。</p>
+  <p class="muted">普通挂单等待 5 分钟，首次买入之外最多撤单重挂 10 次；累计投入超过本轮计划金额 50% 后转卖。每分钟检查：持币相对买入成本亏损超过 2% 时主动退出；启动总资产减当前 USDT 与持币估值超过 10 U 时，先撤单、卖完后结束。盈利可抵消亏损，不预留下一轮额度。持仓满 30 分钟也转主动退出。</p>
   <p>受控 Chrome：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported&&symbol&&quote">{{symbol}} / {{quote}}</span><span v-else>尚未识别</span></p>
   <p v-if="browserReason&&!fillSupported" class="muted">页面识别反馈：{{browserReason}}</p>
   <button class="secondary" :disabled="busy||browserBusy" @click="emit('refreshBrowser')">{{browserBusy?'正在识别…':'重新识别交易页面'}}</button>
@@ -170,7 +170,7 @@ onUnmounted(()=>clearInterval(timer))
     <details><summary>固定调度规则</summary><ul>
       <li>后台每 5 秒检查一次是否有到期动作。</li>
       <li>普通挂单最多 5 分钟；跨过每个自然分钟后巡检订单并检查资产损耗。</li>
-      <li>持仓满 30 分钟进入主动退出；主动退出卖单每 15 秒撤单核对后重估。</li>
+      <li>持仓满 30 分钟进入主动退出；主动退出按上一根已收盘 1 分钟 K 线收盘价 × 0.95 挂限价卖单，每 15 秒撤单核对后重估。</li>
       <li>任务暂停时只读核对已有订单，不提交、不撤单。</li>
     </ul></details>
     <p>本任务空仓再次评估等待：{{current.request.config.buy_check_seconds??20}} 秒。<span v-if="current.market_at">最近行情：{{new Date(current.market_at).toLocaleTimeString()}}。</span></p>
@@ -186,11 +186,12 @@ onUnmounted(()=>clearInterval(timer))
     <p>已完成 {{current.rounds}} 轮 · 累计买入 {{current.buy_total}} U</p>
     <p>积分进度：启动已有 {{current.request.config.current_points??'0'}} 分 + 本任务预计新增 {{fmtPoints(earnedPoints(current))}} 分 = {{fmtPoints(totalPoints(current))}} / {{current.request.config.target_points}} 分。</p>
     <p>代币余额 {{current.inventory}} · 本轮实际支出 {{current.cost}} U · 本轮卖出收入 {{current.proceeds}} U</p>
-    <p>已结束轮次现金盈亏 {{current.realized_pnl}} U · 累计亏损轮次损耗 {{current.session_loss}} / 10 U（余额差不重复扣手续费）</p>
+    <p>已结束轮次现金盈亏 {{current.realized_pnl}} U（余额差不重复扣手续费）</p>
+    <p v-if="current.risk_policy_version===3">启动总资产：{{current.task_start_equity}} U；最近核对的净资产损耗 {{current.session_loss}} / 10 U（负数表示盈利，超过 10 U 后卖完结束）。</p>
     <p v-if="current.task_start_quote">任务启动时可用 {{current.request.expected_quote}}：{{current.task_start_quote}}（固定不变）。</p>
     <p>本轮起始 USDT：{{current.round_start_quote??'尚未开始'}} · 计划买入 {{current.round_plan??'—'}} U · 已撤单重挂 {{current.buy_rehangs??0}} / 10 次。</p>
     <p v-if="current.balances">最近已核对可用 USDT {{current.balances.quote_available}} · 上轮保留零头 {{current.dust??'0'}}。</p>
-    <p v-if="current.risk">含冻结资产的 K 线估值：{{current.risk.equity??'待核对'}} U；预计损耗 {{current.risk.loss??'待核对'}} U / {{current.risk.loss_pct??'待核对'}}%。{{current.risk.reason}}</p>
+    <p v-if="current.risk">含冻结资产的 K 线估值：{{current.risk.equity??'待核对'}} U；整场损耗 {{current.risk.session_loss??'待核对'}} U；持币成本亏损率 {{current.risk.loss_pct??'待核对'}}%，买入单位成本 {{current.risk.unit_cost??'—'}} U。{{current.risk.reason}}</p>
     <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（观察到余额增加后，使用对应买单提交时间；重挂不重置）。</p>
     <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 将平台卖出数量滑杆拉满（包含已有零头）</template></p>
     <div v-if="current.pending_order?.state==='submission_unknown'" class="notice error">
@@ -199,14 +200,14 @@ onUnmounted(()=>clearInterval(timer))
       <label><input v-model="confirmedNotSubmitted" type="checkbox" :disabled="busy" />我已关闭确认弹窗，并确认平台没有这笔订单。</label>
       <button class="secondary" :disabled="busy||!confirmedNotSubmitted" @click="resolveUnsubmitted">核对未提交并结束旧任务</button>
     </div>
-    <div v-if="current.accounting_version!==2" class="notice">
-      <p>此为旧版任务，缺少新核算所需起始余额。请先处理平台挂单，再结束旧版记录；旧统计保留，不转换为新盈亏。</p>
+    <div v-if="current.accounting_version!==2||current.risk_policy_version!==3" class="notice">
+      <p>此为旧版任务，缺少新止损所需启动总资产或持币成本记录。请先处理平台挂单，再结束旧版记录；旧统计保留，不转换为新盈亏。</p>
       <button class="secondary" :disabled="busy" @click="control('retire_legacy')">核对无挂单并结束旧版记录</button>
     </div>
     <div class="actions">
       <button class="secondary" :disabled="busy||!running" @click="control('pause')">暂停自动操作</button>
-      <button :disabled="busy||running" @click="control('resume')">核对后恢复任务</button>
-      <button class="secondary" :disabled="busy" @click="control('finish')">停止买入，卖完结束</button>
+      <button :disabled="busy||running||current.risk_policy_version!==3" @click="control('resume')">核对后恢复任务</button>
+      <button class="secondary" :disabled="busy||current.risk_policy_version!==3" @click="control('finish')">停止买入，卖完结束</button>
       <button class="secondary" :disabled="busy" @click="forceRestart">强制重新开始任务</button>
     </div>
     <p class="muted">强制重新开始只结束本地任务并解锁上方参数，不会自动撤销平台挂单。新任务启动前仍会检查当前委托，有旧挂单时不会提交新单。</p>
