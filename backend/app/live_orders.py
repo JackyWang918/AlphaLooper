@@ -26,6 +26,7 @@ BACKGROUND_TICK_SECONDS = 5
 ORDER_POLL_SECONDS = 60
 SETTLEMENT_POLL_SECONDS = 5
 PAGE_LOADING_TIMEOUT_SECONDS = 60
+BALANCE_DIRECTION_TIMEOUT_SECONDS = 60
 MAX_CANCEL_DISCOVERY_ATTEMPTS = 10
 CANCEL_DISCOVERY_RETRY_SECONDS = 15
 CANCEL_POST_CONFIRM_DELAY_SECONDS = 10
@@ -33,6 +34,10 @@ CANCEL_CONFIRM_TIMEOUT_SECONDS = 120
 LEGACY_SAFE_CANCEL_ERRORS = {
     "未找到当前委托区域唯一的“全部取消”控件，未点击。",
 }
+
+
+class BalanceDirectionNotReady(ValueError):
+    """The order is absent, but the two balance panels are not coherent yet."""
 
 
 class SubmitOrder(FillForm):
@@ -290,6 +295,8 @@ class LiveOrders:
                     record.pop("settlement_candidate", None)
                     record.pop("absence_refresh_pending", None)
                     record.pop("absence_refreshed_at", None)
+                    record.pop("balance_direction_started_at", None)
+                    record.pop("balance_direction_refresh_attempted", None)
                     record.update(
                         state="waiting",
                         observed_pending=True,
@@ -332,7 +339,12 @@ class LiveOrders:
                                 "确认弹窗已点击，但刷新后从未看到当前委托，且余额稳定后仍与提交前相同；"
                                 "无法确认平台是否接受订单，不会自动重发。"
                             )
-                        self.finish(record, balances)
+                        try:
+                            self.finish(record, balances)
+                        except BalanceDirectionNotReady as exc:
+                            self.defer_direction_mismatch(
+                                record, str(exc), allow_refresh=allow_refresh
+                            )
                         return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
                 record.pop("settlement_candidate", None)
@@ -381,7 +393,16 @@ class LiveOrders:
         if (side == "buy" and (cash_delta > 0 or token_delta < 0)) or (
             side == "sell" and (cash_delta < 0 or token_delta > 0)
         ):
-            raise ValueError("余额变化与订单方向不符，等待核对。")
+            side_label = "买单" if side == "buy" else "卖单"
+            quote = record["request"]["expected_quote"]
+            symbol = record["request"]["expected_symbol"]
+            raise BalanceDirectionNotReady(
+                f"{side_label}余额暂未同步："
+                f"{quote} {before['quote_available']} → {balances['quote_available']}"
+                f"（变化 {cash_delta:+}），"
+                f"{symbol} {before['base_available']} → {balances['base_available']}"
+                f"（变化 {token_delta:+}）"
+            )
         result = {
             "balances": balances,
             "before_balances": before,
@@ -397,6 +418,31 @@ class LiveOrders:
             state="completed",
             result=result,
             message="当前无委托且余额稳定，已记录实际资金变化。",
+        )
+        self.save(record)
+
+    def defer_direction_mismatch(self, record, detail, *, allow_refresh):
+        now = time.time()
+        started = record.setdefault("balance_direction_started_at", now)
+        elapsed = now - started
+        if elapsed >= BALANCE_DIRECTION_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"{detail}；等待余额同步超过 "
+                f"{BALANCE_DIRECTION_TIMEOUT_SECONDS} 秒，已停止自动任务并等待人工核对。"
+            )
+        if allow_refresh and not record.get("balance_direction_refresh_attempted"):
+            record["absence_refresh_pending"] = True
+            record["balance_direction_refresh_attempted"] = True
+            action = "下次先刷新一次交易页，再重新核对"
+        else:
+            action = "继续等待页面余额同步"
+        record.pop("settlement_candidate", None)
+        record.update(
+            state="settling",
+            message=(
+                f"{detail}；{action}，5 秒后重试"
+                f"（已等待 {int(elapsed)} 秒）。"
+            ),
         )
         self.save(record)
 

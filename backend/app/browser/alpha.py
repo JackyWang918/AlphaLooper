@@ -11,6 +11,8 @@ from app.browser.schemas import FillForm, token_identity
 
 TABS = {"buy": "买入", "sell": "卖出"}
 FORM_READY_TIMEOUT = 5
+UNSUPPORTED_QUOTE_CONFIRM_SECONDS = 0.3
+LOADING_SUFFIXES = {"", "-", "--", "—", "加载中", "加载中…"}
 
 
 class PageNotReady(ValueError):
@@ -19,6 +21,30 @@ class PageNotReady(ValueError):
 
 class FormNotReady(PageNotReady):
     """The expected trade page is open, but its form is still rendering."""
+
+
+def field_suffix(field, label):
+    """Read only the suffix belonging to one input, never nearby fee text."""
+    container = field.locator(
+        "xpath=ancestor::*[count(.//input)=1 and "
+        ".//*[contains(concat(' ', normalize-space(@class), ' '), "
+        "' bn-textField-suffix ')]][1]"
+    )
+    if container.count() == 0:
+        return ""
+    if container.count() != 1:
+        raise ValueError(f"{label}输入组件识别到多个候选，无法确认页面结构。")
+    suffix = container.locator(".bn-textField-suffix:visible")
+    count = suffix.count()
+    if count == 0:
+        return ""
+    if count != 1:
+        raise ValueError(f"{label}输入组件识别到 {count} 个单位，无法唯一定位。")
+    return " ".join(suffix.inner_text().split())
+
+
+def loading_suffix(value):
+    return value.strip() in LOADING_SUFFIXES
 
 
 def total_inputs(page: Page):
@@ -74,11 +100,19 @@ def inspect_form(page: Page):
         return result
     if not price.is_visible() or not amount.is_visible():
         return result
-    symbol = amount.locator("..").locator(".bn-textField-suffix").inner_text().strip()
-    quote = price.locator("..").locator(".bn-textField-suffix").inner_text().strip()
-    result.update(symbol=symbol, quote=quote)
+    symbol_raw = field_suffix(amount, "数量")
+    quote_raw = field_suffix(price, "价格")
+    symbol = "" if loading_suffix(symbol_raw) else symbol_raw
+    quote = "" if loading_suffix(quote_raw) else quote_raw
+    result.update(
+        symbol=symbol,
+        quote=quote,
+        symbol_raw=symbol_raw,
+        quote_raw=quote_raw,
+    )
     if not symbol or not quote:
-        result["reason"] = "交易表单仍在加载币种和计价币。"
+        raw = f"数量单位={symbol_raw or '空'}，价格单位={quote_raw or '空'}"
+        result["reason"] = f"交易表单仍在加载币种和计价币（{raw}）。"
         return result
     if quote not in {"USDT", "USDC"}:
         result["reason"] = f"页面计价币为 {quote}，当前仅适配 USDT/USDC 表单。"
@@ -111,12 +145,18 @@ def verify_identity(page: Page, command: FillForm):
     if token_identity(page.url) != token_identity(command.url):
         raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
     deadline = time.monotonic() + FORM_READY_TIMEOUT
+    unsupported_quote = None
     while True:
         state = inspect_form(page)
         if state["fill_supported"]:
             break
         if state.get("quote") and state["quote"] not in {"USDT", "USDC"}:
-            raise ValueError(state["reason"])
+            if unsupported_quote == state["quote"]:
+                raise ValueError(state["reason"])
+            unsupported_quote = state["quote"]
+            time.sleep(UNSUPPORTED_QUOTE_CONFIRM_SECONDS)
+            continue
+        unsupported_quote = None
         if time.monotonic() >= deadline:
             raise FormNotReady(state["reason"])
         time.sleep(0.1)

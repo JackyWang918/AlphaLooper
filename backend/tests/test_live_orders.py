@@ -163,13 +163,59 @@ def test_restart_does_not_replay_and_preserves_first_error(service):
     ]
 
 
-def test_wrong_direction_delta_does_not_complete(service):
+def reach_direction_mismatch(service):
     submitted(service)
     observe(service, wallet("101", "1"))
     observe(service, wallet("101", "1"))  # refreshed baseline
     service.now[0] += 5
-    result = observe(service, wallet("101", "1"))
-    assert result["active"] and "方向" in result["last_check_error"]
+    return observe(service, wallet("101", "1"))
+
+
+def test_wrong_direction_delta_refreshes_once_and_can_recover(service):
+    result = reach_direction_mismatch(service)
+    assert result["active"] and result["state"] == "settling"
+    assert result.get("last_check_error") is None
+    assert "USDT 100 → 101（变化 +1）" in result["message"]
+    assert "DGAI 0 → 1（变化 +1）" in result["message"]
+    assert result["absence_refresh_pending"] is True
+
+    # The next inspection refreshes exactly once. Two stable coherent snapshots
+    # then finish the original order without submitting anything again.
+    observe(service, wallet("99.1", "0.9999"))
+    assert service.browser.execute.call_args.kwargs["payload"][
+        "refresh_before_check"
+    ] is True
+    service.now[0] += 5
+    recovered = observe(service, wallet("99.1", "0.9999"))
+    assert not recovered["active"]
+    assert recovered["result"]["cash_delta"] == "-0.9"
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
+
+
+def test_wrong_direction_delta_times_out_after_sixty_seconds(service):
+    first = reach_direction_mismatch(service)
+    assert first.get("last_check_error") is None
+
+    service.now[0] += 60
+    observe(service, wallet("101", "1"))  # one controlled refresh/new candidate
+    service.now[0] += 2
+    timed_out = observe(service, wallet("101", "1"))
+
+    assert timed_out["active"]
+    assert "等待余额同步超过 60 秒" in timed_out["last_check_error"]
+
+
+def test_reappearing_order_resets_direction_wait(service):
+    first = reach_direction_mismatch(service)
+    assert first.get("balance_direction_started_at") is not None
+
+    pending = observe(service, wallet("101", "1"), pending=True)
+
+    assert pending["state"] == "waiting"
+    assert pending.get("balance_direction_started_at") is None
+    assert pending.get("balance_direction_refresh_attempted") is None
 
 
 def test_confirmed_cancel_waits_then_refreshes_before_check(service):

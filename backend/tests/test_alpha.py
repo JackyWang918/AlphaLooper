@@ -5,7 +5,7 @@ from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
 from pydantic import ValidationError
 
-from app.browser.alpha import check_step, fill_form
+from app.browser.alpha import check_step, fill_form, inspect_form
 from app.browser.schemas import FillForm, token_identity
 from app.browser.worker import select_target_page
 
@@ -82,6 +82,34 @@ def test_fill_both_directions_without_submission(page, side):
     assert result["quote_amount"] == ("0.9" if side == "buy" else None)
     assert result["submitted"] is False
     assert page.evaluate("window.submits") == 0
+
+
+def test_sell_form_ignores_unloaded_estimated_fee_outside_price_input(page):
+    page.get_by_role("tab", name="卖出", exact=True).click()
+    page.locator("body").evaluate("""body => {
+      body.insertAdjacentHTML('beforeend', `
+        <div id="estimated-fee">
+          <span>预估手续费</span>
+          <span class="bn-textField-suffix">-- USDT</span>
+        </div>`);
+    }""")
+
+    state = inspect_form(page)
+
+    assert state["side"] == "sell"
+    assert state["quote"] == "USDT"
+    assert state["quote_raw"] == "USDT"
+
+
+def test_multiple_units_inside_price_component_are_rejected(page):
+    page.locator("#limitPrice").locator("..").evaluate("""container => {
+      container.insertAdjacentHTML(
+        'beforeend', '<span class="bn-textField-suffix">USDC</span>'
+      );
+    }""")
+
+    with pytest.raises(ValueError, match="价格输入组件识别到 2 个单位"):
+        inspect_form(page)
 
 
 def test_fill_accepts_equivalent_value_with_trimmed_trailing_zeroes(page):

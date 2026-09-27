@@ -227,17 +227,36 @@ def test_first_post_cancel_inspection_refreshes_page(page):
     assert len(loads) == 1
 
 
-def test_form_suffix_loading_is_retryable(page, monkeypatch):
+@pytest.mark.parametrize("placeholder", ["", "-", "--", "—", "加载中", "加载中…"])
+def test_form_suffix_loading_is_retryable(page, monkeypatch, placeholder):
     monkeypatch.setattr("app.browser.alpha.FORM_READY_TIMEOUT", 0.01)
     page.locator("#limitPrice").locator("..").locator(
         ".bn-textField-suffix"
-    ).evaluate("element=>element.textContent='' ")
+    ).evaluate("(element, value)=>element.textContent=value", placeholder)
 
     result = inspect_progress(page, PAYLOAD)
 
     assert result["settling"] is True
     assert result["page_loading"] is True
     assert "仍在加载" in result["message"]
+    if placeholder:
+        assert f"价格单位={placeholder}" in result["message"]
+
+
+def test_transient_unsupported_quote_recovers_before_second_read(page, monkeypatch):
+    monkeypatch.setattr("app.browser.alpha.UNSUPPORTED_QUOTE_CONFIRM_SECONDS", 0.01)
+    suffix = page.locator("#limitPrice").locator("..").locator(
+        ".bn-textField-suffix"
+    )
+    suffix.evaluate("""element => {
+      element.textContent='BTC';
+      setTimeout(() => element.textContent='USDT', 1);
+    }""")
+
+    result = inspect_progress(page, PAYLOAD)
+
+    assert result.get("page_loading") is not True
+    assert result["balances"]["quote_available"] == "100"
 
 
 def test_loaded_unsupported_quote_is_not_retryable(page):
