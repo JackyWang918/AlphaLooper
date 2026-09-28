@@ -197,6 +197,17 @@ def test_ambiguous_balance_or_modal_stops(page):
     assert page.evaluate("window.submits") == 0
 
 
+def test_lingering_ordinary_confirmation_is_distinguished(page):
+    page.locator("body").evaluate(
+        "e=>e.insertAdjacentHTML('beforeend','<div role=dialog><p>限价 / 卖出</p><button>继续</button></div>')"
+    )
+
+    with pytest.raises(ValueError, match="普通订单确认弹窗仍然可见"):
+        inspect_progress(page, {**PAYLOAD, "side": "sell"})
+
+    assert page.evaluate("window.submits") == 0
+
+
 def test_cancel_all_requires_exactly_one_ordinary_confirmation(page):
     install_order(page)
     page.evaluate("""() => { window.requestCancelAll=()=>{

@@ -192,6 +192,23 @@ def test_confirmation_content_is_not_checked(page):
     assert page.evaluate("window.confirmations") == 1
 
 
+def test_confirmation_click_is_not_reported_until_dialog_closes(page):
+    page.evaluate("""() => {
+      window.submitOrder=()=>{
+        window.submits++;
+        document.body.insertAdjacentHTML('beforeend', `<div role="dialog" id="confirmation">
+          <h2>DGAI</h2><button onclick="window.confirmations++">继续</button>
+        </div>`);
+      };
+    }""")
+
+    with pytest.raises(ValueError, match="已点击一次.*弹窗仍未关闭"):
+        submit_once(page, PAYLOAD)
+
+    assert page.evaluate("[window.submits,window.confirmations]") == [1, 1]
+    assert page.get_by_role("dialog").is_visible()
+
+
 def test_confirmation_nested_wrappers_and_unrelated_continue(page):
     page.evaluate("""() => {
       document.body.insertAdjacentHTML('beforeend','<button onclick="window.wrong=true">继续</button>');

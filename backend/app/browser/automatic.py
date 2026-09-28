@@ -10,7 +10,7 @@ import time
 from decimal import Decimal
 
 from app.browser.alpha import TABS, PageNotReady, verify_identity
-from app.browser.confirmation import MODALS, NUMBER, confirmation_dialogs
+from app.browser.confirmation import NUMBER, confirmation_dialogs
 from app.browser.live import current_order, select_panel
 from app.browser.schemas import FillForm
 
@@ -42,7 +42,16 @@ class CancelNotClicked(ValueError):
 
 
 def no_dialog(page):
-    if page.locator(MODALS).filter(visible=True).count():
+    dialogs = confirmation_dialogs(page)
+    if dialogs.count() == 1:
+        text = dialogs.inner_text()
+        if not re.search(r"验证码|人机验证|安全验证|风险测评|身份验证|验证器", text):
+            button = dialogs.get_by_role("button", name="继续", exact=True).filter(
+                visible=True
+            )
+            if button.count() == 1:
+                raise ValueError("普通订单确认弹窗仍然可见。")
+    if dialogs.count():
         raise ValueError("页面有弹窗，请手动处理后恢复自动任务。")
 
 

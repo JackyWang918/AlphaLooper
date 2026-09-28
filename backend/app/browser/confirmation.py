@@ -182,8 +182,25 @@ def confirm_once(page, command, deadline=None):
             button = dialogs.get_by_role("button", name="继续", exact=True)
             if button.count() == 1:
                 expect(button).to_be_enabled(timeout=5000)
-                button.click(trial=True, timeout=3000)
-                button.click(timeout=3000)  # Never retry this click, including on timeout.
-                return {"unchecked_confirmation": True}
+                # This is the sole confirmation action. A trial click can still
+                # hover/focus the real control and cause the exchange UI to
+                # rerender before the actual click, so rely on Playwright's own
+                # actionability checks and perform exactly one real click.
+                button.click(timeout=3000)  # Never retry, including on timeout.
+
+                # A dispatched click is not evidence that the exchange accepted
+                # it. Do not report confirmation_clicked until the ordinary
+                # dialog has actually gone away; otherwise the next order poll
+                # would misleadingly fail with the generic "page has a dialog"
+                # message while the durable record claims confirmation succeeded.
+                close_deadline = time.monotonic() + 5
+                while time.monotonic() < close_deadline:
+                    if confirmation_dialogs(page).count() == 0:
+                        return {"unchecked_confirmation": True}
+                    page.wait_for_timeout(100)
+                raise ValueError(
+                    "已点击一次“继续”，但订单确认弹窗仍未关闭；"
+                    "提交结果待核实，不会重复点击。"
+                )
         page.wait_for_timeout(100)
     raise ValueError("等待普通订单确认弹窗或唯一“继续”按钮超时。")

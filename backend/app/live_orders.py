@@ -348,7 +348,31 @@ class LiveOrders:
                         return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
                 record.pop("settlement_candidate", None)
-                record.update(last_check_error=str(exc), checked_at=time.time())
+                error = str(exc)
+                if (
+                    record.get("confirmation_clicked")
+                    and error == "普通订单确认弹窗仍然可见。"
+                ):
+                    # Older code could persist confirmation_clicked as soon as
+                    # Playwright dispatched the click, even when the exchange
+                    # left the same dialog open. Reclassify this durable record
+                    # so the existing read-only "not submitted" recovery can be
+                    # used after the user closes the dialog and checks the page.
+                    record.pop("last_check_error", None)
+                    record.update(
+                        state="submission_unknown",
+                        submission_error=(
+                            "已尝试点击一次“继续”，但普通订单确认弹窗仍然可见；"
+                            "不会重复点击。"
+                        ),
+                        message=(
+                            "提交结果待核实：已尝试点击一次“继续”，"
+                            "但弹窗仍未关闭；请关闭弹窗并核对平台无该订单。"
+                        ),
+                        checked_at=time.time(),
+                    )
+                else:
+                    record.update(last_check_error=error, checked_at=time.time())
                 if (
                     record.get("submission_error")
                     and record["state"] == "submission_unknown"

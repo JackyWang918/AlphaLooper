@@ -138,6 +138,20 @@ def test_unknown_can_reconcile_real_balance_changes_without_retry(service):
     ) == 1
 
 
+def test_lingering_confirmation_after_recorded_click_becomes_recoverable(service):
+    submitted(service)
+    service.browser.execute.side_effect = ValueError("普通订单确认弹窗仍然可见。")
+
+    checked = service.check()
+
+    assert checked["state"] == "submission_unknown"
+    assert checked.get("last_check_error") is None
+    assert "不会重复点击" in checked["submission_error"]
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
+
+
 def test_changed_balance_prevents_manual_unsubmitted_release(service):
     body = submitted(service, fails=True)
     service.browser.execute.return_value = {
