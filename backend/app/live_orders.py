@@ -25,6 +25,7 @@ intents = Table(
 BACKGROUND_TICK_SECONDS = 5
 ORDER_POLL_SECONDS = 60
 SETTLEMENT_POLL_SECONDS = 5
+PAGE_REFRESH_MIN_INTERVAL_SECONDS = 30
 PAGE_LOADING_TIMEOUT_SECONDS = 60
 BALANCE_DIRECTION_TIMEOUT_SECONDS = 60
 MAX_CANCEL_DISCOVERY_ATTEMPTS = 10
@@ -61,6 +62,7 @@ class LiveOrders:
         self.stop = threading.Event()
         self.thread = None
         self.automatic = None
+        self.last_page_refresh_at = 0.0
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -248,19 +250,29 @@ class LiveOrders:
                 self.save(record)
                 return record
             try:
-                refresh_before_check = bool(
+                now = time.time()
+                refresh_pending = bool(
                     allow_refresh
                     and (
                         record.get("cancel_refresh_pending")
                         or record.get("absence_refresh_pending")
                     )
                 )
+                refresh_due_at = (
+                    self.last_page_refresh_at + PAGE_REFRESH_MIN_INTERVAL_SECONDS
+                )
+                refresh_before_check = bool(
+                    refresh_pending and now >= refresh_due_at
+                )
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",
                     record["request"]
                     | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
+                if refresh_before_check and not result.get("page_refreshed"):
+                    raise ValueError("交易页刷新结果未确认；不按旧余额结算。")
                 if refresh_before_check and result.get("page_refreshed"):
+                    self.last_page_refresh_at = time.time()
                     record["cancel_refresh_pending"] = False
                     record["absence_refresh_pending"] = False
                     record["cancel_page_refreshed_at"] = time.time()
@@ -306,6 +318,17 @@ class LiveOrders:
                     )
                 else:
                     record.pop("page_loading_started_at", None)
+                    if refresh_pending and not result.get("page_refreshed"):
+                        record.pop("settlement_candidate", None)
+                        record.update(
+                            state="settling",
+                            message=(
+                                "当前无委托；等待整页刷新完成后核对余额，"
+                                "期间不提交新订单。"
+                            ),
+                        )
+                        self.save(record)
+                        return record
                     if record.get("accounting_version") != 2:
                         raise ValueError(
                             "旧订单没有买入前余额基准，不能转换为新口径。请核对后结束旧任务。"

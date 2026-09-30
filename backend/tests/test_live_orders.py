@@ -4,7 +4,12 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine
 
-from app.live_orders import LiveOrders, SubmitOrder, intents
+from app.live_orders import (
+    PAGE_REFRESH_MIN_INTERVAL_SECONDS,
+    LiveOrders,
+    SubmitOrder,
+    intents,
+)
 from tests.test_alpha import PAYLOAD
 
 
@@ -48,11 +53,11 @@ def submitted(service, *, fails=False):
 
 
 def observe(service, balance=None, pending=False):
-    service.browser.execute.return_value = {
+    service.browser.execute.side_effect = lambda action, *, payload: {
         "ok": True,
         "pending": pending,
         "balances": balance or wallet(),
-        "page_refreshed": True,
+        "page_refreshed": bool(payload.get("refresh_before_check")),
     }
     return service.check()
 
@@ -193,8 +198,12 @@ def test_wrong_direction_delta_refreshes_once_and_can_recover(service):
     assert "DGAI 0 → 1（变化 +1）" in result["message"]
     assert result["absence_refresh_pending"] is True
 
-    # The next inspection refreshes exactly once. Two stable coherent snapshots
-    # then finish the original order without submitting anything again.
+    # Wait for the page-refresh spacing before the one allowed extra refresh.
+    observe(service, wallet("99.1", "0.9999"))
+    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
+        "payload"
+    ]
+    service.now[0] += PAGE_REFRESH_MIN_INTERVAL_SECONDS - 5
     observe(service, wallet("99.1", "0.9999"))
     assert service.browser.execute.call_args.kwargs["payload"][
         "refresh_before_check"
@@ -261,6 +270,84 @@ def test_confirmed_cancel_waits_then_refreshes_before_check(service):
     payload = service.browser.execute.call_args.kwargs["payload"]
     assert payload["refresh_before_check"] is True
     assert checked["cancel_refresh_pending"] is False
+
+
+def test_full_page_refresh_is_spaced_across_orders_without_skipping_settlement(service):
+    submitted(service)
+    observe(service, wallet("99.1", "1"))
+    observe(service, wallet("99.1", "1"))
+    assert service.last_page_refresh_at == service.now[0]
+    service.now[0] += 5
+    assert observe(service, wallet("99.1", "1"))["state"] == "completed"
+
+    submitted(service)
+    pending = observe(service, wallet("98.2", "2"))
+    assert pending["state"] == "settling"
+    deferred = observe(service, wallet("98.2", "2"))
+    assert deferred["state"] == "settling"
+    assert deferred["absence_refresh_pending"] is True
+    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
+        "payload"
+    ]
+
+    service.now[0] += PAGE_REFRESH_MIN_INTERVAL_SECONDS - 5
+    refreshed = observe(service, wallet("98.2", "2"))
+    assert refreshed["state"] == "settling"
+    assert service.browser.execute.call_args.kwargs["payload"]["refresh_before_check"]
+    assert refreshed["absence_refresh_pending"] is False
+    service.now[0] += 5
+    assert observe(service, wallet("98.2", "2"))["state"] == "completed"
+
+
+def test_deferred_refresh_does_not_use_old_balance_candidate(service):
+    submitted(service)
+    record = service.get()
+    record.update(
+        absence_refreshed_at=service.now[0] - 5,
+        absence_refresh_pending=True,
+        settlement_candidate={"balances": wallet("99", "1"), "at": service.now[0] - 5},
+    )
+    service.save(record)
+    service.last_page_refresh_at = service.now[0]
+
+    checked = observe(service, wallet("99", "1"))
+
+    assert checked["state"] == "settling"
+    assert "settlement_candidate" not in checked
+    assert checked["active"]
+
+
+def test_order_reappearing_during_refresh_wait_returns_to_waiting(service):
+    submitted(service)
+    service.last_page_refresh_at = service.now[0]
+    observe(service, wallet("99", "1"))
+    assert observe(service, wallet("99", "1"))["absence_refresh_pending"]
+
+    checked = observe(service, wallet(), pending=True)
+
+    assert checked["state"] == "waiting"
+    assert checked.get("absence_refresh_pending") is None
+    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
+        "payload"
+    ]
+
+
+def test_missing_refresh_receipt_cannot_settle_from_old_balances(service):
+    submitted(service)
+    observe(service, wallet("99", "1"))
+    service.browser.execute.side_effect = None
+    service.browser.execute.return_value = {
+        "ok": True,
+        "pending": False,
+        "balances": wallet("99", "1"),
+        "page_refreshed": False,
+    }
+
+    checked = service.check()
+
+    assert checked["active"]
+    assert "刷新结果未确认" in checked["last_check_error"]
+    assert checked["absence_refresh_pending"]
 
 
 def test_paused_reconciliation_does_not_refresh_page(service):

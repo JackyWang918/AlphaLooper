@@ -5,9 +5,10 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine
 
-from app.automatic import Automatic, StartTask, tasks
+from app.automatic import Automatic, StartTask, band_order_price, tasks
 from app.decision_log import decisions
 from app.live_orders import LiveOrders, SubmitOrder, intents
+from app.market import MarketError
 
 
 class Browser:
@@ -107,6 +108,10 @@ class Browser:
 
 @pytest.fixture
 def rig(market, monkeypatch):
+    market.ticker = {"lastPrice": "9.9"}
+    market.candles[-1].open = D("9.9")
+    market.candles[-1].high = D("9.94")
+    market.candles[-1].low = D("9.86")
     engine = create_engine("sqlite://")
     for table in (intents, tasks, decisions):
         table.create(engine)
@@ -145,11 +150,45 @@ def tick(r, seconds=0):
     return r.auto.get()
 
 
-def reconciled(r, seconds=60):
+def test_last_trade_band_uses_closed_candle_and_price_steps(market):
+    market.ticker = {"lastPrice": "10"}
+    latest = max(market.candles, key=lambda row: row.close_time)
+    latest.open = latest.close = D(10)
+    latest.high = D("10.05")
+    latest.low = D("9.95")
+    buy, band = band_order_price(market, "buy")
+    sell, _ = band_order_price(market, "sell")
+    assert band["width_pct"] == D(1)
+    assert buy == D("10.10") and sell == D("9.90")
+    market.ticker["lastPrice"] = "11"
+    assert band_order_price(market, "sell")[0] == D("10.89")
+
+
+def test_last_trade_band_requires_public_price_and_closed_bar(market):
+    with pytest.raises(MarketError, match="lastPrice"):
+        band_order_price(market, "buy")
+    market.ticker = {"lastPrice": "10"}
+    market.candles = []
+    with pytest.raises(MarketError, match="已收盘"):
+        band_order_price(market, "buy")
+
+
+def test_large_last_candle_uses_full_width_without_buy_block(rig):
+    r = rig
+    r.market.candles[-1].high = D("10.2")
+    r.market.candles[-1].low = D("9.8")
+    task = tick(r)
+    assert task["pending"]["side"] == "buy"
+    assert D(task["pending"]["price"]) == D("10.30")
+    assert r.browser.calls.count("live_submit") == 1
+    assert band_order_price(r.market, "sell")[0] == D("9.50")
+
+
+def reconciled(r, seconds=5):
     initial = r.live.get()
     initial_id = initial["id"] if initial else None
     task = tick(r, seconds)
-    for _ in range(3):
+    for _ in range(8):
         current = r.live.get()
         if current is None or current["id"] != initial_id:
             return task
@@ -161,6 +200,7 @@ def test_full_cash_cycle_and_no_double_count(rig):
     r = rig
     t = tick(r)
     assert t["pending"]["quote_amount"] == "50"
+    assert D(t["pending"]["price"]) == D("9.98")
     assert t["round_start_quote"] == "100"
     r.browser.finish()
     assert (
@@ -169,6 +209,7 @@ def test_full_cash_cycle_and_no_double_count(rig):
     tick(r, 5)  # refreshed balance becomes the settlement candidate
     t = tick(r, 5)
     assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
+    assert D(t["pending"]["price"]) == D("9.82")
     bought = t["buy_total"]
     r.browser.finish()
     t = reconciled(r)
@@ -186,35 +227,25 @@ def test_full_cash_cycle_and_no_double_count(rig):
     assert r.browser.calls.count("live_submit") == 3
 
 
-def test_small_partial_buys_accumulate_and_only_top_up_remaining(rig):
+def test_partial_buy_cancels_remainder_and_sells(rig):
     r = rig
     tick(r)
     r.browser.partial("1")
-    t = tick(r, 300)
+    t = tick(r, 5)
     first = t["first_buy_at"]
     assert r.browser.calls.count("live_cancel") == 1
     t = reconciled(r, 15)
-    assert t["pending"]["side"] == "buy" and D(t["pending"]["quote_amount"]) == D(
-        "40.10"
-    )
-    assert t["buy_rehangs"] == 1 and t["round_start_quote"] == "100"
-    r.browser.finish("2")
-    t = reconciled(r)
-    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("29.70")
+    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("9.98")
+    assert t["buy_rehangs"] == 0 and t["round_start_quote"] == "100"
     assert t["first_buy_at"] == first
 
 
-def test_exactly_half_keeps_buying_strictly_over_half_sells(rig):
+def test_any_completed_buy_moves_to_sell(rig):
     r = rig
     tick(r)
     r.browser.finish("1")
-    r.browser.cash = D(75)
-    r.browser.balance = D("2.52")
     t = reconciled(r)
-    assert t["pending"]["side"] == "buy" and D(t["cost"]) == 25
-    r.browser.finish("0.01")
-    t = reconciled(r)
-    assert t["pending"]["side"] == "sell"
+    assert t["pending"]["side"] == "sell" and D(t["cost"]) == D("9.98")
 
 
 def test_ten_rehangs_excludes_initial_and_is_bounded_after_resume(rig):
@@ -240,16 +271,16 @@ def test_ten_rehangs_excludes_initial_and_is_bounded_after_resume(rig):
 def test_stop_denominator_is_coin_cost_and_includes_partial_buy(rig):
     r = rig
     tick(r)
-    r.browser.partial("3")  # 29.70 bought, remainder locked
+    r.browser.partial("3")  # 29.94 bought, remainder locked
     t = tick(r, 60)
     assert not t["exiting"]
-    assert D(t["risk"]["denominator"]) == D("29.70")
-    assert D(t["risk"]["equity"]) == D("100.00")
+    assert D(t["risk"]["denominator"]) == D("29.94")
+    assert D(t["risk"]["equity"]) == D("99.76")
     risk = r.auto.risk(
-        t, {"quote_total": "70.30", "base_total": "3"}, D("9.702"), r.live.get()
+        t, {"quote_total": "70.06", "base_total": "3"}, D("9.7804"), r.live.get()
     )
     assert D(risk["loss_pct"]) == 2
-    assert D(risk["session_loss"]) == D("0.594")
+    assert D(risk["session_loss"]) == D("0.5988")
 
 
 def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
@@ -258,25 +289,21 @@ def test_partial_sell_risk_counts_proceeds_and_locked_coins(rig):
     r.browser.finish()
     t = reconciled(r)
     r.browser.partial("1")
-    t = tick(r, 60)
-    assert D(t["risk"]["equity"]) == r.browser.cash + r.browser.balance * D("9.9")
-    r.market.candles[-1].close = D(8)
-    t = tick(r, 60)
-    assert t["exiting"] and r.browser.calls.count("live_cancel") == 1
-    t = reconciled(r, 15)
-    assert t["pending"]["side"] == "sell" and t["pending"]["sell_all"]
-    assert D(t["pending"]["price"]) == D("7.60")
+    risk = r.auto.risk(t, r.browser.wallet(), D("9.9"), r.live.get())
+    assert D(risk["equity"]) == r.browser.cash + r.browser.balance * D("9.9")
+    risk = r.auto.risk(t, r.browser.wallet(), D(8), r.live.get())
+    assert D(risk["loss_pct"]) > 2
 
 
 def test_missing_frozen_is_not_false_loss_or_early_cancel(rig):
     r = rig
     tick(r)
     r.browser.hide_frozen = True
-    t = tick(r, 60)
-    assert t["risk"]["loss"] is None and not t["exiting"]
+    t = tick(r, 5)
+    assert not t["exiting"]
     assert r.browser.calls.count("live_cancel") == 0
     assert r.browser.calls.count("live_submit") == 1
-    tick(r, 240)
+    tick(r, 25)
     assert r.browser.calls.count("live_cancel") == 1
 
 
@@ -555,8 +582,8 @@ def test_status_explains_next_scheduler_action(rig):
     tick(r)
     status = r.auto.status()
     assert status["current"]["task_start_quote"] == "100"
-    assert status["current"]["schedule"]["kind"] == "minute_check"
-    assert "损耗" in status["current"]["schedule"]["reason"]
+    assert status["current"]["schedule"]["kind"] == "order_timeout"
+    assert "三十秒" in status["current"]["schedule"]["reason"]
 
     r.auto.control(r.body.request_id, "pause")
     status = r.auto.status()
@@ -682,11 +709,11 @@ def test_reconcile_missing_frozen_rechecks_loss_before_any_rebuy(rig):
     tick(r)
     r.browser.partial("1")
     r.browser.hide_frozen = True
-    r.market.candles[-1].close = D(7)
+    r.market.ticker["lastPrice"] = "7"
     t = tick(r, 60)
     assert t["risk_reconcile"] and not t["exiting"]
-    assert r.browser.calls.count("live_cancel") == 0
-    tick(r, 240)
+    assert r.browser.calls.count("live_cancel") == 1
+    tick(r, 25)
     t = reconciled(r, 15)
     assert t["exiting"] and t["pending"]["side"] == "sell"
     assert r.browser.calls.count("live_submit") == 2
@@ -740,17 +767,17 @@ def test_account_budget_strictly_exceeds_ten(rig, loss, stops):
         assert "超过 10 U" in task["message"]
 
 
-@pytest.mark.parametrize("price,exits", [("9.702", False), ("9.701", True)])
+@pytest.mark.parametrize("price,exits", [("9.7804", False), ("9.7803", True)])
 def test_coin_stop_strictly_exceeds_two_percent(rig, price, exits):
     r = rig
     tick(r)
     r.browser.finish()
     reconciled(r)
-    r.market.candles[-1].close = D(price)
+    r.market.ticker["lastPrice"] = price
     task = tick(r, 60)
     assert task["exiting"] is exits
     assert task["stop_buying"] is False
-    assert (r.browser.calls.count("live_cancel") == 1) is exits
+    assert r.browser.calls.count("live_cancel") == 1
     assert D(task["risk"]["session_loss"]) < 2
 
 
@@ -773,10 +800,10 @@ def test_partial_sell_profit_does_not_hide_coin_stop(rig):
     reconciled(r)
     r.browser.partial("1")
     r.browser.cash += 20
-    r.market.candles[-1].close = D("9.60")
+    r.market.ticker["lastPrice"] = "9.60"
     task = tick(r, 60)
     assert D(task["risk"]["session_loss"]) < 0
-    assert D(task["risk"]["unit_cost"]) == D("9.9")
+    assert D(task["risk"]["unit_cost"]) == D("9.98")
     assert D(task["risk"]["loss_pct"]) > 2
     assert task["exiting"] and not task["stop_buying"]
 
@@ -786,7 +813,7 @@ def test_budget_exit_cancels_then_sells_and_survives_restart(rig):
     tick(r)
     r.browser.finish()
     reconciled(r)
-    r.market.candles[-1].close = D("7.50")
+    r.market.ticker["lastPrice"] = "7.50"
     task = tick(r, 60)
     assert task["stop_buying"] and task["active"]
     assert r.browser.calls.count("live_cancel") == 1
@@ -798,8 +825,8 @@ def test_budget_exit_cancels_then_sells_and_survives_restart(rig):
     task = reconciled(r, 5)
     assert task["task_start_equity"] == "100"
     assert task["pending"]["side"] == "sell"
-    assert D(task["pending"]["price"]) == D("7.12")
-    r.market.candles[-1].close = D(10)
+    assert D(task["pending"]["price"]) == D("7.43")
+    r.market.ticker["lastPrice"] = "10"
     r.browser.finish()
     reconciled(r, 15)
     tick(r, 5)
@@ -814,16 +841,16 @@ def test_budget_during_partial_buy_cancels_before_exit_sell(rig):
     tick(r)
     r.browser.partial("1")
     r.browser.cash -= D(9)
-    r.market.candles[-1].close = D(8)
+    r.market.ticker["lastPrice"] = "8"
     task = tick(r, 60)
     assert task["stop_buying"] and r.browser.pending is None
     assert r.browser.calls.count("live_submit") == 1
     task = reconciled(r, 15)
     assert task["pending"]["side"] == "sell"
-    assert D(task["pending"]["price"]) == D("7.60")
+    assert D(task["pending"]["price"]) == D("7.93")
 
 
-def test_exit_requotes_closed_candle_without_compounding_discount(rig):
+def test_exit_requotes_latest_trade_without_compounding_discount(rig):
     r = rig
     tick(r)
     r.browser.finish()
@@ -831,8 +858,8 @@ def test_exit_requotes_closed_candle_without_compounding_discount(rig):
     r.auto.control(r.body.request_id, "finish")
     tick(r)
     task = reconciled(r, 15)
-    assert D(task["pending"]["price"]) == D("9.40")
-    r.market.candles[-1].close = D("10.13")
+    assert D(task["pending"]["price"]) == D("9.82")
+    r.market.ticker["lastPrice"] = "10.13"
     r.market.candles.append(
         r.market.candles[-1].model_copy(
             update={
@@ -845,7 +872,7 @@ def test_exit_requotes_closed_candle_without_compounding_discount(rig):
     tick(r, 15)
     assert r.browser.pending is None
     task = reconciled(r, 15)
-    assert D(task["pending"]["price"]) == D("9.62")
+    assert D(task["pending"]["price"]) == D("10.04")
     assert task["pending"]["sell_all"]
 
 
@@ -878,3 +905,18 @@ def test_old_risk_policy_is_not_silently_converted(rig):
         r.auto.control(r.body.request_id, "resume")
     r.auto.control(r.body.request_id, "retire_legacy")
     assert r.auto.get() is None
+
+
+def test_old_strategy_task_cannot_resume_under_new_quotes(rig):
+    r = rig
+    task = r.auto.get()
+    del task["strategy_policy_version"]
+    task["request"]["config"].update(window=15, wait_seconds=300, max_hold_seconds=1800)
+    r.auto.save(task)
+    with pytest.raises(ValueError, match="旧任务"):
+        r.auto.control(r.body.request_id, "resume")
+    task = tick(r)
+    assert not r.auto.running and "旧任务" in task["message"]
+    task = tick(r, 5)
+    assert "旧任务" in task["message"]
+    assert "live_submit" not in r.browser.calls

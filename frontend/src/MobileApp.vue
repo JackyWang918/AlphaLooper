@@ -17,6 +17,7 @@ type Task = {
   phase: string
   message: string
   risk_policy_version?: number
+  strategy_policy_version?: number
   task_start_equity?: string | null
   task_start_quote?: string | null
   round_start_quote?: string | null
@@ -298,10 +299,6 @@ async function startTask() {
           amount: amount.value,
           target_points: targetPoints.value,
           current_points: currentPoints.value,
-          window: 15,
-          buy_offset: '0.5',
-          sell_offset: '0.5',
-          range_weight: '0.5',
           buy_check_seconds: 20,
         },
       }),
@@ -467,11 +464,12 @@ onUnmounted(() => clearInterval(timer))
         </div>
         <div class="control-grid">
           <button class="pause" :disabled="!!busy || !automatic.running" @click="controlTask('pause')">暂停自动操作</button>
-          <button class="primary" :disabled="!!busy || automatic.running" @click="controlTask('resume')">核对后恢复</button>
-          <button class="ghost" :disabled="!!busy" @click="controlTask('finish')">停止买入，卖完结束</button>
+          <button class="primary" :disabled="!!busy || automatic.running || current.strategy_policy_version !== 2" @click="controlTask('resume')">核对后恢复</button>
+          <button class="ghost" :disabled="!!busy || current.strategy_policy_version !== 2" @click="controlTask('finish')">停止买入，卖完结束</button>
           <button class="danger-button" :disabled="!!busy" @click="controlTask('force_restart')">强制停止</button>
         </div>
         <p class="warning-copy">强制停止不会撤销平台挂单，也不会卖出持仓。</p>
+        <p v-if="current.strategy_policy_version !== 2" class="warning-copy">旧策略任务不能直接恢复。请在桌面控制台处理旧挂单和持仓后结束旧版记录。</p>
       </div>
     </section>
 

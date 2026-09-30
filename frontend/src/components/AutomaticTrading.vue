@@ -32,7 +32,7 @@ const blockedReason=computed(()=>{
   if(amountProblem.value)return amountProblem.value
   return ''
 })
-const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),windowSize=ref(15),buyOffset=ref('0.5'),sellOffset=ref('0.5'),rangeWeight=ref('0.5'),buyCheckSeconds=ref(20)
+const book=ref('本机账户'),amount=ref('50'),target=ref('32768'),currentPoints=ref('0'),buyCheckSeconds=ref(20)
 const requiredPoints=computed(()=>{
   const goal=Number(target.value),existing=Number(currentPoints.value)
   return Number.isFinite(goal)&&Number.isFinite(existing)&&existing<=goal?goal-existing:null
@@ -44,6 +44,7 @@ function fmtNextAction(task:Task){
   return `${new Date(task.schedule.at*1000).toLocaleTimeString()}（约 ${seconds} 秒后）`
 }
 function earnedPoints(task:Task){return Number(task.buy_total)*Number(task.request.config.points_per_u??4)}
+function isCurrentStrategy(task:Task){return (task as Task & {strategy_policy_version?:number}).strategy_policy_version===2}
 function totalPoints(task:Task){return Number(task.request.config.current_points??0)+earnedPoints(task)}
 let timer:ReturnType<typeof setInterval>|undefined
 let refreshPromise:Promise<void>|null=null
@@ -92,7 +93,7 @@ async function start(){
   try{
     await refresh()
     if(!statusReady.value||current.value)return
-    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,current_points:currentPoints.value,window:windowSize.value,buy_offset:buyOffset.value,sell_offset:sellOffset.value,range_weight:rangeWeight.value,buy_check_seconds:buyCheckSeconds.value}})
+    const task=await api('/start',{request_id:requestId,book:book.value,url:props.url,expected_symbol:props.symbol,expected_quote:props.quote,config:{amount:amount.value,target_points:target.value,current_points:currentPoints.value,buy_check_seconds:buyCheckSeconds.value}})
     // Rotate only after a definite response. A lost response retries the same ID.
     requestId=crypto.randomUUID();localStorage.setItem('automatic-request-id',requestId)
     if(task.active)current.value=task
@@ -134,7 +135,7 @@ onUnmounted(()=>clearInterval(timer))
 <section>
   <div class="section-title"><h2>05 / 自动实盘交易</h2><span class="badge">{{running?'自动运行中':current?'已暂停 / 待恢复':'未启动'}}</span></div>
   <p>启动后程序自动估价、买入、卖出并继续下一轮。请先在受控 Chrome 登录、打开目标币种，再刷新浏览器识别结果。</p>
-  <p class="muted">普通挂单等待 5 分钟，首次买入之外最多撤单重挂 10 次；累计投入超过本轮计划金额 50% 后转卖。每分钟检查：持币相对买入成本亏损超过 2% 时主动退出；启动总资产减当前 USDT 与持币估值超过 10 U 时，先撤单、卖完后结束。盈利可抵消亏损，不预留下一轮额度。持仓满 30 分钟也转主动退出。</p>
+  <p class="muted">试运行策略：用公开行情 lastPrice 和上一根已收盘 1 分钟 K 线振幅设置买卖限价；买入一有实际成交就转卖。普通单 30 秒未结束先撤单核对，首次买入后满 2 分钟进入主动退出。每分钟检查持币成本亏损超过 2% 和整场净资产损耗超过 10 U；限价和计时都不保证成交或损耗上限。</p>
   <p>受控 Chrome：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported&&symbol&&quote">{{symbol}} / {{quote}}</span><span v-else>尚未识别</span></p>
   <p v-if="browserReason&&!fillSupported" class="muted">页面识别反馈：{{browserReason}}</p>
   <button class="secondary" :disabled="busy||browserBusy" @click="emit('refreshBrowser')">{{browserBusy?'正在识别…':'重新识别交易页面'}}</button>
@@ -147,13 +148,9 @@ onUnmounted(()=>clearInterval(timer))
       <label>启动时已有积分<input v-model="currentPoints" inputmode="decimal" /></label>
     </div>
     <p class="muted">本任务还需新增：{{requiredPoints===null?'请检查积分输入':fmtPoints(requiredPoints)}} 分。启动后已有积分固定，任务只累计实际买入金额 × 4；卖出不计分。</p>
-    <details><summary>估价试验参数</summary><div class="fields">
-      <label>1 分钟 K 线窗口<input v-model.number="windowSize" type="number" min="3" max="240" /></label>
-      <label>买入波动偏移系数<input v-model="buyOffset" inputmode="decimal" /></label>
-      <label>卖出波动偏移系数<input v-model="sellOffset" inputmode="decimal" /></label>
-      <label>典型振幅权重<input v-model="rangeWeight" inputmode="decimal" /></label>
+    <details><summary>试运行参数</summary><div class="fields">
       <label>空仓再次评估等待（秒）<input v-model.number="buyCheckSeconds" type="number" min="5" max="300" step="5" /></label>
-    </div><p class="muted">最终波动尺度取“收盘价总体标准差”和“分钟高低振幅中位数 × 权重”中的较大值；振幅权重默认 0.5，可降低单根异常长影线的影响。默认 15 根 K 线、买卖偏移各 0.5。参数效果尚未验证。</p></details>
+    </div><p class="muted">买入上限 = lastPrice × (1 + 上根 K 线实际振幅)，卖出下限 = 最新 lastPrice × (1 − 实际振幅)，按平台价格步长取整；不设 1% 振幅上限。lastPrice 是否等同于 Alpha 实际撮合价尚未验证。</p></details>
     <p class="muted">空仓等待可设为 5–300 秒（5 秒的倍数），用于一轮结束后或策略明确暂不买入后的下一次评估。首次启动仍立即评估；它不改变订单巡检、损耗检查或退出规则。</p>
     <button :disabled="!!blockedReason" :title="blockedReason" @click="start">{{busy?'正在处理…':'启动自动实盘买卖'}}</button>
   </fieldset>
@@ -169,8 +166,8 @@ onUnmounted(()=>clearInterval(timer))
     </div>
     <details><summary>固定调度规则</summary><ul>
       <li>后台每 5 秒检查一次是否有到期动作。</li>
-      <li>普通挂单最多 5 分钟；跨过每个自然分钟后巡检订单并检查资产损耗。</li>
-      <li>持仓满 30 分钟进入主动退出；主动退出按上一根已收盘 1 分钟 K 线收盘价 × 0.95 挂限价卖单，每 15 秒撤单核对后重估。</li>
+      <li>普通挂单 30 秒未结束先撤单核对；订单每 5 秒检查，跨过自然分钟后检查资产损耗。</li>
+      <li>首次买入后满 2 分钟进入主动退出；按最新 lastPrice 和上根 K 线实际振幅挂限价卖单，15 秒未结束先撤单核对后重估。</li>
       <li>任务暂停时只读核对已有订单，不提交、不撤单。</li>
     </ul></details>
     <p>本任务空仓再次评估等待：{{current.request.config.buy_check_seconds??20}} 秒。<span v-if="current.market_at">最近行情：{{new Date(current.market_at).toLocaleTimeString()}}。</span></p>
@@ -191,7 +188,7 @@ onUnmounted(()=>clearInterval(timer))
     <p v-if="current.task_start_quote">任务启动时可用 {{current.request.expected_quote}}：{{current.task_start_quote}}（固定不变）。</p>
     <p>本轮起始 USDT：{{current.round_start_quote??'尚未开始'}} · 计划买入 {{current.round_plan??'—'}} U · 已撤单重挂 {{current.buy_rehangs??0}} / 10 次。</p>
     <p v-if="current.balances">最近已核对可用 USDT {{current.balances.quote_available}} · 上轮保留零头 {{current.dust??'0'}}。</p>
-    <p v-if="current.risk">含冻结资产的 K 线估值：{{current.risk.equity??'待核对'}} U；整场损耗 {{current.risk.session_loss??'待核对'}} U；持币成本亏损率 {{current.risk.loss_pct??'待核对'}}%，买入单位成本 {{current.risk.unit_cost??'—'}} U。{{current.risk.reason}}</p>
+    <p v-if="current.risk">含冻结资产的 {{isCurrentStrategy(current)?'公开 lastPrice':'K 线'}} 估值：{{current.risk.equity??'待核对'}} U；整场损耗 {{current.risk.session_loss??'待核对'}} U；持币成本亏损率 {{current.risk.loss_pct??'待核对'}}%，买入单位成本 {{current.risk.unit_cost??'—'}} U。{{current.risk.reason}}</p>
     <p v-if="current.first_buy_at">持仓计时起点：{{new Date(current.first_buy_at*1000).toLocaleString()}}（观察到余额增加后，使用对应买单提交时间；重挂不重置）。</p>
     <p v-if="current.pending">当前计划：<template v-if="current.pending.side==='buy'">按 {{current.pending.price}} 买入 {{current.pending.quote_amount}} {{current.request.expected_quote}}</template><template v-else>按 {{current.pending.price}} 将平台卖出数量滑杆拉满（包含已有零头）</template></p>
     <div v-if="current.pending_order?.state==='submission_unknown'" class="notice error">
@@ -200,14 +197,14 @@ onUnmounted(()=>clearInterval(timer))
       <label><input v-model="confirmedNotSubmitted" type="checkbox" :disabled="busy" />我已关闭确认弹窗，并确认平台没有这笔订单。</label>
       <button class="secondary" :disabled="busy||!confirmedNotSubmitted" @click="resolveUnsubmitted">核对未提交并结束旧任务</button>
     </div>
-    <div v-if="current.accounting_version!==2||current.risk_policy_version!==3" class="notice">
-      <p>此为旧版任务，缺少新止损所需启动总资产或持币成本记录。请先处理平台挂单，再结束旧版记录；旧统计保留，不转换为新盈亏。</p>
+    <div v-if="current.accounting_version!==2||current.risk_policy_version!==3||!isCurrentStrategy(current)" class="notice">
+      <p>此为旧版任务，不能直接套用新的短周期报价策略。请先处理平台挂单和持仓，再结束旧版记录；旧统计保留。</p>
       <button class="secondary" :disabled="busy" @click="control('retire_legacy')">核对无挂单并结束旧版记录</button>
     </div>
     <div class="actions">
       <button class="secondary" :disabled="busy||!running" @click="control('pause')">暂停自动操作</button>
-      <button :disabled="busy||running||current.risk_policy_version!==3" @click="control('resume')">核对后恢复任务</button>
-      <button class="secondary" :disabled="busy||current.risk_policy_version!==3" @click="control('finish')">停止买入，卖完结束</button>
+      <button :disabled="busy||running||current.risk_policy_version!==3||!isCurrentStrategy(current)" @click="control('resume')">核对后恢复任务</button>
+      <button class="secondary" :disabled="busy||current.risk_policy_version!==3||!isCurrentStrategy(current)" @click="control('finish')">停止买入，卖完结束</button>
       <button class="secondary" :disabled="busy" @click="forceRestart">强制重新开始任务</button>
     </div>
     <p class="muted">强制重新开始只结束本地任务并解锁上方参数，不会自动撤销平台挂单。新任务启动前仍会检查当前委托，有旧挂单时不会提交新单。</p>

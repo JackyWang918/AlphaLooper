@@ -12,7 +12,7 @@ from decimal import localcontext
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Column, Integer, String, Table, Text, select
 
 from app import decision_log
@@ -22,15 +22,45 @@ from app.limits import MAX_BUY_QUOTE_AMOUNT
 from app.live_orders import (
     BACKGROUND_TICK_SECONDS,
     CANCEL_CONFIRM_TIMEOUT_SECONDS,
-    ORDER_POLL_SECONDS,
     SETTLEMENT_POLL_SECONDS,
     SubmitOrder,
 )
-from app.market import MarketClient, validate_snapshot
-from app.strategy import Config, align, estimate, reference_price
+from app.market import MarketClient, MarketError, validate_snapshot
+from app.strategy import align
 
 RISK_POLICY_VERSION = 3
-EXIT_PRICE_FACTOR = D("0.95")
+STRATEGY_POLICY_VERSION = 2
+AUTO_ORDER_POLL_SECONDS = 5
+
+
+def trade_price_band(m):
+    """Use the last public trade as reference and the last closed bar as width."""
+    rows = [row for row in m.candles if row.close_time < m.fetched_at]
+    if not rows:
+        raise MarketError("没有已收盘的一分钟 K 线，不能计算报价边界。")
+    row = max(rows, key=lambda item: item.close_time)
+    if m.fetched_at - row.close_time > 90000:
+        raise MarketError("最近已收盘 K 线过期，不能计算报价边界。")
+    try:
+        price = D(str(m.ticker["lastPrice"]))
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise MarketError("公开行情缺少有效 lastPrice，不能计算报价边界。") from exc
+    if not price.is_finite() or price <= 0:
+        raise MarketError("公开行情 lastPrice 非正数或非有限值。")
+    width_pct = (row.high - row.low) / row.close * 100
+    if width_pct < 0 or not width_pct.is_finite():
+        raise MarketError("上一根 K 线振幅无效。")
+    return {"reference": price, "width_pct": width_pct, "last_closed": row.close_time}
+
+
+def band_order_price(m, side):
+    band = trade_price_band(m)
+    width = band["width_pct"] / 100
+    raw = band["reference"] * (1 + width if side == "buy" else 1 - width)
+    price = align(raw, m.tick, up=side == "buy")
+    if price <= 0:
+        raise MarketError("按价格步长计算的限价非正数。")
+    return price, band
 
 tasks = Table(
     "auto_tasks",
@@ -41,14 +71,18 @@ tasks = Table(
 )
 
 
-class LiveConfig(Config):
+class LiveConfig(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     buy_check_seconds: int = Field(default=20, ge=5, le=300, multiple_of=5)
+    window: int = Field(default=3, ge=3, le=3)
     amount: D = Field(default=D(50), gt=0, le=MAX_BUY_QUOTE_AMOUNT)
     budget: D = Field(default=D(10), gt=0, le=10)
     fee_bps: D = Field(default=D(1), ge=1, le=1)
     stop_pct: D = Field(default=D(2), ge=2, le=2)
-    wait_seconds: int = Field(default=300, ge=300, le=300)
-    max_hold_seconds: int = Field(default=1800, ge=1800, le=1800)
+    wait_seconds: int = Field(default=30, ge=30, le=30)
+    exit_seconds: int = Field(default=15, ge=15, le=15)
+    max_hold_seconds: int = Field(default=120, ge=120, le=120)
     target_points: D = Field(default=D(32768), gt=0)
     current_points: D = Field(default=D(0), ge=0)
     points_per_u: D = Field(default=D(4), ge=4, le=4)
@@ -187,7 +221,7 @@ class Automatic:
                         if task.get("exiting")
                         or record.get("cancel_requested_at")
                         or record.get("cancel_retry_after")
-                        else ORDER_POLL_SECONDS
+                        else AUTO_ORDER_POLL_SECONDS
                     )
                 )
                 checked_at = record.get("checked_at")
@@ -246,7 +280,7 @@ class Automatic:
                     "order_timeout",
                     "主动退出卖单到时后撤单重估。"
                     if timeout == config.exit_seconds
-                    else "普通挂单到达五分钟后撤单核对。",
+                    else "普通挂单到达三十秒后撤单核对。",
                 )
             ]
             if task.get("round_start_quote") is not None:
@@ -262,7 +296,7 @@ class Automatic:
                     (
                         task["first_buy_at"] + config.max_hold_seconds,
                         "hold_timeout",
-                        "持仓达到三十分钟后进入主动退出。",
+                        "首次买入后满两分钟进入主动退出。",
                     )
                 )
             at, kind, reason = min(candidates, key=lambda item: item[0])
@@ -297,9 +331,9 @@ class Automatic:
             start_price = None
             start_equity = D(balances["quote_available"])
             if D(balances["base_available"]) > 0:
-                start_price = reference_price(
+                start_price = trade_price_band(
                     self.snapshot({"request": request}, body.config)
-                )
+                )["reference"]
                 start_equity += D(balances["base_available"]) * start_price
             task = {
                 "id": str(body.request_id),
@@ -311,6 +345,7 @@ class Automatic:
                 "message": "自动任务已启动，等待最新行情。",
                 "accounting_version": 2,
                 "risk_policy_version": RISK_POLICY_VERSION,
+                "strategy_policy_version": STRATEGY_POLICY_VERSION,
                 "balances": balances,
                 "task_start_quote": balances["quote_available"],
                 "task_start_equity": str(start_equity),
@@ -402,6 +437,7 @@ class Automatic:
                 if (
                     t.get("accounting_version") == 2
                     and t.get("risk_policy_version") == RISK_POLICY_VERSION
+                    and t.get("strategy_policy_version") == STRATEGY_POLICY_VERSION
                 ):
                     raise ValueError("新口径任务请使用停止买入、卖完结束。")
                 self.live.call("order_readiness", self.probe(t["request"]))
@@ -526,16 +562,27 @@ class Automatic:
             t["buy_end_quote"] = wallet["quote_available"]
             if paid > 0:
                 t["first_buy_at"] = t["first_buy_at"] or record["created_at"]
-            if D(t["cost"]) > D(t["round_plan"]) / 2:
+            if paid > 0 or D(t["round_bought_quantity"]) > 0:
                 t["round_stage"] = "sell"
         else:
             t["proceeds"] = str(D(wallet["quote_available"]) - D(t["buy_end_quote"]))
         t.update(last_order=record["id"], pending=None)
+        token_delta = D(result["token_delta"])
+        effective_cash_per_token = (
+            str(abs(D(result["cash_delta"]) / token_delta))
+            if token_delta != 0
+            else None
+        )
         self.save(
             t,
             "fill" if log_event else None,
             "当前委托已结束，按余额差记录实际资金变化。",
-            {"request_id": record["id"], "result": result},
+            {
+                "request_id": record["id"],
+                "result": result,
+                "effective_cash_per_token": effective_cash_per_token,
+                "observed_settlement_seconds": max(0, self.clock() - record["created_at"]),
+            },
         )
 
     def settle(self, t, price, next_buy_check_at):
@@ -600,10 +647,11 @@ class Automatic:
         if (
             t.get("accounting_version") != 2
             or t.get("risk_policy_version") != RISK_POLICY_VERSION
+            or t.get("strategy_policy_version") != STRATEGY_POLICY_VERSION
             or t.get("task_start_equity") is None
         ):
             raise ValueError(
-                "旧任务缺少新止损口径的启动总资产或持币成本记录；"
+                "旧任务缺少当前止损或短周期报价策略版本；"
                 "请先处理平台挂单和持仓，再核对无挂单并结束旧版记录，重新启动任务。"
             )
 
@@ -614,7 +662,7 @@ class Automatic:
                 "session_loss": None,
                 "loss_pct": None,
                 "equity": None,
-                "basis": "latest_closed_1m_candle",
+                "basis": "public_last_price",
                 "reason": "页面未显示冻结余额或剩余委托量",
             }
         equity = D(wallet["quote_total"]) + D(wallet["base_total"]) * price
@@ -643,7 +691,7 @@ class Automatic:
             "unit_cost": str(unit_cost) if unit_cost is not None else None,
             "held_quantity": str(held),
             "price": str(price),
-            "basis": "latest_closed_1m_candle",
+            "basis": "public_last_price",
         }
 
     def _tick(self, t):
@@ -654,7 +702,17 @@ class Automatic:
             )
         if self.running:
             self.require_risk_policy(t)
-        c = LiveConfig(**t["request"]["config"])
+        config_data = t["request"]["config"]
+        if t.get("strategy_policy_version") != STRATEGY_POLICY_VERSION:
+            # Legacy tasks remain read-only after restart, even when their
+            # persisted 5-minute/30-minute parameters no longer validate.
+            config_data = {
+                **config_data,
+                "window": 3,
+                "wait_seconds": 30,
+                "max_hold_seconds": 120,
+            }
+        c = LiveConfig(**config_data)
         minute_due = int(now) // 60 > t["last_minute"]
         record = self.live.get(t["pending"]["request_id"]) if t["pending"] else None
         if record:
@@ -669,7 +727,7 @@ class Automatic:
                     if record.get("cancel_requested_at")
                     or record.get("cancel_retry_after")
                     or t["exiting"]
-                    else ORDER_POLL_SECONDS
+                    else AUTO_ORDER_POLL_SECONDS
                 )
             )
             if now - self.last_poll >= interval or (self.running and minute_due):
@@ -727,7 +785,7 @@ class Automatic:
             and now - t["first_buy_at"] >= c.max_hold_seconds
         ):
             t["exiting"] = True
-            t.setdefault("exit_reason", "持仓满 30 分钟")
+            t.setdefault("exit_reason", "首次买入后满 2 分钟")
         if (
             not record
             and t["round_stage"] in {"idle", "buy"}
@@ -742,15 +800,22 @@ class Automatic:
             and not t["exiting"]
             and now - record["created_at"] < c.wait_seconds
             and now < record.get("cancel_retry_after", float("inf"))
+            and not (
+                polled
+                and record["request"]["side"] == "buy"
+                and record.get("balances")
+                and D(record["balances"]["base_available"])
+                > D(record["before_balances"]["base_available"])
+            )
         ):
             self.save(t)
             return
         m = self.snapshot(t, c)
-        price_ref = reference_price(m)
+        price_ref = trade_price_band(m)["reference"]
         self.evidence = {
             "config": c.model_dump(mode="json"),
             "market_time": m.fetched_at,
-            "valuation_basis": "latest_closed_1m_candle",
+            "valuation_basis": "public_last_price",
             "candles": [
                 row.model_dump(mode="json")
                 for row in sorted(
@@ -821,9 +886,8 @@ class Automatic:
             )
             enough_bought = (
                 record["request"]["side"] == "buy"
-                and wallet.get("quote_total") is not None
-                and D(t["round_start_quote"]) - D(wallet["quote_total"])
-                > D(t["round_plan"]) / 2
+                and D(wallet["base_available"])
+                > D(record["before_balances"]["base_available"])
             )
             sell_dust = (
                 record["request"]["side"] == "sell"
@@ -839,7 +903,7 @@ class Automatic:
             ):
                 reason = "挂单超时或进入主动退出，先撤单核对余额。"
                 if enough_bought:
-                    reason = "累计买入超过计划金额 50%，撤销剩余买单后转卖。"
+                    reason = "已观察到部分买入成交，撤销剩余买单后转卖。"
                 elif sell_dust:
                     reason = "卖出剩余价值不超过 2 U，撤销余单后结束本轮。"
                 elif retry_cancel:
@@ -891,10 +955,19 @@ class Automatic:
             return
         if t["round_stage"] in {"idle", "buy"}:
             if t["buy_rehangs"] >= 10 and t["buy_attempts"] >= 11:
-                raise ValueError(
-                    "已完成 10 次撤单重挂，累计买入仍未超过计划金额 50%；请调整策略，或选择停止买入、卖完结束。"
-                )
-            e = estimate(m, c)
+                raise ValueError("已连续 10 次撤单重挂仍未买入；请检查币种流动性。")
+            buy_price, band = band_order_price(m, "buy")
+            sell_price, _ = band_order_price(m, "sell")
+            e = {
+                "source": "public_ticker_lastPrice",
+                "reference": str(band["reference"]),
+                "last_closed": band["last_closed"],
+                "width_pct": str(band["width_pct"]),
+                "buy": str(buy_price),
+                "sell": str(sell_price),
+                "buy_allowed": True,
+                "buy_blockers": [],
+            }
             t["estimate"] = json.loads(json.dumps(e, default=str))
             self.evidence["estimate"] = e
             if not e["buy_allowed"]:
@@ -919,31 +992,27 @@ class Automatic:
                     buy_end_quote=str(start),
                 )
                 t.pop("exit_reason", None)
-            price = e["buy"]
+            price = buy_price
             quote_amount = min(
                 D(t["round_plan"]) - D(t["cost"]), D(wallet["quote_available"])
             )
             quantity = align(quote_amount / price, m.step)
             side = "buy"
-            reason = "按本轮剩余计划金额买入，累计投入超过 50% 后转卖。"
+            reason = "以公开 lastPrice 加上一根 K 线振幅为限价买入；有实际成交即转卖。"
         else:
-            price = (
-                align(price_ref * EXIT_PRICE_FACTOR, m.tick)
-                if t["exiting"]
-                else estimate(m, c)["sell"]
-            )
+            price, band = band_order_price(m, "sell")
             quantity = D(wallet["base_available"])
             quote_amount = None
             side = "sell"
             reason = "只填写卖价并将平台卖出数量滑杆拉满，包含已有零头。"
             if t["exiting"]:
                 reason = (
-                    f"{t.get('exit_reason', '主动退出')}；按上一根已收盘 1 分钟 K 线"
-                    "收盘价 × 0.95 向下对齐价格步长，限价卖出全部可用代币。"
+                    f"{t.get('exit_reason', '主动退出')}；按最新公开 lastPrice"
+                    "减上一根 K 线实际振幅向下对齐价格步长，限价卖出全部可用代币。"
                 )
                 self.evidence["exit_quote"] = {
-                    "reference_close": str(price_ref),
-                    "factor": str(EXIT_PRICE_FACTOR),
+                    "reference_last_price": str(band["reference"]),
+                    "width_pct": str(band["width_pct"]),
                     "price": str(price),
                 }
         if quantity <= 0 or quantity < m.min_qty or quantity * price < m.min_notional:

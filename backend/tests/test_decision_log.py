@@ -13,7 +13,7 @@ def decision_rig(request):
     return request.getfixturevalue("base_rig")
 
 
-def test_model_buy_persists_candles_without_book_and_does_not_resubmit(rig):
+def test_last_price_buy_persists_band_without_book_and_does_not_resubmit(rig):
     r = rig
     r.market.bids = r.market.asks = []
     tick(r)
@@ -24,10 +24,10 @@ def test_model_buy_persists_candles_without_book_and_does_not_resubmit(rig):
     evidence = entries[0]["evidence"]
     assert len(evidence["candles"]) == 3
     assert evidence["estimate"]["buy_blockers"] == []
-    assert evidence["estimate"]["buy"] == "9.90"
-    assert evidence["estimate"]["close_volatility"]
-    assert evidence["estimate"]["median_range"] == "0.4"
-    assert evidence["estimate"]["range_volatility"] == "0.20"
+    assert evidence["estimate"]["source"] == "public_ticker_lastPrice"
+    assert evidence["estimate"]["reference"] == "9.9"
+    assert evidence["estimate"]["buy"] == "9.98"
+    assert evidence["estimate"]["sell"] == "9.82"
     assert "asks" not in evidence and "bids" not in evidence
     tick(r, 5)
     assert r.browser.calls.count("live_submit") == 1
@@ -42,6 +42,8 @@ def test_fill_log_dedup_and_restart_reads_without_browser(rig):
         "items"
     ]
     assert len(fills) == 1 and fills[0]["details"]["result"]["local_order_id"]
+    assert fills[0]["details"]["effective_cash_per_token"]
+    assert fills[0]["details"]["observed_settlement_seconds"] >= 0
     restarted = Automatic(r.auto.engine, r.live, r.auto.market, r.auto.clock)
     before_calls = list(r.browser.calls)
     assert restarted.get()["id"] == str(r.body.request_id)
