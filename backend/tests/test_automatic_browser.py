@@ -10,6 +10,19 @@ def isolated_page(request):
     return request.getfixturevalue("base_page")
 
 
+def test_risk_dialog_requires_manual_verification_without_trading(page):
+    page.evaluate("""() => {
+      document.body.insertAdjacentHTML('beforeend', `<div role="dialog">
+        <p>风控校验：请手动完成安全验证</p>
+        <button onclick="window.confirmations++">继续</button>
+      </div>`);
+    }""")
+    with pytest.raises(ValueError, match="平台风控或验证弹窗.*手动完成校验"):
+        inspect_progress(page, PAYLOAD)
+    assert page.evaluate("window.submits") == 0
+    assert page.evaluate("window.confirmations") == 0
+
+
 def install_cancel_flow(page):
     page.evaluate("""() => {
       window.cancelRequests=0;

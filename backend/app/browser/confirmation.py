@@ -87,8 +87,7 @@ def validate_confirmation(text, command):
         quote_fee = fee if fee_currency == command.expected_quote else fee * price
         if command.side == "buy" and gross + quote_fee > MAX_BUY_QUOTE_AMOUNT:
             raise ValueError(
-                "确认弹窗金额含预计手续费超过 "
-                f"{MAX_BUY_QUOTE_AMOUNT} U，未点击继续。"
+                f"确认弹窗金额含预计手续费超过 {MAX_BUY_QUOTE_AMOUNT} U，未点击继续。"
             )
     return {
         "price": str(price),
@@ -170,6 +169,9 @@ def wait_for_confirmation(page, command, timeout_ms=5000):
 
 
 def confirm_once(page, command, deadline=None):
+    from app.browser.runtime import checkpoint
+
+    checkpoint("等待普通订单确认弹窗（验证提示必须人工处理）")
     deadline_at = time.monotonic() + 5
     while time.monotonic() < deadline_at:
         dialogs = confirmation_dialogs(page)
@@ -177,7 +179,10 @@ def confirm_once(page, command, deadline=None):
             raise ValueError("出现多个可见弹窗，未点击继续。")
         if dialogs.count() == 1:
             text = dialogs.inner_text()
-            if re.search(r"验证码|人机验证|安全验证|风险测评|身份验证|验证器", text):
+            if re.search(
+                r"风控|风险控制|验证码|人机验证|安全验证|风险测评|身份验证|验证器|滑块验证",
+                text,
+            ):
                 raise ValueError("出现验证提示，请手动处理；不会自动点击继续。")
             button = dialogs.get_by_role("button", name="继续", exact=True)
             if button.count() == 1:
@@ -186,6 +191,7 @@ def confirm_once(page, command, deadline=None):
                 # hover/focus the real control and cause the exchange UI to
                 # rerender before the actual click, so rely on Playwright's own
                 # actionability checks and perform exactly one real click.
+                checkpoint("点击一次普通订单确认“继续”")
                 button.click(timeout=3000)  # Never retry, including on timeout.
 
                 # A dispatched click is not evidence that the exchange accepted
@@ -193,6 +199,7 @@ def confirm_once(page, command, deadline=None):
                 # dialog has actually gone away; otherwise the next order poll
                 # would misleadingly fail with the generic "page has a dialog"
                 # message while the durable record claims confirmation succeeded.
+                checkpoint("已点击继续，等待确认弹窗关闭（结果尚未确认）")
                 close_deadline = time.monotonic() + 5
                 while time.monotonic() < close_deadline:
                     if confirmation_dialogs(page).count() == 0:

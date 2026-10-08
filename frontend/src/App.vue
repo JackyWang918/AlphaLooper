@@ -67,7 +67,7 @@ async function execute(action: 'status' | 'launch' | 'open') {
     filled.value = result.filled ?? null
     if (action === 'open') rememberTradeUrl(tradeUrl.value)
     else if (result.fill_supported && result.url) rememberTradeUrl(result.url)
-    message.value = result.connected
+    message.value = result.executor_blocked ? result.reason : result.connected
       ? 'Chrome 已连接。请在 Chrome 中手动登录和处理验证。'
       : 'Chrome 尚未启动，点击下方按钮开始。'
   } catch (error) {

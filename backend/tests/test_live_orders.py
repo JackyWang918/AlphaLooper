@@ -119,9 +119,10 @@ def test_unknown_empty_unchanged_does_not_invent_non_submission(service):
     body = submitted(service, fails=True)
     assert observe(service)["state"] == "settling"
     assert observe(service)["state"] == "settling"  # refreshed baseline
-    assert service.browser.execute.call_args.kwargs["payload"][
-        "refresh_before_check"
-    ] is True
+    assert (
+        service.browser.execute.call_args.kwargs["payload"]["refresh_before_check"]
+        is True
+    )
     service.now[0] += 5
     checked = observe(service)
     assert checked["active"] and "不会自动重发" in checked["last_check_error"]
@@ -200,14 +201,16 @@ def test_wrong_direction_delta_refreshes_once_and_can_recover(service):
 
     # Wait for the page-refresh spacing before the one allowed extra refresh.
     observe(service, wallet("99.1", "0.9999"))
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
-        "payload"
-    ]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
     service.now[0] += PAGE_REFRESH_MIN_INTERVAL_SECONDS - 5
     observe(service, wallet("99.1", "0.9999"))
-    assert service.browser.execute.call_args.kwargs["payload"][
-        "refresh_before_check"
-    ] is True
+    assert (
+        service.browser.execute.call_args.kwargs["payload"]["refresh_before_check"]
+        is True
+    )
     service.now[0] += 5
     recovered = observe(service, wallet("99.1", "0.9999"))
     assert not recovered["active"]
@@ -286,9 +289,10 @@ def test_full_page_refresh_is_spaced_across_orders_without_skipping_settlement(s
     deferred = observe(service, wallet("98.2", "2"))
     assert deferred["state"] == "settling"
     assert deferred["absence_refresh_pending"] is True
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
-        "payload"
-    ]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
 
     service.now[0] += PAGE_REFRESH_MIN_INTERVAL_SECONDS - 5
     refreshed = observe(service, wallet("98.2", "2"))
@@ -327,9 +331,10 @@ def test_order_reappearing_during_refresh_wait_returns_to_waiting(service):
 
     assert checked["state"] == "waiting"
     assert checked.get("absence_refresh_pending") is None
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
-        "payload"
-    ]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
 
 
 def test_missing_refresh_receipt_cannot_settle_from_old_balances(service):
@@ -371,9 +376,10 @@ def test_paused_reconciliation_does_not_refresh_page(service):
     checked = service.check(allow_refresh=False)
 
     assert checked["cancel_refresh_pending"] is True
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs[
-        "payload"
-    ]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
 
 
 def test_page_loading_retries_without_error_then_times_out(service):
@@ -396,6 +402,39 @@ def test_page_loading_retries_without_error_then_times_out(service):
     service.now[0] += 1
     timed_out = service.check()
     assert "超过 60 秒" in timed_out["last_check_error"]
+
+
+def test_inspection_recovery_settles_original_buy_without_resubmitting(service):
+    submitted(service)
+    service.browser.execute.return_value = {
+        "ok": True,
+        "page_loading": True,
+        "settling": True,
+        "message": "读取买卖两侧余额超时或尚未就绪（TimeoutError）。",
+    }
+    record = service.get()
+    record["settlement_candidate"] = {"balances": wallet(), "at": 0}
+    record["absence_refresh_pending"] = True
+    service.save(record)
+    first = service.check()
+    assert first["state"] == "settling"
+    assert first.get("last_check_error") is None
+    assert "settlement_candidate" not in first
+    assert first["absence_refresh_pending"]
+    assert service.last_page_refresh_at == service.now[0]
+    service.now[0] += 5
+    waiting = observe(service, wallet("99.1", "0.9999"))
+    assert waiting["active"] and waiting["absence_refresh_pending"]
+    service.now[0] += 25
+    assert observe(service, wallet("99.1", "0.9999"))["active"]
+    service.now[0] += 5
+    completed = observe(service, wallet("99.1", "0.9999"))
+    assert completed["state"] == "completed"
+    assert completed["result"]["cash_delta"] == "-0.9"
+    assert "page_loading_started_at" not in completed
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
 
 
 def test_cancel_confirmation_missing_remains_unknown_and_never_retries(service):

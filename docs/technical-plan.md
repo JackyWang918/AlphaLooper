@@ -1,5 +1,19 @@
 最新自动实盘报价与调度见文末 2026-09-30 章节；旧版设计保留作为历史记录。
 
+## 2026-10-08 浏览器生命周期与执行器故障隔离
+
+BrowserManager 管理两个 spawn 子进程：owner 使用 launch_persistent_context 保持 Chrome，worker 使用 connect_over_cdp 连接默认上下文。owner 仅持有生命周期、接收关闭指令，不执行页面交易。调试地址限定 127.0.0.1 动态端口，并核对 profile 内 DevToolsActivePort 的端口和 browser 路径；重新连接前核对 endpoint 健康与标识，不连接任意现有浏览器。worker 不调用 context.close，停止连接不会关闭 owner 的浏览器。
+
+runtime ContextVar 保存每条命令 35 秒预算及只含固定步骤名称的报告器，关键读取/点击前和阶段完成后检查。外层 manager 按 monotonic 固定 45 秒 deadline 接收 progress/final，progress 不延期；超时或 EOF 终止并清理 worker 通道，保留 owner，闭锁新动作。status 只返回缓存故障状态；launch 为显式重新连接，不恢复自动任务、不重放旧动作。正常 shutdown 仍关闭 worker 和 owner。硬截止只终止页面自动化，无法撤回已发送给平台的请求；既有 submission_unknown 与撤单未知语义保留。
+
+独立 Chrome 使用原专用用户目录及 Playwright 启动参数；CDP 连接方式已通过隔离临时 Chrome 的超时/重连和页面保留验证，真实平台链路仍待用户看护验收。无新增依赖、数据库迁移或策略参数变更。
+
+## 2026-10-08 巡检超时分阶段恢复
+
+`inspect_progress` 对刷新、两次当前委托读取和中间余额快照使用 `inspection_stage`。Playwright TimeoutError 与等待 AssertionError 转为 PageNotReady，返回不含余额的 page_loading/settling 结果，复用 LiveOrders 的 5 秒轮询和连续 60 秒未就绪上限；非超时浏览器错误只暴露步骤和异常类别后停止。委托列表等待也转为 PageNotReady，不从隐藏/缺失订单行推断无委托。身份冲突及弹窗/结构歧义保持硬错误。
+
+刷新超时保留必要刷新标记，且刷新尝试受 30 秒节流。失败快照不得结算或触发新提交；原订单意图保持，不重放买卖/撤单。隔离回归覆盖买入已成交后读取失败、恢复核对后只入账一次并进入卖出。未操作真实账户，旧暂停任务不自动恢复。
+
 ## 2026-09-25 已确认：持币止损、整场净资产止损与主动退出报价
 
 本节优先于下方历史记录中的旧止损及预算规则。用户明确：持有币相对买入成本亏损**超过 2%** 时主动退出；任务启动总资产减去当前剩余 USDT 与持币价值**超过 10 U** 时停止新买入，先撤掉挂单、核对余额，主动卖出后才结束任务。盈利抵消亏损；删除亏损轮次累加和下一轮损耗预留限制。恰好 2% 或 10 U 不触发“超过”条件。

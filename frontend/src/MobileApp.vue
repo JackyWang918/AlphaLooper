@@ -10,6 +10,7 @@ type BrowserState = {
   symbol?: string
   quote?: string
   reason?: string
+  executor_blocked?: boolean
 }
 type Task = {
   id: string
@@ -216,7 +217,9 @@ async function refreshBrowser(silent = false) {
     browser.value = await request<BrowserState>('/api/browser/status')
     const match = browser.value.url.match(/\/alpha\/bsc\/(0x[0-9a-fA-F]{40})/i)
     if (match?.[1]) token.value = match[1]
-    if (!silent) message.value = browser.value.connected ? '浏览器状态已更新。' : 'Chrome 尚未启动。'
+    if (!silent) message.value = browser.value.executor_blocked
+      ? browser.value.reason ?? '浏览器操作已停止，请重新连接后核对。'
+      : browser.value.connected ? '浏览器状态已更新。' : 'Chrome 尚未启动。'
   } catch (value) {
     if (!silent) showError(value, '读取浏览器状态失败。')
   }
@@ -415,7 +418,7 @@ onUnmounted(() => clearInterval(timer))
       <div class="step-card">
         <div class="card-heading">
           <span class="step-number">1</span>
-          <div><h2>浏览器</h2><p>{{ browser.connected ? '受控 Chrome 已连接' : '启动运行自动任务的 Chrome' }}</p></div>
+          <div><h2>浏览器</h2><p>{{ browser.executor_blocked ? browser.reason : browser.connected ? '受控 Chrome 已连接' : '启动运行自动任务的 Chrome' }}</p></div>
         </div>
         <div class="button-row">
           <button class="primary" :disabled="!!busy" @click="launchBrowser">

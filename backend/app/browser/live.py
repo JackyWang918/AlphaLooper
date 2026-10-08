@@ -4,17 +4,20 @@ import re
 import time
 from contextlib import contextmanager
 
-from playwright.sync_api import Error, expect
+from playwright.sync_api import Error, TimeoutError, expect
 
 from app.browser.alpha import TABS, PageNotReady, fill_form, verify_identity
 from app.browser.confirmation import confirm_once
+from app.browser.runtime import checkpoint
 from app.browser.schemas import FillForm, token_identity
 
 
 @contextmanager
 def stage(name):
     try:
+        checkpoint(name)
         yield
+        checkpoint(name + "完成")
     except (Error, AssertionError) as exc:
         raise ValueError(f"{name}失败：控件未就绪、被遮挡或页面结构不匹配。") from exc
     except ValueError as exc:
@@ -51,6 +54,7 @@ def select_panel(page, name):
 
 
 def current_order(page, payload):
+    checkpoint("核对当前委托")
     command = FillForm(**payload)
     if token_identity(page.url) != token_identity(command.url):
         raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
@@ -60,10 +64,14 @@ def current_order(page, payload):
         re.compile(r"^(暂无订单|暂无委托|暂无数据|无订单记录|无进行中的订单)$")
     )
     rows = panel.locator("tbody tr").filter(visible=True)
-    with stage("等待当前委托列表加载"):
+    try:
         expect(rows.first.locator("td").nth(4).or_(empty).first).to_be_visible(
             timeout=5000
         )
+    except (TimeoutError, AssertionError) as exc:
+        raise PageNotReady(
+            "等待当前委托列表加载：订单行或明确无订单提示尚未就绪。"
+        ) from exc
     data = [r for r in rows.all() if r.locator("td").count() >= 5]
     if not data and empty.count() == 1 and empty.is_visible():
         return {"empty": True}
@@ -86,6 +94,7 @@ def order_readiness(page, payload):
     with stage("检查当前委托及余额"):
         if not current_order(page, payload)["empty"]:
             raise ValueError("平台已有挂单，不能叠加新单。")
+        checkpoint("下单前读取买卖两侧余额")
         wallet = wallet_snapshot(page, payload, pending=False)
         if not current_order(page, payload)["empty"]:
             raise ValueError("读取余额期间出现挂单，未提交。")

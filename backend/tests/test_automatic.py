@@ -227,6 +227,34 @@ def test_full_cash_cycle_and_no_double_count(rig):
     assert r.browser.calls.count("live_submit") == 3
 
 
+def test_read_timeout_waits_then_accounts_buy_and_submits_sell(rig, monkeypatch):
+    tick(rig)
+    rig.browser.finish()
+    original = rig.browser.execute
+
+    def loading(action, payload=None):
+        if action == "live_progress":
+            return {
+                "ok": True, "page_loading": True, "settling": True,
+                "message": "读取买卖两侧余额超时或尚未就绪（TimeoutError）。",
+            }
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", loading)
+    task = tick(rig, 5)
+    assert rig.auto.running
+    assert task["pending"]["side"] == "buy"
+    assert rig.live.get()["state"] == "settling"
+    assert rig.browser.calls.count("live_submit") == 1
+    assert "live_cancel" not in rig.browser.calls
+    monkeypatch.setattr(rig.browser, "execute", original)
+    task = reconciled(rig, 5)
+    assert rig.auto.running
+    assert D(task["buy_total"]) > 0
+    assert task["pending"]["side"] == "sell"
+    assert rig.browser.calls.count("live_submit") == 2
+
+
 def test_partial_buy_cancels_remainder_and_sells(rig):
     r = rig
     tick(r)

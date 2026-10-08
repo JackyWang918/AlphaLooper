@@ -7,11 +7,15 @@ final fills or permits a replacement order.
 
 import re
 import time
+from contextlib import contextmanager
 from decimal import Decimal
+
+from playwright.sync_api import Error, TimeoutError
 
 from app.browser.alpha import TABS, PageNotReady, verify_identity
 from app.browser.confirmation import NUMBER, confirmation_dialogs
 from app.browser.live import current_order, select_panel
+from app.browser.runtime import checkpoint
 from app.browser.schemas import FillForm
 
 
@@ -42,7 +46,15 @@ class CancelNotClicked(ValueError):
 
 
 def no_dialog(page):
+    checkpoint("检查平台弹窗")
     dialogs = confirmation_dialogs(page)
+    if dialogs.count() == 1 and re.search(
+        r"风控|风险控制|验证码|人机验证|安全验证|身份验证|验证器|滑块验证",
+        dialogs.inner_text(),
+    ):
+        raise ValueError(
+            "检测到平台风控或验证弹窗；请在浏览器中手动完成校验，再核对委托和余额后恢复。自动交易不会处理此验证。"
+        )
     if dialogs.count() == 1:
         text = dialogs.inner_text()
         if not re.search(r"验证码|人机验证|安全验证|风险测评|身份验证|验证器", text):
@@ -240,17 +252,37 @@ def confirm_cancel_all(page):
     raise ValueError("取消全部订单的确认弹窗未出现；撤单结果未知，未继续点击。")
 
 
+@contextmanager
+def inspection_stage(name):
+    """Retry incomplete reads, without exposing page contents in diagnostics."""
+    try:
+        checkpoint(name)
+        yield
+        checkpoint(name + "完成")
+    except (TimeoutError, AssertionError) as exc:
+        raise PageNotReady(f"{name}超时或尚未就绪（{type(exc).__name__}）。") from exc
+    except Error as exc:
+        raise ValueError(
+            f"{name}失败（{type(exc).__name__}）；请检查浏览器连接和页面。"
+        ) from exc
+
+
 def inspect_progress(page, payload):
     refreshed = False
-    if payload.get("refresh_before_check"):
-        page.reload(wait_until="domcontentloaded", timeout=30000)
-        refreshed = True
+    detail = None
     try:
-        _, detail = current_detail(page, payload)
-        balances = wallet_snapshot(
-            page, payload, pending=detail is not None, detail=detail
-        )
-        _, after = current_detail(page, payload)
+        if payload.get("refresh_before_check"):
+            with inspection_stage("刷新交易页"):
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            refreshed = True
+        with inspection_stage("首次读取当前委托"):
+            _, detail = current_detail(page, payload)
+        with inspection_stage("读取买卖两侧余额"):
+            balances = wallet_snapshot(
+                page, payload, pending=detail is not None, detail=detail
+            )
+        with inspection_stage("再次读取当前委托"):
+            _, after = current_detail(page, payload)
     except PageNotReady as exc:
         return {
             "pending": None,
@@ -292,9 +324,11 @@ def cancel_once(page, payload):
         if row is None:
             return {"cancel_clicked": False, "already_absent": True}
         button = cancel_all_button(page, row)
+        checkpoint("点击一次当前委托全部取消")
     except Exception as exc:
         raise CancelNotClicked(str(exc)) from exc
     button.click(timeout=3000)
+    checkpoint("等待普通撤单确认弹窗")
     confirmation = confirm_cancel_all(page)
     return {
         "cancel_clicked": True,
@@ -306,14 +340,17 @@ def cancel_once(page, payload):
 
 
 def side_balance(page, command, side):
+    checkpoint(f"读取{TABS[side]}侧余额：核对交易身份")
     verify_identity(page, command)
     no_dialog(page)
+    checkpoint(f"读取{TABS[side]}侧余额：切换标签")
     page.get_by_role("tab", name=TABS[side], exact=True).click(timeout=3000)
     if verify_identity(page, command)["side"] != side:
         raise ValueError("不能确认余额读取方向。")
     unit = re.escape(
         command.expected_quote if side == "buy" else command.expected_symbol
     )
+    checkpoint(f"读取{TABS[side]}侧余额：读取余额文本")
     text = page.locator("body").inner_text()
 
     def read(label, required=False):

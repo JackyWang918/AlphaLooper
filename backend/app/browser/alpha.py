@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from playwright.sync_api import Error as BrowserError
 from playwright.sync_api import Page, expect
 
+from app.browser.runtime import checkpoint
 from app.browser.schemas import FillForm, token_identity
 
 TABS = {"buy": "买入", "sell": "卖出"}
@@ -142,6 +143,7 @@ def inspect_form(page: Page):
 
 
 def verify_identity(page: Page, command: FillForm):
+    checkpoint("核对交易页面币种和计价币")
     if token_identity(page.url) != token_identity(command.url):
         raise ValueError("当前页面的链或合约地址与指定链接不一致，已停止。")
     deadline = time.monotonic() + FORM_READY_TIMEOUT
@@ -283,6 +285,7 @@ def set_sell_slider_to_max(page: Page, amount):
 
 
 def fill_form(page: Page, payload: dict):
+    checkpoint("填写订单表单（尚未提交）")
     command = FillForm(**payload)
     initial = verify_identity(page, command)
     check_step(command.price, initial["price_step"])

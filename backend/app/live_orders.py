@@ -221,10 +221,9 @@ class LiveOrders:
             record = self.get()
             if not record:
                 return None
-            if (
-                record.get("cancel_error") in LEGACY_SAFE_CANCEL_ERRORS
-                and not record.get("cancel_confirmed_at")
-            ):
+            if record.get(
+                "cancel_error"
+            ) in LEGACY_SAFE_CANCEL_ERRORS and not record.get("cancel_confirmed_at"):
                 # Older code persisted an unknown cancel intent even though its
                 # adapter explicitly confirmed that no control was clicked.
                 record.pop("cancel_requested_at", None)
@@ -261,15 +260,21 @@ class LiveOrders:
                 refresh_due_at = (
                     self.last_page_refresh_at + PAGE_REFRESH_MIN_INTERVAL_SECONDS
                 )
-                refresh_before_check = bool(
-                    refresh_pending and now >= refresh_due_at
-                )
+                refresh_before_check = bool(refresh_pending and now >= refresh_due_at)
+                if refresh_before_check:
+                    # A timed-out reload may still have navigated the page.
+                    # Throttle attempts as well as confirmed completions.
+                    self.last_page_refresh_at = now
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",
                     record["request"]
                     | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
-                if refresh_before_check and not result.get("page_refreshed"):
+                if (
+                    refresh_before_check
+                    and not result.get("page_refreshed")
+                    and not result.get("page_loading")
+                ):
                     raise ValueError("交易页刷新结果未确认；不按旧余额结算。")
                 if refresh_before_check and result.get("page_refreshed"):
                     self.last_page_refresh_at = time.time()
@@ -285,8 +290,8 @@ class LiveOrders:
                     elapsed = time.time() - started
                     if elapsed >= PAGE_LOADING_TIMEOUT_SECONDS:
                         raise ValueError(
-                            "等待交易表单加载超过 60 秒，任务已暂停；"
-                            "请确认页面仍为本任务币种。"
+                            "等待交易页面核对就绪超过 60 秒，任务已暂停；"
+                            f"最近失败步骤：{result.get('message', '页面仍在加载。')}"
                         )
                     record.update(
                         state="settling",
@@ -343,10 +348,9 @@ class LiveOrders:
                         )
                         self.save(record)
                         return record
-                    unchanged_unknown = (
-                        not record.get("observed_pending")
-                        and balances == record.get("before_balances")
-                    )
+                    unchanged_unknown = not record.get(
+                        "observed_pending"
+                    ) and balances == record.get("before_balances")
                     previous = record.get("settlement_candidate")
                     if not previous or previous["balances"] != balances:
                         record["settlement_candidate"] = {
@@ -486,10 +490,7 @@ class LiveOrders:
         record.pop("settlement_candidate", None)
         record.update(
             state="settling",
-            message=(
-                f"{detail}；{action}，5 秒后重试"
-                f"（已等待 {int(elapsed)} 秒）。"
-            ),
+            message=(f"{detail}；{action}，5 秒后重试（已等待 {int(elapsed)} 秒）。"),
         )
         self.save(record)
 
@@ -526,8 +527,7 @@ class LiveOrders:
                     record.update(
                         cancel_state="not_clicked",
                         cancel_discovery_attempts=attempts,
-                        cancel_retry_after=time.time()
-                        + CANCEL_DISCOVERY_RETRY_SECONDS,
+                        cancel_retry_after=time.time() + CANCEL_DISCOVERY_RETRY_SECONDS,
                         message=(
                             f"尚未识别撤单控件，确认未点击；将在 15 秒后重试"
                             f"（{attempts}/{MAX_CANCEL_DISCOVERY_ATTEMPTS}）。"
@@ -560,8 +560,7 @@ class LiveOrders:
                     cancel_state="confirmed",
                     cancel_result=result,
                     cancel_confirmed_at=confirmed_at,
-                    cancel_check_after=confirmed_at
-                    + CANCEL_POST_CONFIRM_DELAY_SECONDS,
+                    cancel_check_after=confirmed_at + CANCEL_POST_CONFIRM_DELAY_SECONDS,
                     cancel_timeout_at=confirmed_at + CANCEL_CONFIRM_TIMEOUT_SECONDS,
                     cancel_refresh_pending=True,
                     message="已确认取消全部订单；等待后刷新页面并核对委托与余额。",
