@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from app import decision_log
+from app.alpha123 import Alpha123Client, Alpha123Error
 from app.automatic import Automatic, StartTask
 from app.browser.diagnostics import PageTest
 from app.browser.manager import BrowserBusy, BrowserManager
@@ -144,6 +145,31 @@ def health():
         "status": "ok",
         "database": "connected",
         "trading_enabled": app.state.live.enabled,
+    }
+
+
+@app.get("/api/airdrop-events/preview")
+def airdrop_events_preview():
+    """Read-only source verification for the future airdrop-entry task."""
+    try:
+        events, rejected = Alpha123Client().events()
+    except Alpha123Error as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "events": [
+            {
+                "event_id": event.event_id,
+                "token": event.token,
+                "chain_id": event.chain_id,
+                "contract_address": event.contract_address,
+                "scheduled_at": event.scheduled_at,
+                "source_status": event.source_status,
+                "source_type": event.source_type,
+                "supported": event.chain_id == "56",
+            }
+            for event in events
+        ],
+        "rejected": rejected,
     }
 
 
