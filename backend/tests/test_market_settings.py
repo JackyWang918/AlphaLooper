@@ -57,8 +57,46 @@ def test_request_uses_file_proxy_and_error_does_not_expose_credentials(
             raise httpx.ConnectError("private credential diagnostic")
 
     monkeypatch.setattr(market.httpx, "Client", Client)
+    with pytest.raises(httpx.ConnectError) as error:
+        market.get_once("https://example.invalid", "http://user:secret@127.0.0.1:7897", "httpx")
+    assert calls[0]["proxy"] == "http://user:secret@127.0.0.1:7897"
+    assert "secret" not in str(error.value) and "private" in str(error.value)
+
+
+def test_request_retries_httpx_then_uses_curl_fallback(env_file, monkeypatch):
+    env_file.write_text("ALPHALOOPER_HTTP_PROXY=http://127.0.0.1:7897\n")
+    calls = []
+
+    def fetch(url, proxy, transport):
+        calls.append((proxy, transport))
+        if transport == "httpx":
+            raise httpx.ConnectError("temporary proxy connection error")
+        return {"code": "000000", "data": {"ok": True}}
+
+    monkeypatch.setattr(market, "get_once", fetch)
+    monkeypatch.setattr(market.time, "sleep", lambda _: None)
+
+    assert market.public_get(market.PREFIX + "klines") == {"ok": True}
+    assert calls == [
+        ("http://127.0.0.1:7897", "httpx"),
+        ("http://127.0.0.1:7897", "httpx"),
+        ("http://127.0.0.1:7897", "curl"),
+    ]
+
+
+def test_request_failure_reports_attempts_without_proxy_credentials(env_file, monkeypatch):
+    env_file.write_text("ALPHALOOPER_HTTP_PROXY=http://user:secret@127.0.0.1:7897\n")
+    monkeypatch.setattr(
+        market,
+        "get_once",
+        lambda *_: (_ for _ in ()).throw(httpx.ConnectError("private diagnostic")),
+    )
+    monkeypatch.setattr(market.time, "sleep", lambda _: None)
+
     with pytest.raises(market.MarketError) as error:
         market.public_get(market.PREFIX + "klines")
-    assert calls[0]["proxy"] == "http://user:secret@127.0.0.1:7897"
+
     assert "klines" in str(error.value) and "已配置代理" in str(error.value)
+    assert "httpx:ConnectError" in str(error.value)
+    assert "curl:ConnectError" in str(error.value)
     assert "secret" not in str(error.value) and "private" not in str(error.value)

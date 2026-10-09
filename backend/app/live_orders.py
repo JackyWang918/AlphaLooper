@@ -128,6 +128,14 @@ class LiveOrders:
             raise ValueError(result.get("message", "浏览器执行失败"))
         return result
 
+    @staticmethod
+    def inspection_payload(record):
+        payload = dict(record["request"])
+        submitted = record.get("submitted_order") or {}
+        if payload["side"] == "sell" and submitted.get("quantity"):
+            payload["expected_sell_quantity"] = submitted["quantity"]
+        return payload
+
     def submit(self, body: SubmitOrder, *, owner=None, quote_valid_until=None):
         with self.lock:
             task = self.automatic.get() if self.automatic else None
@@ -203,10 +211,27 @@ class LiveOrders:
                 )
                 if result.get("confirmation_clicked") is not True:
                     raise ValueError("执行器未确认已完成订单确认步骤，保留待核实状态。")
+                submitted_order = result.get("submitted_order")
+                if body.side == "sell":
+                    if not isinstance(submitted_order, dict):
+                        raise ValueError("执行器未返回平台滑条生成的卖出数量，保留待核实状态。")
+                    try:
+                        quantity = Decimal(str(submitted_order["quantity"]))
+                    except (KeyError, ValueError, ArithmeticError) as exc:
+                        raise ValueError(
+                            "执行器返回的卖出数量无效，保留待核实状态。"
+                        ) from exc
+                    if quantity <= 0:
+                        raise ValueError("平台滑条生成的卖出数量必须为正数。")
                 record.update(
                     state="waiting",
                     confirmation_clicked=True,
                     confirmation=result.get("confirmation"),
+                    **(
+                        {"submitted_order": {"quantity": str(quantity)}}
+                        if body.side == "sell"
+                        else {}
+                    ),
                     message="已核对订单确认单并点击继续，等待平台订单结果。",
                 )
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
@@ -276,7 +301,7 @@ class LiveOrders:
                     self.last_page_refresh_at = now
                 result = self.call(
                     "live_progress" if record.get("task_id") else "live_inspect",
-                    record["request"]
+                    self.inspection_payload(record)
                     | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
                 if refresh_before_check and not result.get("page_refreshed"):
@@ -426,7 +451,7 @@ class LiveOrders:
             record = self.get(str(request_id))
             if not record or not record["active"]:
                 raise ValueError("该委托已结束或不存在，请刷新状态。")
-            result = self.call("live_unsubmitted", record["request"])
+            result = self.call("live_unsubmitted", self.inspection_payload(record))
             if result["pending"]:
                 raise ValueError("平台仍有挂单，不能标记为未提交。")
             if result.get("settling") or result.get("balances") != record.get(
@@ -521,7 +546,7 @@ class LiveOrders:
             record.update(cancel_requested_at=time.time(), cancel_state="unknown")
             self.save(record)  # Before click; never replay after timeout/restart.
             try:
-                result = self.call("live_cancel", record["request"])
+                result = self.call("live_cancel", self.inspection_payload(record))
                 if result.get("already_absent"):
                     record.pop("cancel_requested_at", None)
                     record.pop("cancel_retry_after", None)

@@ -64,7 +64,9 @@ def page():
 def test_submit_once_pending_then_balance_reconciliation_without_history(page):
     assert preflight(page, PAYLOAD)["balances"]["quote_available"] == "100"
     assert page.evaluate("window.submits") == 0
-    assert submit_once(page, PAYLOAD)["clicked"]
+    submitted = submit_once(page, PAYLOAD)
+    assert submitted["clicked"]
+    assert submitted["submitted_order"]["quantity"] == "1"
     assert page.evaluate("[window.submits,window.confirmations]") == [1, 1]
     assert inspect_order(page, PAYLOAD)["pending"]
     with pytest.raises(ValueError, match="已有挂单"):

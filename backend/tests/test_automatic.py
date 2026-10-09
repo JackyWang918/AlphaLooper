@@ -60,7 +60,11 @@ class Browser:
             if payload["side"] == "sell" and payload.get("sell_all"):
                 self.pending["quantity"] = str(self.balance)
             self.filled = D(0)
-            return {"ok": True, "confirmation_clicked": True}
+            return {
+                "ok": True,
+                "confirmation_clicked": True,
+                "submitted_order": {"quantity": self.pending["quantity"]},
+            }
         if action in {"live_progress", "live_inspect", "live_unsubmitted"}:
             return {
                 "ok": True,

@@ -126,7 +126,7 @@ def submit_once(page, payload):
     command = FillForm(**payload)
     if not current_order(page, payload)["empty"]:
         raise ValueError("提交前发现平台已有挂单，已停止。")
-    fill_form(page, payload)
+    submitted_order = fill_form(page, payload)
     state = verify_identity(page, command)
     if state["side"] != command.side:
         raise ValueError("下单方向发生变化。")
@@ -138,7 +138,12 @@ def submit_once(page, payload):
         button.click(timeout=3000)  # Never retry a possibly sent order.
     with stage("核对订单确认弹窗并点击一次继续"):
         confirmation = confirm_once(page, command, deadline=deadline)
-    return {"clicked": True, "confirmation_clicked": True, "confirmation": confirmation}
+    return {
+        "clicked": True,
+        "confirmation_clicked": True,
+        "confirmation": confirmation,
+        "submitted_order": submitted_order,
+    }
 
 
 def inspect_order(page, payload):

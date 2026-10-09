@@ -167,6 +167,20 @@ def current_detail(page, payload):
         or quantity <= 0
     ):
         raise ValueError("当前委托币种、方向或订单类型与系统记录不符。")
+    expected_sell_quantity = payload.get("expected_sell_quantity")
+    if command.side == "sell" and expected_sell_quantity is not None:
+        expected = Decimal(str(expected_sell_quantity))
+        # The current-order table can truncate or round its quantity. Accept at
+        # most one displayed least-significant digit, but never associate a
+        # materially different same-symbol sell order with this submission.
+        displayed_unit = Decimal(1).scaleb(quantity.as_tuple().exponent)
+        if abs(quantity - expected) > displayed_unit:
+            raise ValueError(
+                "当前卖单数量与本次平台滑条生成数量不符；"
+                f"本次 {expected} {command.expected_symbol}，"
+                f"当前委托 {quantity} {command.expected_symbol}。"
+                "拒绝关联、撤单或结算，请人工核对。"
+            )
     # Platform quantities are authoritative (quote buys and percentage sells).
     # Progress columns are optional; balances drive the ledger.
     detail = {

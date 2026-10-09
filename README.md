@@ -130,7 +130,7 @@ ALPHALOOPER_HTTP_PROXY=http://127.0.0.1:7897
 ALPHALOOPER_HTTP_TRANSPORT=curl
 ```
 
-`curl` 是本机 Python TLS 不兼容时的可选方式，需要已安装 curl；它保持 HTTPS 证书校验，不携带登录 Cookie。公司机器已实测该方式可取回 DGAI 行情。代理地址应按家里网络调整，不能假定始终可用。
+`curl` 是本机 Python TLS 不兼容时的可选方式，需要已安装 curl；它保持 HTTPS 证书校验，不携带登录 Cookie。公司机器已实测该方式可取回 DGAI 行情。配置为 `httpx` 时，单次公开行情请求遇到可恢复的网络错误会先重试一次，再用同一代理以 curl 备用传输一次；仍失败才暂停，不会使用缓存或旧 K 线。代理地址应按家里网络调整，不能假定始终可用。
 
 在 `backend` 中可使用普通命令启动；以下显式加载环境文件的命令也继续支持：
 

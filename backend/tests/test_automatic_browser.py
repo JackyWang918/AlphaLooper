@@ -182,6 +182,36 @@ def test_current_order_keeps_platform_price_without_requiring_exact_match(page):
     assert result["current_order"]["price"] == "0.899999"
 
 
+def test_sell_order_with_different_platform_quantity_is_not_associated(page):
+    install_order(page, direction="卖出", quantity="226.34 DGAI")
+    payload = {
+        **PAYLOAD,
+        "side": "sell",
+        "sell_all": True,
+        "expected_sell_quantity": "83.71239",
+    }
+
+    with pytest.raises(ValueError, match="当前卖单数量与本次平台滑条生成数量不符"):
+        inspect_progress(page, payload)
+    with pytest.raises(ValueError, match="当前卖单数量与本次平台滑条生成数量不符"):
+        cancel_once(page, payload)
+    assert page.evaluate("window.cancelRequests") == 0
+
+
+def test_sell_order_quantity_allows_one_displayed_last_digit(page):
+    install_order(page, direction="卖出", quantity="83.71 DGAI")
+    result = inspect_progress(
+        page,
+        {
+            **PAYLOAD,
+            "side": "sell",
+            "sell_all": True,
+            "expected_sell_quantity": "83.71239",
+        },
+    )
+    assert result["pending"]
+
+
 def test_cancel_rejects_wrong_direction_without_click(page):
     install_order(page, direction="卖出")
     with pytest.raises(ValueError):

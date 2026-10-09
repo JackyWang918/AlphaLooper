@@ -19,6 +19,9 @@ BASE = "https://www.binance.com"
 PREFIX = "/bapi/defi/v1/public/alpha-trade/"
 TOKEN_LIST = "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
 ENV_FILE = PROJECT_ROOT / "backend" / ".env"
+REQUEST_TIMEOUT_SECONDS = 8
+REQUEST_RETRY_COUNT = 2
+REQUEST_RETRY_DELAY_SECONDS = 0.3
 
 
 def network_settings():
@@ -74,49 +77,73 @@ class Snapshot(BaseModel):
     ticker: dict
 
 
+def get_once(url, proxy, transport):
+    if transport == "curl":
+        args = [
+            "curl.exe" if os.name == "nt" else "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            str(REQUEST_TIMEOUT_SECONDS),
+        ]
+        if proxy:
+            args += ["--proxy", proxy]
+        result = subprocess.run(
+            args + [url],
+            capture_output=True,
+            timeout=REQUEST_TIMEOUT_SECONDS + 3,
+            check=True,
+        )
+        return json.loads(result.stdout)
+    if transport == "httpx":
+        with httpx.Client(
+            proxy=proxy, timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            return response.json()
+    raise MarketError("ALPHALOOPER_HTTP_TRANSPORT 必须为 httpx 或 curl。")
+
+
 def public_get(path: str, params=None):
+    """Read fresh public data with bounded transport recovery, never cache fallback."""
     url = BASE + path + ("?" + urlencode(params) if params else "")
-    proxy, transport = network_settings()
-    try:
-        if transport == "curl":
-            args = [
-                "curl.exe" if os.name == "nt" else "curl",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "15",
-            ]
-            if proxy:
-                args += ["--proxy", proxy]
-            result = subprocess.run(
-                args + [url], capture_output=True, timeout=18, check=True
-            )
-            body = json.loads(result.stdout)
-        elif transport == "httpx":
-            with httpx.Client(proxy=proxy, timeout=15, trust_env=False) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                body = response.json()
-        else:
-            raise MarketError("ALPHALOOPER_HTTP_TRANSPORT 必须为 httpx 或 curl。")
-        if (
-            not isinstance(body, dict)
-            or body.get("code") != "000000"
-            or body.get("success") is False
-            or body.get("data") is None
-        ):
-            raise MarketError("Alpha 行情接口返回失败，未使用旧数据替代。")
-        return body["data"]
-    except (httpx.HTTPError, OSError, subprocess.SubprocessError, ValueError) as exc:
-        if isinstance(exc, MarketError):
-            raise
-        route = "已配置代理" if proxy else "直连，未配置代理"
-        endpoint = path.rstrip("/").rsplit("/", 1)[-1]
-        raise MarketError(
-            f"公开行情请求失败（接口 {endpoint}；{transport}；{route}；{type(exc).__name__}）。"
-            "请检查 Clash 是否运行及 backend/.env 的代理端口。"
-        ) from exc
+    proxy, configured_transport = network_settings()
+    transports = (
+        ("httpx", "curl") if configured_transport == "httpx" else ("curl",)
+    )
+    errors = []
+    for transport in transports:
+        attempts = REQUEST_RETRY_COUNT if transport == configured_transport else 1
+        for attempt in range(attempts):
+            try:
+                body = get_once(url, proxy, transport)
+            except (
+                httpx.HTTPError,
+                OSError,
+                subprocess.SubprocessError,
+                json.JSONDecodeError,
+            ) as exc:
+                errors.append(f"{transport}:{type(exc).__name__}")
+                if attempt + 1 < attempts:
+                    time.sleep(REQUEST_RETRY_DELAY_SECONDS)
+                continue
+            if (
+                not isinstance(body, dict)
+                or body.get("code") != "000000"
+                or body.get("success") is False
+                or body.get("data") is None
+            ):
+                raise MarketError("Alpha 行情接口返回失败，未使用旧数据替代。")
+            return body["data"]
+    route = "已配置代理" if proxy else "直连，未配置代理"
+    endpoint = path.rstrip("/").rsplit("/", 1)[-1]
+    attempted = "、".join(errors)
+    raise MarketError(
+        f"公开行情请求失败（接口 {endpoint}；{route}；已尝试 {attempted}）。"
+        "请检查 Clash 是否运行及 backend/.env 的代理端口。"
+    )
 
 
 def resolve_pair(tokens, exchange, url, quote):
