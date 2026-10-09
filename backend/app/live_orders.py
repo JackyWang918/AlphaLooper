@@ -254,7 +254,16 @@ class LiveOrders:
                     allow_refresh
                     and (
                         record.get("cancel_refresh_pending")
-                        or record.get("absence_refresh_pending")
+                        # A normal order disappearance is reconciled with two
+                        # read-only snapshots.  Reloading every completed short
+                        # cycle makes the trading page substantially less stable.
+                        # Keep this recovery reload only for a confirmed cancel,
+                        # or for the one explicit retry after contradictory
+                        # balance directions.
+                        or (
+                            record.get("absence_refresh_pending")
+                            and record.get("balance_direction_refresh_attempted")
+                        )
                     )
                 )
                 refresh_due_at = (
@@ -270,12 +279,11 @@ class LiveOrders:
                     record["request"]
                     | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
-                if (
-                    refresh_before_check
-                    and not result.get("page_refreshed")
-                    and not result.get("page_loading")
-                ):
-                    raise ValueError("交易页刷新结果未确认；不按旧余额结算。")
+                if refresh_before_check and not result.get("page_refreshed"):
+                    # Do not turn a failed recovery reload into a reload loop.
+                    # The automatic scheduler turns this durable error into a
+                    # paused task; a user must inspect the page before resuming.
+                    raise ValueError("交易页刷新结果未确认；不按旧余额结算，自动任务将暂停等待人工核对。")
                 if refresh_before_check and result.get("page_refreshed"):
                     self.last_page_refresh_at = time.time()
                     record["cancel_refresh_pending"] = False
@@ -328,8 +336,8 @@ class LiveOrders:
                         record.update(
                             state="settling",
                             message=(
-                                "当前无委托；等待整页刷新完成后核对余额，"
-                                "期间不提交新订单。"
+                                "当前无委托；恢复性页面刷新未完成，"
+                                "不按旧余额结算或提交新订单。"
                             ),
                         )
                         self.save(record)
@@ -339,12 +347,15 @@ class LiveOrders:
                             "旧订单没有买入前余额基准，不能转换为新口径。请核对后结束旧任务。"
                         )
                     balances = result["balances"]
-                    if not record.get("absence_refreshed_at"):
+                    if not allow_refresh and not record.get("absence_refreshed_at"):
+                        # After restart or an explicit pause, stay read-only and
+                        # require the user to resume before closing an order
+                        # whose disappearance has not yet been reconciled in
+                        # this process.
                         record.pop("settlement_candidate", None)
                         record.update(
                             state="settling",
-                            absence_refresh_pending=True,
-                            message="当前无委托；下次先刷新交易页，再核对余额。",
+                            message="当前无委托；任务已暂停，等待人工核对后恢复再结算余额。",
                         )
                         self.save(record)
                         return record
@@ -363,7 +374,7 @@ class LiveOrders:
                     elif time.time() - previous["at"] >= 2:
                         if unchanged_unknown:
                             raise ValueError(
-                                "确认弹窗已点击，但刷新后从未看到当前委托，且余额稳定后仍与提交前相同；"
+                                "确认弹窗已点击，但从未看到当前委托，且余额稳定后仍与提交前相同；"
                                 "无法确认平台是否接受订单，不会自动重发。"
                             )
                         try:
