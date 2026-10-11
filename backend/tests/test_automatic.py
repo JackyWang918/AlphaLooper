@@ -868,6 +868,38 @@ def test_budget_exit_cancels_then_sells_and_survives_restart(rig):
     assert r.browser.calls.count("live_submit") == 3
 
 
+def test_budget_loss_refreshes_before_setting_sticky_stop(rig, monkeypatch):
+    r = rig
+    task = r.auto.get()
+    task.update(task_start_equity="111", task_start_quote="111", next_buy_check_at=0)
+    r.auto.save(task)
+    original = r.live.call
+    reads = []
+
+    def call(action, payload):
+        if action == "order_readiness":
+            reads.append(payload)
+            return {
+                "balances": {
+                    "quote_available": "100" if len(reads) == 1 else "111",
+                    "base_available": "0",
+                    "quote_total": "100" if len(reads) == 1 else "111",
+                    "base_total": "0",
+                }
+            }
+        return original(action, payload)
+
+    monkeypatch.setattr(r.live, "call", call)
+
+    checked = tick(r)
+
+    assert not checked["stop_buying"] and not checked["exiting"]
+    assert len(reads) == 2
+    assert "refresh_before_check" not in reads[0]
+    assert reads[1]["refresh_before_check"] is True
+    assert D(checked["risk"]["session_loss"]) == 0
+
+
 def test_budget_during_partial_buy_cancels_before_exit_sell(rig):
     r = rig
     tick(r)

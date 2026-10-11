@@ -31,6 +31,7 @@ from app.strategy import align
 RISK_POLICY_VERSION = 3
 STRATEGY_POLICY_VERSION = 2
 AUTO_ORDER_POLL_SECONDS = 5
+RISK_REFRESH_MIN_INTERVAL_SECONDS = 30
 
 
 def trade_price_band(m):
@@ -108,6 +109,7 @@ class Automatic:
         self.notifier = notifier
         self.running = False  # Never restored from disk.
         self.last_poll = 0
+        self.last_risk_page_refresh_at = 0.0
         self.evidence = {}
         live.automatic = self
 
@@ -547,10 +549,38 @@ class Automatic:
             raise ValueError("行情与任务币种不匹配。")
         return m
 
+    def refresh_risk_wallet(self, t, record, now):
+        """Reload once before a loss snapshot can make the budget stop sticky."""
+        if now < self.last_risk_page_refresh_at + RISK_REFRESH_MIN_INTERVAL_SECONDS:
+            return None
+        # Throttle attempts too: a timeout may still have started navigation.
+        self.last_risk_page_refresh_at = now
+        if record:
+            result = self.live.call(
+                "live_progress",
+                self.live.inspection_payload(record) | {"refresh_before_check": True},
+            )
+            if result.get("page_loading") or result.get("settling"):
+                raise ValueError("净资产损耗复核刷新后页面或余额尚未就绪。")
+            balances = result.get("balances")
+        else:
+            result = self.live.call(
+                "order_readiness",
+                self.probe(t["request"]) | {"refresh_before_check": True},
+            )
+            balances = result.get("balances")
+        if not balances:
+            raise ValueError("净资产损耗复核刷新后未取得余额。")
+        self.last_risk_page_refresh_at = self.clock()
+        return balances
+
     def consume(self, t, record, *, log_event=True):
         """Consume a local order exactly once together with the cleared pointer."""
         result = record["result"]
         wallet = result["balances"]
+        # A completed order establishes a new balance baseline. Do not defer a
+        # later risk recheck merely because it follows an earlier page reload.
+        self.last_risk_page_refresh_at = 0.0
         t.update(balances=wallet, inventory=wallet["base_available"])
         if record["request"]["side"] == "buy":
             paid = -D(result["cash_delta"])
@@ -845,6 +875,28 @@ class Automatic:
             wallet = t["balances"]
         if minute_due or not record:
             risk = self.risk(t, wallet, price_ref, record)
+            if (
+                risk["session_loss"] is not None
+                and D(risk["session_loss"]) > c.budget
+                and not t["stop_buying"]
+            ):
+                before_refresh = risk
+                refreshed_wallet = self.refresh_risk_wallet(t, record, now)
+                if refreshed_wallet is None:
+                    t.update(
+                        risk=risk,
+                        risk_reconcile=True,
+                        message=(
+                            "净资产损耗快照超过阈值；等待页面刷新节流后重新核对，"
+                            "期间不停止任务或提交新订单。"
+                        ),
+                    )
+                    self.evidence.update(balances=wallet, risk=risk)
+                    self.save(t, "risk_recheck", t["message"])
+                    return
+                wallet = refreshed_wallet
+                risk = self.risk(t, wallet, price_ref, record)
+                self.evidence["risk_before_refresh"] = before_refresh
             t["risk"] = risk
             self.evidence.update(balances=wallet, risk=risk)
             t["last_minute"] = int(now) // 60

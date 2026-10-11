@@ -92,6 +92,9 @@ def order_readiness(page, payload):
     from app.browser.automatic import wallet_snapshot
 
     with stage("检查当前委托及余额"):
+        if payload.get("refresh_before_check"):
+            with stage("刷新交易页"):
+                page.reload(wait_until="domcontentloaded", timeout=30000)
         if not current_order(page, payload)["empty"]:
             raise ValueError("平台已有挂单，不能叠加新单。")
         checkpoint("下单前读取买卖两侧余额")
