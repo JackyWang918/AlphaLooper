@@ -1,5 +1,24 @@
 # AlphaLooper
 
+## 2026-10-14 DeepSeek 异常诊断与企业微信通知
+
+自动任务异常暂停时，通知线程使用暂停时的本地订单状态、前后余额、风险/恢复状态和最近最多六条判断记录，请 DeepSeek 给出诊断结论、可能原因、人工排查步骤及仍缺少的证据，并合并到原企业微信停止消息。AI 不访问浏览器、不执行恢复/下单/撤单、不修改任务或止损规则。用户主动暂停、正常结束和后端重启通知不调用 AI。
+
+在本机 `backend/.env` 填写下面的 Key（已准备空白配置项，其他主机可从 `.env.example` 复制）：
+
+```dotenv
+ALPHALOOPER_AI_DIAGNOSTICS_ENABLED=true
+ALPHALOOPER_DEEPSEEK_API_KEY=在这里填写你的DeepSeek_API_Key
+ALPHALOOPER_DEEPSEEK_MODEL=deepseek-flash
+ALPHALOOPER_DEEPSEEK_TIMEOUT_SECONDS=20
+```
+
+API Key 从 [DeepSeek 控制台](https://platform.deepseek.com/) 获取；默认模型及 Chat Completions 接口参照 [DeepSeek 官方文档](https://api-docs.deepseek.com/)。AI 沿用 `ALPHALOOPER_HTTP_PROXY`（未设置则直连）。需配置原有 `ALPHALOOPER_WECOM_WEBHOOK_URL` 才会在停止通知中触发分析；Key 未填、功能关闭、接口失败或超时会附加状态说明并照常发送原停止通知。AI 每次异常只请求一次，默认最多等待 20 秒（可设置 5–45 秒）；企业微信重试复用同一分析，不再次调用 AI。合并通知可能等待这段分析时间，但不会占用交易锁或阻塞控制台。
+
+填写后选择合适时机重启后端。可先在 `backend` 执行 `uv run python -m scripts.check_ai_diagnostics`，该自检仅向 DeepSeek 发送构造的模拟问题，使用 API 额度，不发送企业微信消息或操作账户。开发测试均使用模拟 API，未验证你的真实 Key 或发送测试消息。
+
+发送给 DeepSeek 的是筛选、限长及脱敏后的故障和资金数值；不上传 `.env`、完整任务/数据库、账户账本名称、交易链接、Cookie、会话令牌、HTML 或截图。AI 输出仍是推测，不能替代平台委托与余额核对。完整诊断输入及结果保存在现有判断日志的“AI 异常分析”类型，企业微信文本按 UTF-8 字节限制保留摘要。无新依赖或数据库迁移，密钥不提交 Git。
+
 ## 2026-10-14 自动恢复与账户同步核对
 
 页面加载、只读控件超时及公开行情暂时失败现在进入“正在恢复 / 核对中”，每 5 秒重查；页面/委托读取及余额方向等待最多 60 秒，任务级读取/行情/风险复核和持续变化的订单结算最多 120 秒。通过核对后自动继续原任务，期间不提交或撤单。超过期限、币种/页面结构冲突、验证、浏览器断连或交易结果未知仍暂停并要求人工；后端重启和用户主动暂停不自动恢复。

@@ -26,14 +26,14 @@ async def lifespan(app: FastAPI):
     app.state.engine = make_engine()
     app.state.browser = BrowserManager()
     app.state.live = LiveOrders(app.state.engine, app.state.browser)
-    app.state.notifier = WeComNotifier.from_env()
+    app.state.notifier = WeComNotifier.from_env(app.state.engine)
     app.state.automatic = Automatic(
         app.state.engine, app.state.live, notifier=app.state.notifier
     )
     existing = app.state.automatic.get()
     if existing:
         app.state.notifier.enqueue_task_stopped(
-            existing,
+            {**existing, "phase": "paused"},
             "后端服务已重启；出于安全规则，自动任务保持暂停，等待人工核对后恢复。",
         )
     app.state.live.start()
@@ -292,6 +292,7 @@ DecisionKind = Literal[
     "risk",
     "risk_recheck",
     "recovery",
+    "ai_analysis",
     "cancel",
     "execution",
     "order_check",

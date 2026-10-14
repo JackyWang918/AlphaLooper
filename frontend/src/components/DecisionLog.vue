@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 const props=defineProps<{tasks:{id:string;request:{expected_symbol:string}}[];currentId?:string}>()
 type Entry={id:number;time:number;kind:string;reason:string;state:Record<string,unknown>;evidence:Record<string,any>;details:Record<string,any>|null}
 const selected=ref(''),kind=ref(''),items=ref<Entry[]>([]),next=ref<number|null>(null),error=ref(''),busy=ref(false),auto=ref(true),config=ref<Record<string,unknown>>({})
-const labels:Record<string,string>={control:'任务操作',buy_wait:'暂不买入',buy:'决定买入',sell:'决定卖出',risk:'持仓评估',risk_recheck:'资产同步复核',recovery:'自动恢复',cancel:'决定撤单',execution:'执行反馈',order_check:'订单巡检',fill:'成交回填',completed:'任务结束',error:'异常暂停'}
+const labels:Record<string,string>={control:'任务操作',buy_wait:'暂不买入',buy:'决定买入',sell:'决定卖出',risk:'持仓评估',risk_recheck:'资产同步复核',recovery:'自动恢复',ai_analysis:'AI 异常分析',cancel:'决定撤单',execution:'执行反馈',order_check:'订单巡检',fill:'成交回填',completed:'任务结束',error:'异常暂停'}
 let timer:ReturnType<typeof setInterval>|undefined
 let version=0
 async function load(older=false){

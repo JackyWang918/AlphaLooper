@@ -78,6 +78,7 @@ const logLabels: Record<string, string> = {
   risk: '风险检查',
   risk_recheck: '资产同步复核',
   recovery: '自动恢复',
+  ai_analysis: 'AI 异常分析',
   cancel: '决定撤单',
   execution: '执行反馈',
   order_check: '订单巡检',

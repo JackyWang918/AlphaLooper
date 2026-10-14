@@ -11,6 +11,7 @@ from app.strategy import Config
 def disable_wecom_notifications(monkeypatch):
     """Never let automated tests send messages to a real robot."""
     monkeypatch.setenv("ALPHALOOPER_WECOM_WEBHOOK_URL", "")
+    monkeypatch.setenv("ALPHALOOPER_DEEPSEEK_API_KEY", "")
 
 
 @pytest.fixture

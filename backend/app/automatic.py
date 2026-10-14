@@ -573,7 +573,29 @@ class Automatic:
 
     def notify_stopped(self, task, reason):
         if self.notifier:
-            self.notifier.enqueue_task_stopped(dict(task), reason)
+            snapshot = dict(task)
+            if task.get("phase") == "attention":
+                # Capture only local observations; do not inspect or change the browser.
+                try:
+                    order = (
+                        self.live.get(task["pending"]["request_id"])
+                        if task.get("pending")
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 -- retain notification even when context capture fails
+                    order = None
+                try:
+                    events = decision_log.read(self.engine, task["id"], limit=6)[
+                        "items"
+                    ]
+                except Exception:  # noqa: BLE001 -- diagnostics cannot suppress the stop notification
+                    events = []
+                snapshot["_diagnostic_context"] = {
+                    "stopped_at": self.clock(),
+                    "order": order,
+                    "recent_events": events,
+                }
+            self.notifier.enqueue_task_stopped(snapshot, reason)
 
     def snapshot(self, t, c):
         r = t["request"]

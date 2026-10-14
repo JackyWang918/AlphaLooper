@@ -418,6 +418,9 @@ def test_automatic_error_notifies_once_but_manual_pause_does_not(rig):
     assert len(notifier.messages) == 1
     assert notifier.messages[0][1] == "页面结构变化"
     assert notifier.messages[0][0]["buy_total"] == "0"
+    context = notifier.messages[0][0]["_diagnostic_context"]
+    assert context["recent_events"][0]["kind"] == "error"
+    assert context["stopped_at"] == rig.now[0]
 
     rig.auto.control(rig.body.request_id, "resume")
     rig.auto.control(rig.body.request_id, "pause")
@@ -702,7 +705,7 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
             len(lines) == 3
         )  # task metadata, start, pause; duplicate start logs nothing
         assert client.get(log_url, params={"limit": 10000}).status_code == 422
-        for kind in ("recovery", "risk_recheck"):
+        for kind in ("recovery", "risk_recheck", "ai_analysis"):
             assert client.get(log_url, params={"kind": kind}).status_code == 200
             assert (
                 client.get(log_url + "/export", params={"kind": kind}).status_code
