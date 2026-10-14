@@ -76,6 +76,8 @@ const logLabels: Record<string, string> = {
   buy: '决定买入',
   sell: '决定卖出',
   risk: '风险检查',
+  risk_recheck: '资产同步复核',
+  recovery: '自动恢复',
   cancel: '决定撤单',
   execution: '执行反馈',
   order_check: '订单巡检',
@@ -147,11 +149,12 @@ const totalPoints = computed(() => Number(current.value?.request.config.current_
 const remainingPoints = computed(() => Math.max(0, Number(current.value?.request.config.target_points ?? 0) - totalPoints.value))
 const overallPnl = computed(() => {
   if (!current.value) return '—'
+  if (current.value.phase === 'recovering') return '待核对'
   const loss = current.value.risk?.session_loss ?? current.value.session_loss
   return invertDecimal(loss)
 })
 const statusTone = computed(() => automatic.value.running ? 'running' : current.value ? 'paused' : 'idle')
-const statusText = computed(() => automatic.value.running ? '运行中' : current.value ? '已暂停' : '未启动')
+const statusText = computed(() => automatic.value.running ? (current.value?.phase === 'recovering' ? '正在恢复 / 核对中' : '运行中') : current.value ? '已暂停' : '未启动')
 
 function tradeUrl() {
   return `https://www.binance.com/zh-CN/alpha/bsc/${token.value.trim().toLowerCase()}`

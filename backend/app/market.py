@@ -45,6 +45,10 @@ class MarketError(ValueError):
     pass
 
 
+class MarketUnavailable(MarketError):
+    kind = "read_retry"
+
+
 class Candle(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
     time: int
@@ -140,7 +144,7 @@ def public_get(path: str, params=None):
     route = "已配置代理" if proxy else "直连，未配置代理"
     endpoint = path.rstrip("/").rsplit("/", 1)[-1]
     attempted = "、".join(errors)
-    raise MarketError(
+    raise MarketUnavailable(
         f"公开行情请求失败（接口 {endpoint}；{route}；已尝试 {attempted}）。"
         "请检查 Clash 是否运行及 backend/.env 的代理端口。"
     )
@@ -173,7 +177,9 @@ def resolve_pair(tokens, exchange, url, quote):
 
 
 def validate_snapshot(m: Snapshot, now_ms: int, max_age=15000):
-    if not -5000 <= now_ms - m.fetched_at <= max_age:
+    if now_ms - m.fetched_at > max_age:
+        raise MarketUnavailable("行情已过期，请重新获取行情后核对。")
+    if now_ms - m.fetched_at < -5000:
         raise MarketError("行情已过期或时间异常，请刷新行情后试算。")
 
 

@@ -9,6 +9,7 @@ dependencies = [
     "playwright>=1.63.0",
     "python-dotenv>=1.2.3",
     "sqlalchemy>=2.0.54",
+    "tzdata>=2026.5",
     "uvicorn[standard]>=0.53.0",
 ]
 

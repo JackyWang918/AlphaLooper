@@ -284,9 +284,9 @@ def test_first_post_cancel_inspection_refreshes_page(page):
 @pytest.mark.parametrize("placeholder", ["", "-", "--", "—", "加载中", "加载中…"])
 def test_form_suffix_loading_is_retryable(page, monkeypatch, placeholder):
     monkeypatch.setattr("app.browser.alpha.FORM_READY_TIMEOUT", 0.01)
-    page.locator("#limitPrice").locator("..").locator(
-        ".bn-textField-suffix"
-    ).evaluate("(element, value)=>element.textContent=value", placeholder)
+    page.locator("#limitPrice").locator("..").locator(".bn-textField-suffix").evaluate(
+        "(element, value)=>element.textContent=value", placeholder
+    )
 
     result = inspect_progress(page, PAYLOAD)
 
@@ -299,9 +299,7 @@ def test_form_suffix_loading_is_retryable(page, monkeypatch, placeholder):
 
 def test_transient_unsupported_quote_recovers_before_second_read(page, monkeypatch):
     monkeypatch.setattr("app.browser.alpha.UNSUPPORTED_QUOTE_CONFIRM_SECONDS", 0.01)
-    suffix = page.locator("#limitPrice").locator("..").locator(
-        ".bn-textField-suffix"
-    )
+    suffix = page.locator("#limitPrice").locator("..").locator(".bn-textField-suffix")
     suffix.evaluate("""element => {
       element.textContent='BTC';
       setTimeout(() => element.textContent='USDT', 1);
@@ -314,9 +312,9 @@ def test_transient_unsupported_quote_recovers_before_second_read(page, monkeypat
 
 
 def test_loaded_unsupported_quote_is_not_retryable(page):
-    page.locator("#limitPrice").locator("..").locator(
-        ".bn-textField-suffix"
-    ).evaluate("element=>element.textContent='BTC'")
+    page.locator("#limitPrice").locator("..").locator(".bn-textField-suffix").evaluate(
+        "element=>element.textContent='BTC'"
+    )
 
     with pytest.raises(ValueError, match="页面计价币为 BTC"):
         inspect_progress(page, PAYLOAD)
@@ -366,3 +364,25 @@ def test_unknown_frozen_is_explicit_not_zero(page):
     result = inspect_progress(page, PAYLOAD)
     assert result["balances"]["quote_total"] is None
     assert result["balances"]["base_total"] == "1"
+
+
+def test_readiness_preserves_loading_category_after_reload(page, monkeypatch):
+    from app.browser.alpha import PageNotReady
+    from app.browser.live import order_readiness
+
+    def reload(**kwargs):
+        page.get_by_role("tab", name="当前委托", exact=True).evaluate("e=>e.remove()")
+
+    monkeypatch.setattr(page, "reload", reload)
+    with pytest.raises(PageNotReady, match="仍在加载"):
+        order_readiness(page, PAYLOAD | {"refresh_before_check": True})
+    assert page.evaluate("window.submits") == 0
+
+
+def test_readiness_success_confirms_refresh_without_trading(page, monkeypatch):
+    from app.browser.live import order_readiness
+
+    monkeypatch.setattr(page, "reload", lambda **kwargs: None)
+    result = order_readiness(page, PAYLOAD | {"refresh_before_check": True})
+    assert result["page_refreshed"] is True
+    assert page.evaluate("window.submits") == 0

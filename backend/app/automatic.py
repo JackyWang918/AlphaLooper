@@ -26,6 +26,17 @@ from app.live_orders import (
     SubmitOrder,
 )
 from app.market import MarketClient, MarketError, validate_snapshot
+from app.recovery import (
+    RECOVERY_SECONDS,
+    RETRY_SECONDS,
+    BalanceNotReady,
+    ExecutionUnknown,
+    ObservationNotReady,
+    RecoveryExpired,
+    category,
+    coherent_delta,
+    validate_wallet,
+)
 from app.strategy import align
 
 RISK_POLICY_VERSION = 3
@@ -62,6 +73,7 @@ def band_order_price(m, side):
     if price <= 0:
         raise MarketError("按价格步长计算的限价非正数。")
     return price, band
+
 
 tasks = Table(
     "auto_tasks",
@@ -161,6 +173,10 @@ class Automatic:
                                 "exiting",
                                 "stop_buying",
                                 "pending",
+                                "phase",
+                                "recovery",
+                                "risk_wallet_recovery",
+                                "error_kind",
                             )
                         },
                         "evidence": self.evidence,
@@ -236,6 +252,12 @@ class Automatic:
                 "kind": "manual",
                 "at": None,
                 "reason": "等待人工恢复任务；当前不会自动交易。",
+            }
+        if task.get("recovery") or task.get("risk_wallet_recovery"):
+            return {
+                "kind": "recovery",
+                "at": task.get("recovery", {}).get("retry_at", now + RETRY_SECONDS),
+                "reason": "正在恢复页面或核对账户同步；核对通过后自动继续，不重放交易动作。",
             }
         if record and record.get("state") == "submission_unknown":
             return {
@@ -470,6 +492,20 @@ class Automatic:
                 self.running = True
                 self.last_poll = 0
                 t["next_buy_check_at"] = 0
+                t.pop("recovery", None)
+                t.pop("risk_wallet_recovery", None)
+                order = self.live.get()
+                if order:
+                    for key in (
+                        "page_loading_started_at",
+                        "read_recovery_started_at",
+                        "balance_direction_started_at",
+                        "settlement_started_at",
+                        "settlement_candidate",
+                        "last_check_error",
+                    ):
+                        order.pop(key, None)
+                    self.live.save(order)
                 t.update(phase="running", message="正在核对原订单与持仓后恢复。")
             elif action == "finish":
                 self.require_risk_policy(t)
@@ -550,28 +586,64 @@ class Automatic:
         return m
 
     def refresh_risk_wallet(self, t, record, now):
-        """Reload once before a loss snapshot can make the budget stop sticky."""
-        if now < self.last_risk_page_refresh_at + RISK_REFRESH_MIN_INTERVAL_SECONDS:
+        """Refresh once, then obtain two coherent observations across ticks."""
+        recovery = t.setdefault("risk_wallet_recovery", {"started_at": now})
+        if now - recovery["started_at"] >= RECOVERY_SECONDS:
+            raise RecoveryExpired(
+                "账户风险复核超过 120 秒，仍未取得可信余额；请人工核对。"
+            )
+        refresh = not recovery.get("refreshed")
+        if (
+            refresh
+            and now
+            < max(self.last_risk_page_refresh_at, self.live.last_page_refresh_at)
+            + RISK_REFRESH_MIN_INTERVAL_SECONDS
+        ):
             return None
-        # Throttle attempts too: a timeout may still have started navigation.
-        self.last_risk_page_refresh_at = now
+        if refresh:
+            self.last_risk_page_refresh_at = now
+            self.live.last_page_refresh_at = now
+        extra = {"refresh_before_check": True} if refresh else {}
         if record:
             result = self.live.call(
                 "live_progress",
-                self.live.inspection_payload(record) | {"refresh_before_check": True},
+                self.live.inspection_payload(record) | extra,
             )
-            if result.get("page_loading") or result.get("settling"):
-                raise ValueError("净资产损耗复核刷新后页面或余额尚未就绪。")
-            balances = result.get("balances")
         else:
             result = self.live.call(
                 "order_readiness",
-                self.probe(t["request"]) | {"refresh_before_check": True},
+                self.probe(t["request"]) | extra,
             )
-            balances = result.get("balances")
+        if result.get("page_refreshed"):
+            recovery["refreshed"] = True
+        if result.get("page_loading") or result.get("settling"):
+            recovery.pop("candidate", None)
+            raise ObservationNotReady("净资产损耗复核刷新后页面或余额尚未就绪。")
+        if refresh and not result.get("page_refreshed"):
+            raise ObservationNotReady("风险复核刷新结果未确认，等待重新核对。")
+        balances = result.get("balances")
         if not balances:
-            raise ValueError("净资产损耗复核刷新后未取得余额。")
-        self.last_risk_page_refresh_at = self.clock()
+            raise ObservationNotReady("净资产损耗复核刷新后未取得余额。")
+        validate_wallet(balances)
+        # An order can disappear or change while the risk page is reloaded.
+        # Reconcile it through LiveOrders, never cancel based on this snapshot.
+        if record and (
+            not result.get("pending")
+            or result.get("current_order") != record.get("current_order")
+        ):
+            recovery.pop("candidate", None)
+            self.last_poll = 0
+            return None
+        risk = self.risk(t, balances, D(self.evidence["reference_price"]), record)
+        if risk.get("session_loss") is None:
+            recovery.pop("candidate", None)
+            return None
+        candidate = recovery.get("candidate")
+        if not candidate or candidate["balances"] != balances:
+            recovery["candidate"] = {"balances": balances, "at": now}
+            return None
+        if now - candidate["at"] < 2:
+            return None
         return balances
 
     def consume(self, t, record, *, log_event=True):
@@ -611,7 +683,9 @@ class Automatic:
                 "request_id": record["id"],
                 "result": result,
                 "effective_cash_per_token": effective_cash_per_token,
-                "observed_settlement_seconds": max(0, self.clock() - record["created_at"]),
+                "observed_settlement_seconds": max(
+                    0, self.clock() - record["created_at"]
+                ),
             },
         )
 
@@ -667,9 +741,51 @@ class Automatic:
                 self.running = False
                 return
             was_running = self.running
+            risk_recovery = t.get("risk_wallet_recovery")
+            if (
+                was_running
+                and risk_recovery
+                and self.clock() - risk_recovery["started_at"] >= RECOVERY_SECONDS
+            ):
+                t["error_kind"] = "manual"
+                self.pause(t, "账户风险复核超过 120 秒，仍未取得可信余额；请人工核对。")
+                return
+            if was_running and self.clock() < t.get("recovery", {}).get("retry_at", 0):
+                return
             try:
                 self._tick(t)
+                if self.running and t.pop("recovery", None):
+                    t["phase"] = (
+                        "recovering" if t.get("risk_wallet_recovery") else "running"
+                    )
+                    self.save(t, "recovery", "读取已恢复，继续核对原任务。")
             except Exception as exc:  # noqa: BLE001
+                kind = category(exc)
+                if was_running and kind in {"read_retry", "balance_sync"}:
+                    if t.get("risk_wallet_recovery"):
+                        t["risk_wallet_recovery"].pop("candidate", None)
+                    t["risk"] = {
+                        "equity": None,
+                        "loss": None,
+                        "loss_pct": None,
+                        "session_loss": None,
+                        "reason": "读取暂未就绪，等待核对",
+                    }
+                    recovery = t.setdefault("recovery", {"started_at": self.clock()})
+                    if self.clock() - recovery["started_at"] < RECOVERY_SECONDS:
+                        recovery.update(
+                            kind=kind,
+                            retry_at=self.clock() + RETRY_SECONDS,
+                            reason=str(exc),
+                        )
+                        t.update(
+                            phase="recovering",
+                            message=f"正在恢复：{exc}；5 秒后重新核对。",
+                        )
+                        self.save(t, "recovery", details=dict(recovery))
+                        return
+                    exc = RecoveryExpired(f"自动恢复超过 120 秒；最近原因：{exc}")
+                t["error_kind"] = category(exc)
                 self.pause(t, str(exc), log_event=was_running)
 
     @staticmethod
@@ -686,6 +802,7 @@ class Automatic:
             )
 
     def risk(self, t, wallet, price, record=None):
+        validate_wallet(wallet)
         if wallet.get("quote_total") is None or wallet.get("base_total") is None:
             return {
                 "loss": None,
@@ -695,6 +812,20 @@ class Automatic:
                 "basis": "public_last_price",
                 "reason": "页面未显示冻结余额或剩余委托量",
             }
+        if record:
+            before = record["before_balances"]
+            cash_delta = D(wallet["quote_total"]) - D(before["quote_available"])
+            token_delta = D(wallet["base_total"]) - D(before["base_available"])
+            if not coherent_delta(record["request"]["side"], cash_delta, token_delta):
+                return {
+                    "loss": None,
+                    "loss_pct": None,
+                    "session_loss": None,
+                    "equity": None,
+                    "basis": "public_last_price",
+                    "reason": "本笔订单两侧余额尚未同步",
+                    "balance_sync": True,
+                }
         equity = D(wallet["quote_total"]) + D(wallet["base_total"]) * price
         # Buy cash/token deltas include fees. An open buy contributes only its
         # observed fills; quote_total includes the still-locked unfilled cash.
@@ -786,6 +917,8 @@ class Automatic:
                 record = None
             else:
                 t.update(pending=None, last_order=record["id"])
+                if record.get("error_kind") == "read_retry" and self.running:
+                    raise ObservationNotReady(record["message"])
                 self.pause(
                     t,
                     "上一笔未提交：" + record["message"] + "；检查后可恢复。",
@@ -800,11 +933,14 @@ class Automatic:
             t["pending"] = None
             self.save(t)
         if record and record["state"] == "submission_unknown":
-            raise ValueError("原订单提交结果未知；不能重复提交。")
+            raise ExecutionUnknown("原订单提交结果未知；不能重复提交。")
         if record and record["state"] == "settling":
             t["message"] = record["message"]
+            t["phase"] = "recovering"
             self.save(t)
             return
+        if t["phase"] == "recovering" and not t.get("risk_wallet_recovery"):
+            t["phase"] = "running"
         if record and record.get("cancel_discovery_exhausted"):
             raise ValueError(record["cancel_error"])
         if c.current_points + D(t["buy_total"]) * c.points_per_u >= c.target_points:
@@ -826,6 +962,7 @@ class Automatic:
         # A paused task only reconciles. Running orders need fresh balances for risk.
         if (
             record
+            and not t.get("risk_wallet_recovery")
             and not minute_due
             and not t["exiting"]
             and now - record["created_at"] < c.wait_seconds
@@ -843,6 +980,7 @@ class Automatic:
         m = self.snapshot(t, c)
         price_ref = trade_price_band(m)["reference"]
         self.evidence = {
+            "reference_price": str(price_ref),
             "config": c.model_dump(mode="json"),
             "market_time": m.fetched_at,
             "valuation_basis": "public_last_price",
@@ -873,30 +1011,55 @@ class Automatic:
             ]
         else:
             wallet = t["balances"]
-        if minute_due or not record:
-            risk = self.risk(t, wallet, price_ref, record)
+        validate_snapshot(m, int(self.clock() * 1000))
+        if minute_due or not record or t.get("risk_wallet_recovery"):
+            try:
+                risk = self.risk(t, wallet, price_ref, record)
+            except BalanceNotReady:
+                risk = {
+                    "loss": None,
+                    "loss_pct": None,
+                    "session_loss": None,
+                    "equity": None,
+                    "reason": "两侧余额字段尚未同步",
+                    "balance_sync": True,
+                }
             if (
-                risk["session_loss"] is not None
-                and D(risk["session_loss"]) > c.budget
-                and not t["stop_buying"]
+                t.get("risk_wallet_recovery")
+                or risk.get("balance_sync")
+                or (
+                    risk["session_loss"] is not None
+                    and D(risk["session_loss"]) > c.budget
+                    and not t["stop_buying"]
+                )
             ):
                 before_refresh = risk
                 refreshed_wallet = self.refresh_risk_wallet(t, record, now)
                 if refreshed_wallet is None:
                     t.update(
-                        risk=risk,
+                        risk={
+                            "equity": None,
+                            "loss": None,
+                            "loss_pct": None,
+                            "session_loss": None,
+                            "reason": "账户数据正在复核，不使用未同步余额判断止损",
+                        },
                         risk_reconcile=True,
+                        phase="recovering",
                         message=(
-                            "净资产损耗快照超过阈值；等待页面刷新节流后重新核对，"
-                            "期间不停止任务或提交新订单。"
+                            "账户数据正在复核；等待刷新及两次可信余额核对，"
+                            "期间不提交或撤单，核对通过后自动继续。"
                         ),
                     )
                     self.evidence.update(balances=wallet, risk=risk)
                     self.save(t, "risk_recheck", t["message"])
                     return
                 wallet = refreshed_wallet
+                validate_snapshot(m, int(self.clock() * 1000))
+                t.pop("risk_wallet_recovery", None)
                 risk = self.risk(t, wallet, price_ref, record)
                 self.evidence["risk_before_refresh"] = before_refresh
+                t["phase"] = "running"
             t["risk"] = risk
             self.evidence.update(balances=wallet, risk=risk)
             t["last_minute"] = int(now) // 60
@@ -905,6 +1068,8 @@ class Automatic:
                 # order merely to obtain a valuation. Normal timeout and
                 # explicit exit conditions still release the order.
                 t["risk_reconcile"] = True
+                if not record:
+                    raise ObservationNotReady("账户总余额未就绪，暂不开始下一单。")
             else:
                 t["risk_reconcile"] = False
                 t["session_loss"] = risk["session_loss"]
@@ -926,7 +1091,9 @@ class Automatic:
                     "cancel_timeout_at",
                     record["cancel_requested_at"] + CANCEL_CONFIRM_TIMEOUT_SECONDS,
                 ):
-                    raise ValueError("撤单尚未确认，不重复撤单或重挂；请核对平台。")
+                    raise ExecutionUnknown(
+                        "撤单尚未确认，不重复撤单或重挂；请核对平台。", "cancel_unknown"
+                    )
                 return
             retry_cancel = bool(
                 record.get("cancel_retry_after") and now >= record["cancel_retry_after"]
@@ -936,11 +1103,9 @@ class Automatic:
                 if t["exiting"] and record["request"]["side"] == "sell"
                 else c.wait_seconds
             )
-            enough_bought = (
-                record["request"]["side"] == "buy"
-                and D(wallet["base_available"])
-                > D(record["before_balances"]["base_available"])
-            )
+            enough_bought = record["request"]["side"] == "buy" and D(
+                wallet["base_available"]
+            ) > D(record["before_balances"]["base_available"])
             sell_dust = (
                 record["request"]["side"] == "sell"
                 and wallet.get("base_total") is not None
@@ -972,7 +1137,7 @@ class Automatic:
                     self.save(t, "execution", canceled["message"])
                     return
                 if canceled.get("cancel_error"):
-                    raise ValueError(canceled["cancel_error"])
+                    raise ExecutionUnknown(canceled["cancel_error"], "cancel_unknown")
                 t["message"] = reason
                 self.save(
                     t,
@@ -1117,6 +1282,13 @@ class Automatic:
         if record["state"] in {"not_submitted", "submission_unknown"}:
             if record["state"] == "not_submitted":
                 t.update(pending=None, last_order=record["id"])
+                if record.get("error_kind") == "read_retry":
+                    raise ObservationNotReady(record["message"])
+            t["error_kind"] = (
+                "submission_unknown"
+                if record["state"] == "submission_unknown"
+                else "manual"
+            )
             self.pause(t, record["message"])
 
     def count_attempt(self, t, record):

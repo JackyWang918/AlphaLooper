@@ -2,9 +2,9 @@
 
 from multiprocessing.connection import Connection
 
-from playwright.sync_api import Error, sync_playwright
+from playwright.sync_api import Error, TimeoutError, sync_playwright
 
-from app.browser.alpha import fill_form, inspect_form
+from app.browser.alpha import PageNotReady, fill_form, inspect_form
 from app.browser.automatic import (
     CancelNotClicked,
     available_balance,
@@ -20,8 +20,9 @@ from app.browser.live import (
     preflight,
     submit_once,
 )
-from app.browser.runtime import checkpoint, command_runtime
+from app.browser.runtime import CommandBudgetExceeded, checkpoint, command_runtime
 from app.browser.schemas import token_identity
+from app.recovery import READ_ACTIONS
 
 
 def select_target_page(context, current, url):
@@ -203,7 +204,18 @@ def run_worker(pipe: Connection, endpoint: str):
                             "页面操作或回读核对失败，请人工检查。若正在实盘提交，结果可能未知，不会自动重试下单。"
                         )
                     )
-                    pipe.send({"ok": False, "message": message})
+                    retryable = action in READ_ACTIONS | {
+                        "live_prepare"
+                    } and isinstance(
+                        exc, (PageNotReady, TimeoutError, CommandBudgetExceeded)
+                    )
+                    pipe.send(
+                        {
+                            "ok": False,
+                            "message": message,
+                            "error_kind": "read_retry" if retryable else "manual",
+                        }
+                    )
         finally:
             # Stopping a CDP client only disconnects automation. The owner
             # retains Chrome for manual verification and future reconnection.

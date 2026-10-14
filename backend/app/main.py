@@ -290,6 +290,8 @@ DecisionKind = Literal[
     "buy",
     "sell",
     "risk",
+    "risk_recheck",
+    "recovery",
     "cancel",
     "execution",
     "order_check",

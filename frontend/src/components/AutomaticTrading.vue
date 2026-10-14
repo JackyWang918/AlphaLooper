@@ -133,7 +133,7 @@ onUnmounted(()=>clearInterval(timer))
 
 <template>
 <section>
-  <div class="section-title"><h2>05 / 自动实盘交易</h2><span class="badge">{{running?'自动运行中':current?'已暂停 / 待恢复':'未启动'}}</span></div>
+  <div class="section-title"><h2>05 / 自动实盘交易</h2><span class="badge">{{running?(current?.phase==='recovering'?'正在恢复 / 核对中':'自动运行中'):current?'已暂停 / 待恢复':'未启动'}}</span></div>
   <p>启动后程序自动估价、买入、卖出并继续下一轮。请先在受控 Chrome 登录、打开目标币种，再刷新浏览器识别结果。</p>
   <p class="muted">试运行策略：用公开行情 lastPrice 和上一根已收盘 1 分钟 K 线振幅设置买卖限价；买入一有实际成交就转卖。普通单 30 秒未结束先撤单核对，首次买入后满 2 分钟进入主动退出。每分钟检查持币成本亏损超过 2% 和整场净资产损耗超过 10 U；限价和计时都不保证成交或损耗上限。</p>
   <p>受控 Chrome：<span v-if="connected">已连接</span><span v-else>未连接</span> · 交易表单：<span v-if="fillSupported&&symbol&&quote">{{symbol}} / {{quote}}</span><span v-else>尚未识别</span></p>
@@ -184,7 +184,8 @@ onUnmounted(()=>clearInterval(timer))
     <p>积分进度：启动已有 {{current.request.config.current_points??'0'}} 分 + 本任务预计新增 {{fmtPoints(earnedPoints(current))}} 分 = {{fmtPoints(totalPoints(current))}} / {{current.request.config.target_points}} 分。</p>
     <p>代币余额 {{current.inventory}} · 本轮实际支出 {{current.cost}} U · 本轮卖出收入 {{current.proceeds}} U</p>
     <p>已结束轮次现金盈亏 {{current.realized_pnl}} U（余额差不重复扣手续费）</p>
-    <p v-if="current.risk_policy_version===3">启动总资产：{{current.task_start_equity}} U；最近核对的净资产损耗 {{current.session_loss}} / 10 U（负数表示盈利，超过 10 U 后卖完结束）。</p>
+    <p v-if="current.risk_policy_version===3">启动总资产：{{current.task_start_equity}} U；最近核对的净资产损耗 {{current.phase==='recovering'?'待核对':current.session_loss}} / 10 U（负数表示盈利，超过 10 U 后卖完结束）。</p>
+    <p v-if="running&&current.phase==='recovering'" class="muted">暂不提交或撤单；页面和账户核对通过后自动继续原任务，无需点击恢复。超过恢复期限或发现明确异常时会暂停并通知。</p>
     <p v-if="current.task_start_quote">任务启动时可用 {{current.request.expected_quote}}：{{current.task_start_quote}}（固定不变）。</p>
     <p>本轮起始 USDT：{{current.round_start_quote??'尚未开始'}} · 计划买入 {{current.round_plan??'—'}} U · 已撤单重挂 {{current.buy_rehangs??0}} / 10 次。</p>
     <p v-if="current.balances">最近已核对可用 USDT {{current.balances.quote_available}} · 上轮保留零头 {{current.dust??'0'}}。</p>

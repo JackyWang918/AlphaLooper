@@ -9,6 +9,10 @@ RESPONSE_TIMEOUT_SECONDS = 45
 _runtime = ContextVar("browser_command_runtime", default=None)
 
 
+class CommandBudgetExceeded(ValueError):
+    """Cooperative deadline; retry is allowed only for known read-only actions."""
+
+
 @contextmanager
 def command_runtime(report, *, seconds=COMMAND_BUDGET_SECONDS):
     token = _runtime.set((time.monotonic() + seconds, report))
@@ -25,6 +29,6 @@ def checkpoint(step):
     deadline, report = runtime
     report(step)
     if time.monotonic() >= deadline:
-        raise ValueError(
+        raise CommandBudgetExceeded(
             f"页面操作总耗时超过 {COMMAND_BUDGET_SECONDS} 秒；停在：{step}。请人工核对后恢复，不会重放交易动作。"
         )

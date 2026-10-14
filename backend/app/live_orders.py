@@ -13,6 +13,16 @@ from sqlalchemy import Column, Integer, String, Table, Text, select
 from app.browser.schemas import FillForm
 from app.database import Base
 from app.limits import MAX_BUY_QUOTE_AMOUNT
+from app.recovery import (
+    READ_ACTIONS,
+    RECOVERY_SECONDS,
+    BalanceNotReady,
+    ObservationNotReady,
+    RecoveryExpired,
+    category,
+    coherent_delta,
+    validate_wallet,
+)
 
 intents = Table(
     "live_orders",
@@ -125,6 +135,11 @@ class LiveOrders:
     def call(self, action, payload):
         result = self.browser.execute(action, payload=payload)
         if not result.get("ok"):
+            if (
+                action in READ_ACTIONS | {"live_prepare"}
+                and result.get("error_kind") == "read_retry"
+            ):
+                raise ObservationNotReady(result.get("message", "页面尚未就绪。"))
             raise ValueError(result.get("message", "浏览器执行失败"))
         return result
 
@@ -188,7 +203,12 @@ class LiveOrders:
                         "提交准备期间行情已过期，未点击下单，请恢复后重新估价。"
                     )
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
-                record.update(active=False, state="not_submitted", message=str(exc))
+                record.update(
+                    active=False,
+                    state="not_submitted",
+                    message=str(exc),
+                    error_kind=category(exc),
+                )
                 self.save(record)
                 return record
             record.update(
@@ -214,7 +234,9 @@ class LiveOrders:
                 submitted_order = result.get("submitted_order")
                 if body.side == "sell":
                     if not isinstance(submitted_order, dict):
-                        raise ValueError("执行器未返回平台滑条生成的卖出数量，保留待核实状态。")
+                        raise ValueError(
+                            "执行器未返回平台滑条生成的卖出数量，保留待核实状态。"
+                        )
                     try:
                         quantity = Decimal(str(submitted_order["quantity"]))
                     except (KeyError, ValueError, ArithmeticError) as exc:
@@ -236,6 +258,7 @@ class LiveOrders:
                 )
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
                 record["submission_error"] = str(exc)
+                record["error_kind"] = "submission_unknown"
                 record["message"] = "提交结果待核实：" + record["submission_error"]
             self.save(record)
             return record
@@ -305,10 +328,11 @@ class LiveOrders:
                     | ({"refresh_before_check": True} if refresh_before_check else {}),
                 )
                 if refresh_before_check and not result.get("page_refreshed"):
-                    # Do not turn a failed recovery reload into a reload loop.
-                    # The automatic scheduler turns this durable error into a
-                    # paused task; a user must inspect the page before resuming.
-                    raise ValueError("交易页刷新结果未确认；不按旧余额结算，自动任务将暂停等待人工核对。")
+                    # Keep the old candidate invalid until a throttled retry
+                    # confirms navigation; bounded recovery prevents reload loops.
+                    raise ObservationNotReady(
+                        "交易页刷新结果未确认；等待后重新核对，不按旧余额结算。"
+                    )
                 if refresh_before_check and result.get("page_refreshed"):
                     self.last_page_refresh_at = time.time()
                     record["cancel_refresh_pending"] = False
@@ -317,6 +341,8 @@ class LiveOrders:
                     record["absence_refreshed_at"] = time.time()
                 record["checked_at"] = time.time()
                 record.pop("last_check_error", None)
+                if result.get("balances"):
+                    validate_wallet(result["balances"])
                 if result.get("page_loading"):
                     record.pop("settlement_candidate", None)
                     started = record.setdefault("page_loading_started_at", time.time())
@@ -333,6 +359,9 @@ class LiveOrders:
                             f"将在 5 秒后重试（已等待 {int(elapsed)} 秒）。"
                         ),
                     )
+                    self.wait_observation(
+                        record, result.get("message", "页面仍在加载。")
+                    )
                 elif result.get("settling"):
                     record.pop("page_loading_started_at", None)
                     record.pop("settlement_candidate", None)
@@ -340,7 +369,10 @@ class LiveOrders:
                         state="settling",
                         message="读取期间委托或冻结余额变化，等待余额稳定。",
                     )
+                    self.wait_observation(record, record["message"])
                 elif result["pending"]:
+                    record.pop("settlement_started_at", None)
+                    record.pop("read_recovery_started_at", None)
                     record.pop("page_loading_started_at", None)
                     record.pop("settlement_candidate", None)
                     record.pop("absence_refresh_pending", None)
@@ -355,6 +387,14 @@ class LiveOrders:
                         message="当前委托仍在，按余额跟踪。",
                     )
                 else:
+                    if allow_refresh:
+                        started = record.setdefault(
+                            "settlement_started_at", time.time()
+                        )
+                        if time.time() - started >= RECOVERY_SECONDS:
+                            raise RecoveryExpired(
+                                "委托消失后核对超过 120 秒，余额仍未可信；请人工核对。"
+                            )
                     record.pop("page_loading_started_at", None)
                     if refresh_pending and not result.get("page_refreshed"):
                         record.pop("settlement_candidate", None)
@@ -365,8 +405,10 @@ class LiveOrders:
                                 "不按旧余额结算或提交新订单。"
                             ),
                         )
+                        self.wait_observation(record, record["message"])
                         self.save(record)
                         return record
+                    record.pop("read_recovery_started_at", None)
                     if record.get("accounting_version") != 2:
                         raise ValueError(
                             "旧订单没有买入前余额基准，不能转换为新口径。请核对后结束旧任务。"
@@ -411,7 +453,28 @@ class LiveOrders:
                         return record
             except Exception as exc:  # noqa: BLE001 -- preserve unresolved order on adapter failure
                 record.pop("settlement_candidate", None)
+                if isinstance(exc, ObservationNotReady):
+                    if (
+                        isinstance(exc, BalanceNotReady)
+                        and allow_refresh
+                        and not record.get("balance_direction_refresh_attempted")
+                    ):
+                        record["absence_refresh_pending"] = True
+                        record["balance_direction_refresh_attempted"] = True
+                    try:
+                        self.wait_observation(record, str(exc))
+                    except RecoveryExpired as expired:
+                        record.update(
+                            last_check_error=str(expired), error_kind="manual"
+                        )
+                    self.save(record)
+                    return record
                 error = str(exc)
+                record["error_kind"] = (
+                    "submission_unknown"
+                    if record["state"] == "submission_unknown"
+                    else "manual"
+                )
                 if (
                     record.get("confirmation_clicked")
                     and error == "普通订单确认弹窗仍然可见。"
@@ -446,6 +509,23 @@ class LiveOrders:
             self.save(record)
             return record
 
+    @staticmethod
+    def wait_observation(record, message):
+        now = time.time()
+        started = record.setdefault("read_recovery_started_at", now)
+        elapsed = now - started
+        if elapsed >= PAGE_LOADING_TIMEOUT_SECONDS:
+            raise RecoveryExpired(
+                f"等待页面或余额核对超过 60 秒；最近失败步骤：{message}"
+            )
+        record.pop("last_check_error", None)
+        record.update(
+            state="settling",
+            checked_at=now,
+            error_kind="read_retry",
+            message=f"{message}；5 秒后重试（已等待 {int(elapsed)} 秒）。",
+        )
+
     def resolve_unsubmitted(self, request_id):
         with self.lock:
             record = self.get(str(request_id))
@@ -469,6 +549,7 @@ class LiveOrders:
             return record
 
     def finish(self, record, balances):
+        validate_wallet(balances)
         before = record["before_balances"]
         cash_delta = Decimal(balances["quote_available"]) - Decimal(
             before["quote_available"]
@@ -477,9 +558,11 @@ class LiveOrders:
             before["base_available"]
         )
         side = record["request"]["side"]
-        if (side == "buy" and (cash_delta > 0 or token_delta < 0)) or (
-            side == "sell" and (cash_delta < 0 or token_delta > 0)
-        ):
+        if cash_delta == token_delta == 0 and not record.get("cancel_confirmed_at"):
+            raise BalanceDirectionNotReady(
+                "委托已消失但两侧余额均未更新，不能确认无成交；等待余额同步。"
+            )
+        if not coherent_delta(side, cash_delta, token_delta):
             side_label = "买单" if side == "buy" else "卖单"
             quote = record["request"]["expected_quote"]
             symbol = record["request"]["expected_symbol"]
@@ -603,7 +686,9 @@ class LiveOrders:
                 )
             except Exception as exc:  # noqa: BLE001
                 record.update(
-                    cancel_error=str(exc), message="撤单结果待核实：" + str(exc)
+                    cancel_error=str(exc),
+                    error_kind="cancel_unknown",
+                    message="撤单结果待核实：" + str(exc),
                 )
             self.save(record)
             return record

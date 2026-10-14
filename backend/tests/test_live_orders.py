@@ -119,7 +119,10 @@ def test_unknown_empty_unchanged_does_not_invent_non_submission(service):
     body = submitted(service, fails=True)
     assert observe(service)["state"] == "settling"
     assert observe(service)["state"] == "settling"  # second read-only snapshot
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs["payload"]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
     service.now[0] += 5
     checked = observe(service)
     assert checked["active"] and "不会自动重发" in checked["last_check_error"]
@@ -345,7 +348,9 @@ def test_missing_refresh_receipt_cannot_settle_from_old_balances(service):
     checked = service.check()
 
     assert checked["active"]
-    assert "刷新结果未确认" in checked["last_check_error"]
+    assert "刷新结果未确认" in checked["message"]
+    assert checked.get("last_check_error") is None
+    assert checked["state"] == "settling"
     assert checked["absence_refresh_pending"]
 
 
@@ -419,7 +424,10 @@ def test_inspection_recovery_settles_original_buy_without_resubmitting(service):
     service.now[0] += 5
     waiting = observe(service, wallet("99.1", "0.9999"))
     assert waiting["active"] and waiting["absence_refresh_pending"]
-    assert "refresh_before_check" not in service.browser.execute.call_args.kwargs["payload"]
+    assert (
+        "refresh_before_check"
+        not in service.browser.execute.call_args.kwargs["payload"]
+    )
     service.now[0] += 5
     completed = observe(service, wallet("99.1", "0.9999"))
     assert completed["state"] == "completed"
@@ -428,6 +436,109 @@ def test_inspection_recovery_settles_original_buy_without_resubmitting(service):
     assert [c.args[0] for c in service.browser.execute.call_args_list].count(
         "live_submit"
     ) == 1
+
+
+@pytest.mark.parametrize(
+    "side,initial,stale,final",
+    [
+        ("buy", wallet(), wallet("99", "0"), wallet("99", "1")),
+        ("sell", wallet("100", "1"), wallet("100", "0"), wallet("101", "0")),
+        ("buy", wallet(), wallet("100", "1"), wallet("99", "1")),
+        ("sell", wallet("100", "1"), wallet("101", "1"), wallet("101", "0")),
+    ],
+)
+def test_one_sided_settlement_waits_refreshes_and_accounts_once(
+    service, side, initial, stale, final
+):
+    body = request().model_copy(update={"side": side})
+    service.browser.execute.side_effect = [
+        {"ok": True, "balances": initial},
+        {
+            "ok": True,
+            "confirmation_clicked": True,
+            "submitted_order": {"quantity": "1"},
+        },
+    ]
+    service.submit(body)
+    observe(service, stale)
+    service.now[0] += 5
+    waiting = observe(service, stale)
+    assert waiting["active"] and waiting["state"] == "settling"
+    assert waiting.get("result") is None
+    assert waiting["absence_refresh_pending"]
+    service.now[0] += 5
+    observe(service, final)
+    assert service.browser.execute.call_args.kwargs["payload"]["refresh_before_check"]
+    service.now[0] += 5
+    completed = observe(service, final)
+    assert completed["state"] == "completed"
+    assert completed["result"]["gross"] == "1"
+    assert service.check() is None
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
+
+
+def test_failed_reload_is_throttled_and_bounded(service):
+    submitted(service)
+    record = service.get()
+    record.update(
+        absence_refresh_pending=True, balance_direction_refresh_attempted=True
+    )
+    service.save(record)
+    calls = []
+
+    def inspect(action, *, payload):
+        calls.append(payload)
+        return {
+            "ok": True,
+            "pending": False,
+            "balances": wallet("99", "1"),
+            "page_refreshed": False,
+        }
+
+    service.browser.execute.side_effect = inspect
+    for offset in (0, 5, 25, 30, 59, 60):
+        service.now[0] = 1000 + offset
+        checked = service.check()
+        assert checked["active"] and checked.get("result") is None
+    assert "超过 60 秒" in checked["last_check_error"]
+    assert [bool(p.get("refresh_before_check")) for p in calls] == [
+        True,
+        False,
+        False,
+        True,
+        False,
+        True,
+    ]
+
+
+def test_read_error_kind_retries_but_submit_error_kind_never_replays(service):
+    body = submitted(service, fails=True)
+    service.browser.execute.return_value = {
+        "ok": False,
+        "error_kind": "read_retry",
+        "message": "加载中",
+    }
+    checked = service.check()
+    assert checked.get("last_check_error") is None
+    assert checked["active"]
+    assert service.submit(body)["active"]
+    assert [c.args[0] for c in service.browser.execute.call_args_list].count(
+        "live_submit"
+    ) == 1
+
+
+def test_observed_order_disappearing_with_unchanged_wallet_does_not_invent_zero_fill(
+    service,
+):
+    submitted(service)
+    observe(service, pending=True)
+    observe(service)
+    service.now[0] += 5
+    checked = observe(service)
+    assert checked["state"] == "settling" and checked.get("result") is None
+    assert checked["absence_refresh_pending"]
 
 
 def test_cancel_confirmation_missing_remains_unknown_and_never_retries(service):
@@ -532,6 +643,15 @@ def test_api_guard_and_history_endpoints_removed(tmp_path, monkeypatch):
             == 404
         )
         fake.assert_called_once()
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-1"])
+def test_invalid_wallet_requires_manual_attention_without_settlement(service, bad):
+    submitted(service)
+    checked = observe(service, wallet(bad, "1"))
+    assert checked["active"] and checked.get("result") is None
+    assert checked["error_kind"] == "manual"
+    assert "有限非负数" in checked["last_check_error"]
 
 
 def test_live_sell_forces_platform_percentage_but_fill_only_does_not():

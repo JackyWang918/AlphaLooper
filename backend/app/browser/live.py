@@ -8,7 +8,7 @@ from playwright.sync_api import Error, TimeoutError, expect
 
 from app.browser.alpha import TABS, PageNotReady, fill_form, verify_identity
 from app.browser.confirmation import confirm_once
-from app.browser.runtime import checkpoint
+from app.browser.runtime import CommandBudgetExceeded, checkpoint
 from app.browser.schemas import FillForm, token_identity
 
 
@@ -18,7 +18,13 @@ def stage(name):
         checkpoint(name)
         yield
         checkpoint(name + "完成")
-    except (Error, AssertionError) as exc:
+    except PageNotReady as exc:
+        raise PageNotReady(f"{name}：{exc}") from exc
+    except CommandBudgetExceeded:
+        raise
+    except (TimeoutError, AssertionError) as exc:
+        raise PageNotReady(f"{name}：控件暂未就绪。") from exc
+    except Error as exc:
         raise ValueError(f"{name}失败：控件未就绪、被遮挡或页面结构不匹配。") from exc
     except ValueError as exc:
         raise ValueError(f"{name}：{exc}") from exc
@@ -101,7 +107,10 @@ def order_readiness(page, payload):
         wallet = wallet_snapshot(page, payload, pending=False)
         if not current_order(page, payload)["empty"]:
             raise ValueError("读取余额期间出现挂单，未提交。")
-    return {"balances": wallet}
+    return {
+        "balances": wallet,
+        "page_refreshed": bool(payload.get("refresh_before_check")),
+    }
 
 
 def preflight(page, payload):

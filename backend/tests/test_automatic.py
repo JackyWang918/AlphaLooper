@@ -51,7 +51,11 @@ class Browser:
         self.calls.append(action)
         if action in {"order_readiness", "live_prepare"}:
             assert self.pending is None
-            return {"ok": True, "balances": self.wallet()}
+            return {
+                "ok": True,
+                "balances": self.wallet(),
+                "page_refreshed": bool(payload.get("refresh_before_check")),
+            }
         if action == "live_balance":
             return {"ok": True, **self.wallet()}
         if action == "live_submit":
@@ -239,7 +243,9 @@ def test_read_timeout_waits_then_accounts_buy_and_submits_sell(rig, monkeypatch)
     def loading(action, payload=None):
         if action == "live_progress":
             return {
-                "ok": True, "page_loading": True, "settling": True,
+                "ok": True,
+                "page_loading": True,
+                "settling": True,
                 "message": "读取买卖两侧余额超时或尚未就绪（TimeoutError）。",
             }
         return original(action, payload)
@@ -308,9 +314,7 @@ def test_stop_denominator_is_coin_cost_and_includes_partial_buy(rig):
     assert not t["exiting"]
     assert D(t["risk"]["denominator"]) == D("29.94")
     assert D(t["risk"]["equity"]) == D("99.76")
-    risk = r.auto.risk(
-        t, {"quote_total": "70.06", "base_total": "3"}, D("9.7804"), r.live.get()
-    )
+    risk = r.auto.risk(t, r.browser.wallet(), D("9.7804"), r.live.get())
     assert D(risk["loss_pct"]) == 2
     assert D(risk["session_loss"]) == D("0.5988")
 
@@ -698,6 +702,12 @@ def test_auto_api_local_guard_conflict_and_migration(tmp_path, monkeypatch):
             len(lines) == 3
         )  # task metadata, start, pause; duplicate start logs nothing
         assert client.get(log_url, params={"limit": 10000}).status_code == 422
+        for kind in ("recovery", "risk_recheck"):
+            assert client.get(log_url, params={"kind": kind}).status_code == 200
+            assert (
+                client.get(log_url + "/export", params={"kind": kind}).status_code
+                == 200
+            )
         assert client.get(f"/api/automatic/{uuid4()}/decisions").status_code == 404
         assert browser.calls == ["order_readiness"]
         assert (
@@ -791,6 +801,9 @@ def test_account_budget_strictly_exceeds_ten(rig, loss, stops):
     r = rig
     r.browser.cash = D(100) - D(loss)
     tick(r)
+    if stops:
+        assert not r.auto.get()["stop_buying"]
+        tick(r, 5)
     task = r.auto.get(str(r.body.request_id))
     assert task["stop_buying"] is stops
     assert task["active"] is not stops
@@ -847,6 +860,8 @@ def test_budget_exit_cancels_then_sells_and_survives_restart(rig):
     reconciled(r)
     r.market.ticker["lastPrice"] = "7.50"
     task = tick(r, 60)
+    assert not task["stop_buying"]
+    task = tick(r, 5)
     assert task["stop_buying"] and task["active"]
     assert r.browser.calls.count("live_cancel") == 1
     assert r.browser.calls.count("live_submit") == 2
@@ -880,12 +895,13 @@ def test_budget_loss_refreshes_before_setting_sticky_stop(rig, monkeypatch):
         if action == "order_readiness":
             reads.append(payload)
             return {
+                "page_refreshed": bool(payload.get("refresh_before_check")),
                 "balances": {
                     "quote_available": "100" if len(reads) == 1 else "111",
                     "base_available": "0",
                     "quote_total": "100" if len(reads) == 1 else "111",
                     "base_total": "0",
-                }
+                },
             }
         return original(action, payload)
 
@@ -897,6 +913,9 @@ def test_budget_loss_refreshes_before_setting_sticky_stop(rig, monkeypatch):
     assert len(reads) == 2
     assert "refresh_before_check" not in reads[0]
     assert reads[1]["refresh_before_check"] is True
+    assert checked["risk"]["session_loss"] is None
+    checked = tick(r, 5)
+    assert not checked["stop_buying"]
     assert D(checked["risk"]["session_loss"]) == 0
 
 
@@ -907,11 +926,337 @@ def test_budget_during_partial_buy_cancels_before_exit_sell(rig):
     r.browser.cash -= D(9)
     r.market.ticker["lastPrice"] = "8"
     task = tick(r, 60)
+    assert not task["stop_buying"]
+    task = tick(r, 5)
     assert task["stop_buying"] and r.browser.pending is None
+
     assert r.browser.calls.count("live_submit") == 1
     task = reconciled(r, 15)
     assert task["pending"]["side"] == "sell"
     assert D(task["pending"]["price"]) == D("7.93")
+
+
+def test_readiness_timeout_recovers_without_manual_resume(rig, monkeypatch):
+    original = rig.browser.execute
+    failures = [2]
+
+    def delayed(action, payload=None):
+        if action == "order_readiness" and failures[0]:
+            failures[0] -= 1
+            return {
+                "ok": False,
+                "error_kind": "read_retry",
+                "message": "余额控件尚未就绪",
+            }
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", delayed)
+    assert tick(rig)["phase"] == "recovering"
+    assert rig.auto.running and not rig.browser.pending
+    assert rig.auto.status()["current"]["schedule"]["kind"] == "recovery"
+    assert tick(rig, 5)["phase"] == "recovering"
+    task = tick(rig, 5)
+    assert task["phase"] == "running" and task["pending"]["side"] == "buy"
+    assert "recovery" not in task
+    assert rig.browser.calls.count("live_submit") == 1
+
+
+def test_transient_market_failure_is_bounded_and_does_not_use_old_snapshot(
+    rig, monkeypatch
+):
+    from app.market import MarketUnavailable
+
+    def unavailable(*args):
+        raise MarketUnavailable("公开行情短暂网络失败")
+
+    monkeypatch.setattr(rig.auto.market, "snapshot", unavailable)
+    assert tick(rig)["phase"] == "recovering"
+    assert tick(rig, 119)["phase"] == "recovering"
+    assert tick(rig, 5)["phase"] == "attention"
+    assert not rig.auto.running and rig.browser.pending is None
+    assert "live_submit" not in rig.browser.calls
+
+
+def test_refresh_slow_loading_then_stable_wallet_resumes_without_false_stop(
+    rig, monkeypatch
+):
+    task = rig.auto.get()
+    task["task_start_equity"] = "111"
+    rig.auto.save(task)
+    original = rig.browser.execute
+    reads = []
+    loading = [True]
+
+    def delayed(action, payload=None):
+        if action == "order_readiness":
+            reads.append(dict(payload))
+            if payload.get("refresh_before_check"):
+                return {
+                    "ok": True,
+                    "page_refreshed": True,
+                    "page_loading": True,
+                    "settling": True,
+                }
+            if len(reads) > 1 and loading[0]:
+                return {
+                    "ok": False,
+                    "error_kind": "read_retry",
+                    "message": "USDT 尚未加载",
+                }
+            result = original(action, payload)
+            if len(reads) > 1:
+                result["balances"].update(quote_available="111", quote_total="111")
+            return result
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", delayed)
+    task = tick(rig)
+    assert task["phase"] == "recovering" and rig.auto.running
+    assert task["risk"]["session_loss"] is None
+    tick(rig, 5)
+    loading[0] = False
+    tick(rig, 5)
+    task = tick(rig, 5)
+    assert rig.auto.running and not task["stop_buying"]
+    assert task["pending"]["side"] == "buy"
+    assert sum(bool(p.get("refresh_before_check")) for p in reads) == 1
+    assert rig.browser.calls.count("live_submit") == 1
+
+
+def test_sell_usdt_delayed_does_not_account_loss_or_start_next_order(rig, monkeypatch):
+    tick(rig)
+    rig.browser.finish()
+    reconciled(rig)
+    before_cash = rig.browser.cash
+    rig.browser.finish()
+    final_cash = rig.browser.cash
+    rig.browser.cash = before_cash
+    original = rig.browser.execute
+    reloads = []
+
+    def read(action, payload=None):
+        if action == "live_progress" and payload.get("refresh_before_check"):
+            reloads.append(action)
+            rig.browser.cash = final_cash
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", read)
+    tick(rig, 5)
+    task = tick(rig, 5)
+    assert rig.auto.running and task["pending"]["side"] == "sell"
+    assert not task["stop_buying"] and task["rounds"] == 0
+    assert rig.browser.calls.count("live_submit") == 2
+    task = reconciled(rig, 5)
+    assert task["rounds"] == 1 and task["pending"] is None
+    assert D(task["realized_pnl"]) == final_cash - 100
+    assert not task["stop_buying"] and len(reloads) == 1
+
+
+def test_manual_pause_and_restart_never_auto_resume_recovery(rig, monkeypatch):
+    original = rig.browser.execute
+    monkeypatch.setattr(
+        rig.browser,
+        "execute",
+        lambda *a, **kw: {"ok": False, "error_kind": "read_retry", "message": "加载中"},
+    )
+    tick(rig)
+    rig.auto.control(rig.body.request_id, "pause")
+    monkeypatch.setattr(rig.browser, "execute", original)
+    tick(rig, 10)
+    assert not rig.auto.running and rig.browser.pending is None
+    restarted = Automatic(rig.auto.engine, rig.live, rig.auto.market, rig.auto.clock)
+    restarted.tick()
+    assert not restarted.running and rig.browser.pending is None
+    restarted.control(rig.body.request_id, "resume")
+    restarted.tick()
+    assert restarted.running and rig.browser.calls.count("live_submit") == 1
+
+
+def test_unknown_submit_timeout_never_enters_auto_retry(rig, monkeypatch):
+    original = rig.browser.execute
+
+    def unknown(action, payload=None):
+        if action == "live_submit":
+            rig.browser.calls.append(action)
+            return {"ok": False, "error_kind": "read_retry", "message": "点击结果未知"}
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", unknown)
+    task = tick(rig)
+    assert not rig.auto.running and task["error_kind"] == "submission_unknown"
+    for _ in range(4):
+        tick(rig, 5)
+    assert rig.browser.calls.count("live_submit") == 1
+
+
+def test_identity_conflict_is_not_retried(rig, monkeypatch):
+    original = rig.auto.market.snapshot
+
+    def wrong(*args):
+        result = original(*args)
+        result.address = "0x2"
+        return result
+
+    monkeypatch.setattr(rig.auto.market, "snapshot", wrong)
+    task = tick(rig)
+    assert task["phase"] == "attention" and not rig.auto.running
+    assert "不匹配" in task["message"]
+    assert "live_submit" not in rig.browser.calls
+
+
+def test_preflight_loading_is_safe_to_reprepare_with_fresh_quote(rig, monkeypatch):
+    original = rig.browser.execute
+    fails = [True]
+
+    def delayed(action, payload=None):
+        if action == "live_prepare" and fails[0]:
+            fails[0] = False
+            return {
+                "ok": False,
+                "error_kind": "read_retry",
+                "message": "准备阶段控件未就绪",
+            }
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", delayed)
+    task = tick(rig)
+    assert (
+        rig.auto.running and task["phase"] == "recovering" and task["pending"] is None
+    )
+    assert rig.live.get() is None
+    rig.market.ticker["lastPrice"] = "10"
+    task = tick(rig, 5)
+    assert task["pending"]["price"] == "10.09"
+    assert rig.browser.calls.count("live_submit") == 1
+
+
+def test_market_recovers_automatically_using_new_quote(rig, monkeypatch):
+    from app.market import MarketUnavailable
+
+    original = rig.auto.market.snapshot
+    fails = [True]
+
+    def delayed(*args):
+        if fails[0]:
+            fails[0] = False
+            raise MarketUnavailable("代理短暂断开")
+        return original(*args)
+
+    monkeypatch.setattr(rig.auto.market, "snapshot", delayed)
+    assert tick(rig)["phase"] == "recovering"
+    rig.market.ticker["lastPrice"] = "10"
+    task = tick(rig, 5)
+    assert rig.auto.running and task["pending"]["price"] == "10.09"
+
+
+def test_risk_recheck_unready_deadline_pauses_without_sticky_stop(rig, monkeypatch):
+    task = rig.auto.get()
+    task["task_start_equity"] = "111"
+    rig.auto.save(task)
+    original = rig.browser.execute
+
+    def unready(action, payload=None):
+        if action == "order_readiness" and payload.get("refresh_before_check"):
+            return {"ok": True, "page_refreshed": True, "page_loading": True}
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", unready)
+    assert tick(rig)["phase"] == "recovering"
+    task = tick(rig, 120)
+    assert not rig.auto.running and not task["stop_buying"]
+    assert task["phase"] == "attention" and "120 秒" in task["message"]
+    assert rig.browser.pending is None
+
+
+def test_slow_wallet_read_invalidates_quote_and_retries_before_any_order(
+    rig, monkeypatch
+):
+    original = rig.browser.execute
+    delayed = [True]
+
+    def read(action, payload=None):
+        result = original(action, payload)
+        if action == "order_readiness" and delayed[0]:
+            delayed[0] = False
+            rig.now[0] += 16
+        return result
+
+    monkeypatch.setattr(rig.browser, "execute", read)
+    task = tick(rig)
+    assert rig.auto.running and task["phase"] == "recovering"
+    assert rig.browser.pending is None
+    rig.market.ticker["lastPrice"] = "10"
+    task = tick(rig, 5)
+    assert task["pending"]["price"] == "10.09"
+    assert rig.browser.calls.count("live_submit") == 1
+
+
+def test_inconsistent_total_wallet_refreshes_before_new_order(rig, monkeypatch):
+    original = rig.browser.execute
+    refreshed = [False]
+    reloads = []
+
+    def read(action, payload=None):
+        if action == "order_readiness" and payload.get("refresh_before_check"):
+            refreshed[0] = True
+            reloads.append(action)
+        result = original(action, payload)
+        if action == "order_readiness" and not refreshed[0]:
+            result["balances"]["quote_total"] = "99"
+        return result
+
+    monkeypatch.setattr(rig.browser, "execute", read)
+    task = tick(rig)
+    assert rig.auto.running and task["phase"] == "recovering"
+    assert rig.browser.pending is None
+    task = tick(rig, 5)
+    assert task["pending"]["side"] == "buy" and len(reloads) == 1
+
+
+def test_recovery_notifies_only_on_expiry(rig, monkeypatch):
+    from unittest.mock import Mock
+
+    from app.market import MarketUnavailable
+
+    notifier = Mock()
+    rig.auto.notifier = notifier
+
+    def unavailable(*args):
+        raise MarketUnavailable("网络抖动")
+
+    monkeypatch.setattr(rig.auto.market, "snapshot", unavailable)
+    tick(rig)
+    tick(rig, 5)
+    notifier.enqueue_task_stopped.assert_not_called()
+    tick(rig, 115)
+    assert not rig.auto.running
+    notifier.enqueue_task_stopped.assert_called_once()
+    tick(rig, 5)
+    notifier.enqueue_task_stopped.assert_called_once()
+
+
+def test_order_disappearing_during_risk_reload_is_reconciled_before_actions(
+    rig, monkeypatch
+):
+    tick(rig)
+    rig.browser.partial("1")
+    rig.browser.cash -= D(9)
+    rig.market.ticker["lastPrice"] = "8"
+    original = rig.browser.execute
+
+    def disappear(action, payload=None):
+        if action == "live_progress" and payload.get("refresh_before_check"):
+            rig.browser.finish()
+        return original(action, payload)
+
+    monkeypatch.setattr(rig.browser, "execute", disappear)
+    task = tick(rig, 60)
+    assert rig.auto.running and task["pending"]["side"] == "buy"
+    assert not task["stop_buying"]
+    assert "live_cancel" not in rig.browser.calls
+    assert rig.browser.calls.count("live_submit") == 1
+    task = reconciled(rig, 5)
+    assert D(task["buy_total"]) > 0
 
 
 def test_exit_requotes_latest_trade_without_compounding_discount(rig):
